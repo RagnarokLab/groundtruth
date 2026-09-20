@@ -5,6 +5,7 @@ Read-only against the plugin's own sqlite db; never touches the world files
 or any other plugin's data. Serves a static canvas map + a JSON data API.
 """
 import base64
+import hmac
 import io
 import json
 import os
@@ -341,8 +342,141 @@ def nbt_near(world, x, z, radius=48, limit=200):
 
 LOG_DB_PATH = os.environ.get("GT_LOG_DB", "/opt/minecraft/plugins/GroundTruth/groundtruth-log.db")
 
+# --- admin panel auth (A1) -------------------------------------------------------------------
+# A one-off admin code (GT_ADMIN_CODE), optionally replaced by a TOTP code later. Brute force is
+# defended directly: warn at 5 failed attempts, then IP-ban on both the web and the MC server at 10.
+ADMIN_CODE = os.environ.get("GT_ADMIN_CODE", "")
+ADMIN_FAIL_FILE = Path(os.environ.get("GT_ADMIN_FAIL_FILE", "/opt/groundtruth-web/auth_failures.json"))
+ADMIN_WARN_AT = int(os.environ.get("GT_ADMIN_WARN_AT", "5"))
+ADMIN_BAN_AT = int(os.environ.get("GT_ADMIN_BAN_AT", "10"))
+MC_LOG = os.environ.get("GT_MC_LOG", "/opt/minecraft/logs/latest.log")
+_admin_fails = {}
+_admin_banned = set()
 
-def log_query(world=None, x=None, z=None, radius=0, since_ms=0, player=None, action=None, limit=200):
+
+def _load_admin_fails():
+    global _admin_fails, _admin_banned
+    try:
+        d = json.loads(ADMIN_FAIL_FILE.read_text())
+        _admin_fails = d.get("fails", {})
+        _admin_banned = set(d.get("banned", []))
+    except Exception:
+        _admin_fails, _admin_banned = {}, set()
+
+
+def _save_admin_fails():
+    try:
+        ADMIN_FAIL_FILE.write_text(json.dumps({"fails": _admin_fails, "banned": sorted(_admin_banned)}))
+    except Exception:
+        pass
+
+
+def _client_ip(handler):
+    """Real client IP (the public URL goes through a Cloudflare tunnel)."""
+    for h in ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"):
+        v = handler.headers.get(h)
+        if v:
+            return v.split(",")[0].strip()
+    return handler.client_address[0]
+
+
+def admin_auth(handler, qs):
+    """(ok, reason). reason in ok|bad|warn|banned."""
+    ip = _client_ip(handler)
+    if ip in _admin_banned:
+        return False, "banned"
+    code = handler.headers.get("X-GT-Code") or (qs.get("code", [""])[0])
+    if ADMIN_CODE and code and hmac.compare_digest(code, ADMIN_CODE):
+        if _admin_fails.pop(ip, None) is not None:
+            _save_admin_fails()
+        return True, "ok"
+    e = _admin_fails.get(ip) or {"n": 0, "first": time.time()}
+    e["n"] += 1
+    e["last"] = time.time()
+    _admin_fails[ip] = e
+    if e["n"] >= ADMIN_BAN_AT:
+        _admin_banned.add(ip)
+        _save_admin_fails()
+        try:
+            rcon_cmd(f"ban-ip {ip}")
+        except Exception:
+            pass
+        return False, "banned"
+    _save_admin_fails()
+    return False, "warn" if e["n"] >= ADMIN_WARN_AT else "bad"
+
+
+_load_admin_fails()
+
+
+def admin_health():
+    out = {"log": {}, "map": {}, "server": {}}
+    try:
+        if os.path.exists(LOG_DB_PATH):
+            conn = sqlite3.connect(f"file:{LOG_DB_PATH}?mode=ro", uri=True)
+            out["log"]["events"] = conn.execute("SELECT COUNT(*) FROM log_events").fetchone()[0]
+            r = conn.execute("SELECT MIN(ts), MAX(ts) FROM log_events").fetchone()
+            out["log"]["oldest"], out["log"]["newest"] = r[0], r[1]
+            for t in ("log_positions", "log_containers", "log_inventories", "log_sessions"):
+                try:
+                    out["log"][t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                except sqlite3.OperationalError:
+                    out["log"][t] = None
+            conn.close()
+            out["log"]["db_bytes"] = os.path.getsize(LOG_DB_PATH)
+    except Exception as e:
+        out["log"]["error"] = str(e)
+    try:
+        out["server"]["logstatus"] = rcon_cmd("groundtruth logstatus")
+    except Exception as e:
+        out["server"]["error"] = str(e)
+    try:
+        out["map"]["db_bytes"] = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    except Exception:
+        pass
+    return out
+
+
+def admin_summary(world=None, since_ms=0):
+    if not os.path.exists(LOG_DB_PATH):
+        return {"enabled": False}
+    conn = sqlite3.connect(f"file:{LOG_DB_PATH}?mode=ro", uri=True)
+    try:
+        args, where = [], "WHERE 1=1"
+        if world:
+            where += " AND world=?"; args.append(world)
+        if since_ms:
+            where += " AND ts>=?"; args.append(since_ms)
+        by_action = conn.execute(f"SELECT action,COUNT(*) FROM log_events {where} GROUP BY action ORDER BY 2 DESC", args).fetchall()
+        by_actor = conn.execute(
+            f"SELECT COALESCE(actor_name,actor_id,'?'),COUNT(*) FROM log_events {where} "
+            "GROUP BY 1 ORDER BY 2 DESC LIMIT 20", args).fetchall()
+        return {"enabled": True,
+                "by_action": [{"action": a, "n": n} for a, n in by_action],
+                "by_actor": [{"actor": a, "n": n} for a, n in by_actor]}
+    finally:
+        conn.close()
+
+
+def admin_console(lines=200, grep=None):
+    """Tail of the Minecraft server log - so admins can see RCON-issued output (e.g. Sassy) without
+    needing the Crafty console."""
+    try:
+        with open(MC_LOG, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            back = min(size, 600_000)
+            f.seek(size - back)
+            data = f.read().decode("utf-8", "replace")
+        out = data.splitlines()[-max(1, min(lines, 2000)):]
+        if grep:
+            out = [ln for ln in out if grep.lower() in ln.lower()]
+        return {"lines": out}
+    except Exception as e:
+        return {"error": str(e), "lines": []}
+
+
+def log_query(world=None, x=None, z=None, radius=0, since_ms=0, player=None, action=None, limit=200, offset=0):
     """Read-only query over the M-Log event log (groundtruth-log.db), newest first."""
     if not os.path.exists(LOG_DB_PATH):
         return {"enabled": False, "count": 0, "events": []}
@@ -363,6 +497,8 @@ def log_query(world=None, x=None, z=None, radius=0, since_ms=0, player=None, act
         if action:
             sql += " AND action=?"; args.append(action)
         sql += " ORDER BY ts DESC LIMIT ?"; args.append(max(1, min(limit, 5000)))
+        if offset:
+            sql += " OFFSET ?"; args.append(max(0, offset))
         rows = conn.execute(sql, args).fetchall()
         out = [{"ts": r[0], "world": r[1], "x": r[2], "y": r[3], "z": r[4], "action": r[5],
                 "actorKind": r[6], "actorId": r[7], "actorName": r[8],
@@ -751,6 +887,46 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self.send_response(400); self.end_headers(); return
             return
+
+        if parsed.path.startswith("/api/admin/"):
+            ok, why = admin_auth(self, qs)
+            if not ok:
+                code = 429 if why == "banned" else 401
+                msg = {"banned": "This IP is banned.", "warn": "Wrong code. 10 failed attempts bans this IP.",
+                       "bad": "Wrong code."}.get(why, "Denied.")
+                body = json.dumps({"error": msg}).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            try:
+                if parsed.path == "/api/admin/health":
+                    self._send_json(admin_health())
+                elif parsed.path == "/api/admin/summary":
+                    self._send_json(admin_summary(qs.get("world", [None])[0],
+                                                  int(qs.get("since", ["0"])[0])))
+                elif parsed.path == "/api/admin/console":
+                    self._send_json(admin_console(int(qs.get("lines", ["200"])[0]),
+                                                  qs.get("grep", [None])[0]))
+                elif parsed.path == "/api/admin/log":
+                    x = int(qs["x"][0]) if "x" in qs else None
+                    z = int(qs["z"][0]) if "z" in qs else None
+                    self._send_json(log_query(
+                        qs.get("world", [None])[0], x, z,
+                        int(qs.get("r", ["0"])[0]), int(qs.get("since", ["0"])[0]),
+                        qs.get("actor", qs.get("player", [None]))[0], qs.get("action", [None])[0],
+                        int(qs.get("limit", ["200"])[0]), int(qs.get("offset", ["0"])[0])))
+                else:
+                    self.send_response(404); self.end_headers()
+            except ValueError:
+                self.send_response(400); self.end_headers()
+            return
+
+        if parsed.path == "/admin":
+            # serve the admin page (static allowlist already handles /admin.html)
+            self.path = "/admin.html"
 
         if parsed.path == "/api/log":
             try:

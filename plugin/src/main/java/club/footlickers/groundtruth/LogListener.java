@@ -23,6 +23,9 @@ import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryMoveItemEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
+import org.bukkit.event.server.RemoteServerCommandEvent;
+import org.bukkit.event.server.ServerCommandEvent;
 import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.event.player.PlayerBucketEmptyEvent;
 import org.bukkit.event.player.PlayerBucketFillEvent;
@@ -170,6 +173,21 @@ public class LogListener implements Listener {
 
     /** Snapshot a container's contents when a player closes it (for restoring theft). */
     @EventHandler(priority = EventPriority.MONITOR)
+    public void onOpen(InventoryOpenEvent e) {
+        if (!(e.getPlayer() instanceof Player)) return;
+        InventoryType t = e.getInventory().getType();
+        if (!isContainer(t)) return;
+        Player p = (Player) e.getPlayer();
+        Location l = e.getInventory().getLocation();
+        int x = l != null ? l.getBlockX() : p.getLocation().getBlockX();
+        int y = l != null ? l.getBlockY() : p.getLocation().getBlockY();
+        int z = l != null ? l.getBlockZ() : p.getLocation().getBlockZ();
+        String world = l != null ? l.getWorld().getName() : p.getWorld().getName();
+        log.logEvent(now(), world, x, y, z, "container-open", "player", p.getUniqueId().toString(), p.getName(),
+                null, null, null, t.name(), null, null, "{\"container\":\"" + t.name() + "\"}", 0);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
     public void onClose(InventoryCloseEvent e) {
         InventoryType t = e.getInventory().getType();
         if (!isContainer(t)) return;
@@ -248,6 +266,26 @@ public class LogListener implements Listener {
                 "command", "player", p.getUniqueId().toString(), p.getName(),
                 null, null, null, null, null, null,
                 "{\"cmd\":" + Json.str(cmd) + "}", 0);
+    }
+
+    /** RCON commands (e.g. what the Discord bot runs) - the server does NOT log these itself, so we
+     *  both record them and mirror them to the server log so they show up in the console. */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onRemoteCommand(RemoteServerCommandEvent e) {
+        String cmd = e.getCommand();
+        org.bukkit.Bukkit.getLogger().info("[GroundTruth] RCON: " + cmd);
+        log.logEvent(now(), "-", 0, 0, 0, "command", "rcon", "rcon", "RCON",
+                null, null, null, null, null, null, "{\"cmd\":" + Json.str(cmd) + "}", 0);
+    }
+
+    /** Console / command-block commands (players come through PlayerCommandPreprocessEvent). */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onServerCommand(ServerCommandEvent e) {
+        if (e.getSender() instanceof Player) return;
+        boolean block = e.getSender() instanceof org.bukkit.command.BlockCommandSender;
+        String kind = block ? "command_block" : "console";
+        log.logEvent(now(), "-", 0, 0, 0, "command", kind, kind, kind,
+                null, null, null, null, null, null, "{\"cmd\":" + Json.str(e.getCommand()) + "}", 0);
     }
 
     // --- helpers --------------------------------------------------------------------------------
