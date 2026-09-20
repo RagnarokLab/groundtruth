@@ -72,7 +72,9 @@ or redistributed — `.gitignore` excludes them. Only the code that generates th
 
 ## Licence
 
-MIT - see `LICENSE`.
+Proprietary / source-available - see `LICENSE`. You may view the source, but redistribution,
+modification and commercial use are not permitted, except that the client-side mod may be included
+unmodified in a non-commercial modpack.
 
 ## Status
 

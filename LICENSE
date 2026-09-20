@@ -1,21 +1,33 @@
-MIT License
+GroundTruth License
+Copyright (c) 2026 RagnarokLab. All rights reserved.
 
-Copyright (c) 2026 RagnarokLab
+This software and its source code (the "Software") are proprietary. You may view the source, but your
+use of it is limited to what is expressly permitted below.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+YOU MAY NOT:
+  1. copy, redistribute, publish, sublicense, or otherwise make the Software (in source or compiled
+     form) available to any third party, except as expressly allowed under "Modpack Exception";
+  2. modify, adapt, translate, or create derivative works based on the Software;
+  3. sell, rent, lease, host as a paid service, paywall, or otherwise commercially exploit the
+     Software, or use it to drive paid access, donations tiers, or advertising revenue;
+  4. remove, obscure, or alter this notice or any attribution.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+MODPACK EXCEPTION (client-side mod only):
+You may include the **client-side mod** component of the Software, **unmodified and in its original
+published form**, in a **non-commercial** modpack distributed for use with a Minecraft server,
+provided that:
+  - it is not sold, paywalled, ad-gated, or otherwise monetised in any way;
+  - you do not charge for access to it, and it is not used to promote a paid product or paid tier;
+  - this licence and attribution to the copyright holder are retained and made visible.
+This exception applies ONLY to the client-side mod. The server plugin, the offline dumper, the web
+viewer, and any other component may NOT be redistributed or included in modpacks or server packs
+without prior written permission.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+NO WARRANTY:
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For any use not expressly permitted here, contact the copyright holder for written permission.
