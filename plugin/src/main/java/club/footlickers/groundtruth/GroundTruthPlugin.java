@@ -11,6 +11,7 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.io.File;
 import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.List;
@@ -22,7 +23,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     private ChunkIndexer indexer;
     private LogDb logDb;
     private Auth auth;
-    private final Map<String, DumpTask> dumpsInProgress = new HashMap<>();
+    private final Map<String, Process> externalDumps = new HashMap<>();
     private final Map<java.util.UUID, Location> lastSample = new HashMap<>();
 
     @Override
@@ -157,13 +158,15 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             sender.sendMessage("Unknown world. Usage: /groundtruth stop <world>");
             return true;
         }
-        DumpTask task = dumpsInProgress.get(world.getName());
-        if (task == null) {
+        Process p = externalDumps.get(world.getName());
+        if (p == null || !p.isAlive()) {
             sender.sendMessage("No dump running for " + world.getName() + ".");
             return true;
         }
-        task.cancel();
-        sender.sendMessage("[GroundTruth] Stopped the dump for " + world.getName() + ".");
+        p.descendants().forEach(ProcessHandle::destroy);
+        p.destroy();
+        externalDumps.remove(world.getName());
+        sender.sendMessage("[GroundTruth] Stopped the offline dump for " + world.getName() + ".");
         return true;
     }
 
@@ -236,6 +239,13 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         return true;
     }
 
+    /**
+     * /groundtruth dump <world> - spwans the OFFLINE dumper (a separate JVM, zero server tick impact)
+     * instead of indexing in-process. The in-process path used to load chunks on the main thread and
+     * tanked TPS; the offline dumper reads region files directly, so it's the only safe backfill.
+     * Writes to `dumper-script` (default /opt/groundtruth-dumper/live-dump.sh), which runs the dumper
+     * then rebuilds the tile pyramid.
+     */
     private boolean handleDump(CommandSender sender, String[] args) {
         if (!sender.isOp()) {
             sender.sendMessage("Ops only.");
@@ -246,21 +256,38 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             sender.sendMessage("Unknown world. Usage: /groundtruth dump <world>");
             return true;
         }
-        if (dumpsInProgress.containsKey(world.getName())) {
-            sender.sendMessage("A dump for " + world.getName() + " is already running. /groundtruth stop " + world.getName() + " to cancel it.");
+        String name = world.getName();
+        Process existing = externalDumps.get(name);
+        if (existing != null && existing.isAlive()) {
+            sender.sendMessage("[GroundTruth] A dump for " + name + " is already running. /groundtruth stop " + name + " to cancel it.");
             return true;
         }
-        sender.sendMessage("[GroundTruth] Starting backfill of " + world.getName()
-                + " - this is a real one-time IO pass, it will take a while on a big world. /groundtruth stop " + world.getName() + " cancels it early.");
-        DumpTask task = new DumpTask(this, storage, indexer, world, sender) {
-            @Override
-            public synchronized void cancel() {
-                dumpsInProgress.remove(world.getName());
-                super.cancel();
-            }
-        };
-        dumpsInProgress.put(world.getName(), task);
-        task.runTaskTimer(this, 20L, 1L);
+        File regionDir = new File(world.getWorldFolder(), "region");
+        if (!regionDir.isDirectory()) {
+            sender.sendMessage("[GroundTruth] No region dir at " + regionDir + " - can't dump " + name + ".");
+            return true;
+        }
+        String script = getConfig().getString("dumper-script", "/opt/groundtruth-dumper/live-dump.sh");
+        if (!new File(script).isFile()) {
+            sender.sendMessage("[GroundTruth] Offline dumper script not found: " + script + " (set dumper-script in config.yml).");
+            return true;
+        }
+        String db = new File(getDataFolder(), "groundtruth.db").getAbsolutePath();
+        int minY = world.getMinHeight();
+        try {
+            Process p = new ProcessBuilder("bash", script, name, regionDir.getAbsolutePath(), db, String.valueOf(minY))
+                    .redirectErrorStream(true)
+                    .redirectOutput(new File(getDataFolder(), "dump-" + name + ".log"))
+                    .start();
+            p.onExit().thenAccept(proc -> externalDumps.remove(name));
+            externalDumps.put(name, p);
+            sender.sendMessage("[GroundTruth] Started the OFFLINE dumper for " + name
+                    + " (separate process, zero tick impact). Tiles rebuild when it finishes.");
+            sender.sendMessage("[GroundTruth] /groundtruth stop " + name + " cancels it; log: plugins/GroundTruth/dump-"
+                    + name + ".log");
+        } catch (Exception e) {
+            sender.sendMessage("[GroundTruth] Failed to start the offline dumper: " + e.getMessage());
+        }
         return true;
     }
 
