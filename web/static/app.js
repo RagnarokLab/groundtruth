@@ -1033,3 +1033,50 @@ document.getElementById('view3dBtn').addEventListener('click', () => {
   if (window.GT3D) window.GT3D.open(currentWorld, panX, panZ);
   else alert('3D view is still loading');
 });
+
+// --- login: one code for everyone; admins get the admin panel --------------------------------
+const loginCodeEl = document.getElementById('loginCode');
+const loginBtn = document.getElementById('loginBtn');
+const loginStatus = document.getElementById('loginStatus');
+const adminBtn = document.getElementById('adminBtn');
+
+function applyIdentity(id) {
+  const row = document.getElementById('loginRow');
+  if (!id) { loginStatus.textContent = ''; adminBtn.style.display = 'none'; if (row) row.style.display = ''; return; }
+  loginStatus.textContent = 'logged in as ' + id.name + (id.admin ? ' (admin)' : '');
+  adminBtn.style.display = id.admin ? '' : 'none';
+  // admins keep the input box (they'll paste a fresh code next time); players' box goes away for good
+  if (row) row.style.display = id.admin ? '' : 'none';
+}
+
+async function doLogin(code) {
+  if (!code) return;
+  try {
+    const r = await fetch('/api/auth?code=' + encodeURIComponent(code));
+    const d = await r.json();
+    if (d.error) { loginStatus.textContent = d.error; return; }
+    localStorage.setItem('gt_code', code);
+    localStorage.setItem('gt_identity', JSON.stringify(d));
+    applyIdentity(d);
+  } catch (e) { loginStatus.textContent = 'login failed'; }
+}
+
+loginBtn.addEventListener('click', () => doLogin(loginCodeEl.value.trim()));
+loginCodeEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') loginBtn.click(); });
+
+// Admin panel opens as a full-screen overlay on the SAME page (one main page, not a separate site).
+let adminFrame = null;
+adminBtn.addEventListener('click', () => {
+  if (adminFrame) { adminFrame.remove(); adminFrame = null; return; }
+  adminFrame = document.createElement('iframe');
+  adminFrame.src = '/admin.html';
+  adminFrame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0;z-index:300;background:#0e1620';
+  document.body.appendChild(adminFrame);
+});
+window.addEventListener('message', (e) => {
+  if (e.data === 'gt-admin-close' && adminFrame) { adminFrame.remove(); adminFrame = null; }
+});
+
+try { applyIdentity(JSON.parse(localStorage.getItem('gt_identity') || 'null')); } catch (e) {}
+const urlCode = new URLSearchParams(location.search).get('code');
+if (urlCode) { doLogin(urlCode); history.replaceState(null, '', location.pathname); }

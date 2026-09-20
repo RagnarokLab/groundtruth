@@ -5,6 +5,7 @@ Read-only against the plugin's own sqlite db; never touches the world files
 or any other plugin's data. Serves a static canvas map + a JSON data API.
 """
 import base64
+import hashlib
 import hmac
 import io
 import json
@@ -343,15 +344,58 @@ def nbt_near(world, x, z, radius=48, limit=200):
 LOG_DB_PATH = os.environ.get("GT_LOG_DB", "/opt/minecraft/plugins/GroundTruth/groundtruth-log.db")
 
 # --- admin panel auth (A1) -------------------------------------------------------------------
-# A one-off admin code (GT_ADMIN_CODE), optionally replaced by a TOTP code later. Brute force is
-# defended directly: warn at 5 failed attempts, then IP-ban on both the web and the MC server at 10.
-ADMIN_CODE = os.environ.get("GT_ADMIN_CODE", "")
+# One login code for everyone, minted by the PLUGIN (signed token). The web verifies the signature
+# with the shared secret - no shared database needed. Player codes are one-shot; admin codes are
+# reusable. Brute force is still defended: warn at 5 failed attempts, IP-ban (web + MC) at 10.
+AUTH_SECRET = os.environ.get("GT_AUTH_SECRET", "")
+CONSUMED_FILE = Path(os.environ.get("GT_CONSUMED_FILE", "/opt/groundtruth-web/consumed_codes.json"))
 ADMIN_FAIL_FILE = Path(os.environ.get("GT_ADMIN_FAIL_FILE", "/opt/groundtruth-web/auth_failures.json"))
 ADMIN_WARN_AT = int(os.environ.get("GT_ADMIN_WARN_AT", "5"))
 ADMIN_BAN_AT = int(os.environ.get("GT_ADMIN_BAN_AT", "10"))
 MC_LOG = os.environ.get("GT_MC_LOG", "/opt/minecraft/logs/latest.log")
 _admin_fails = {}
 _admin_banned = set()
+
+
+def _b64d(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def verify_token(code):
+    """Return the payload dict for a valid, unexpired signed login code, else None."""
+    if not AUTH_SECRET or not code or "." not in code:
+        return None
+    p, sig = code.rsplit(".", 1)
+    want = hmac.new(AUTH_SECRET.encode(), p.encode(), hashlib.sha256).digest()
+    try:
+        got = _b64d(sig)
+        if not hmac.compare_digest(want, got):
+            return None
+        payload = json.loads(_b64d(p))
+    except Exception:
+        return None
+    if int(payload.get("e", 0)) < time.time() * 1000:
+        return None
+    return payload
+
+
+def consume_once(payload):
+    """True the first time this (player) token id is used; False if already consumed."""
+    try:
+        d = json.loads(CONSUMED_FILE.read_text())
+    except Exception:
+        d = {}
+    j = payload.get("j")
+    if j in d:
+        return False
+    d[j] = int(time.time())
+    cutoff = time.time() - 7 * 86400
+    d = {k: v for k, v in d.items() if v > cutoff}
+    try:
+        CONSUMED_FILE.write_text(json.dumps(d))
+    except Exception:
+        pass
+    return True
 
 
 def _load_admin_fails():
@@ -381,12 +425,13 @@ def _client_ip(handler):
 
 
 def admin_auth(handler, qs):
-    """(ok, reason). reason in ok|bad|warn|banned."""
+    """(ok, reason) for an admin endpoint: the token must be valid AND carry the admin flag."""
     ip = _client_ip(handler)
     if ip in _admin_banned:
         return False, "banned"
     code = handler.headers.get("X-GT-Code") or (qs.get("code", [""])[0])
-    if ADMIN_CODE and code and hmac.compare_digest(code, ADMIN_CODE):
+    payload = verify_token(code)
+    if payload and payload.get("a") == 1:
         if _admin_fails.pop(ip, None) is not None:
             _save_admin_fails()
         return True, "ok"
@@ -886,6 +931,20 @@ class Handler(BaseHTTPRequestHandler):
                                              int(qs.get("r", ["48"])[0]), int(qs.get("limit", ["200"])[0])))
             except ValueError:
                 self.send_response(400); self.end_headers(); return
+            return
+
+        if parsed.path == "/api/auth":
+            code = qs.get("code", [""])[0]
+            payload = verify_token(code)
+            if not payload:
+                self._send_json({"error": "Invalid or expired code."})
+                return
+            # every code is one-shot for LOGGING IN (admin or not) - the browser keeps the token for
+            # the session, but the same code can't be used to log in twice.
+            if not consume_once(payload):
+                self._send_json({"error": "That code has already been used."})
+                return
+            self._send_json({"name": payload.get("n"), "uuid": payload.get("u"), "admin": payload.get("a") == 1})
             return
 
         if parsed.path.startswith("/api/admin/"):

@@ -21,6 +21,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     private Storage storage;
     private ChunkIndexer indexer;
     private LogDb logDb;
+    private Auth auth;
     private final Map<String, DumpTask> dumpsInProgress = new HashMap<>();
     private final Map<java.util.UUID, Location> lastSample = new HashMap<>();
 
@@ -39,6 +40,12 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             getLogger().warning("[GroundTruth] Failed to open groundtruth-log.db, logging disabled: " + e.getMessage());
         }
         indexer = new ChunkIndexer(this, storage);
+        // one login code for everyone: the plugin mints signed tokens, the web verifies them
+        if (!getConfig().isString("auth-secret") || getConfig().getString("auth-secret", "").isEmpty()) {
+            getConfig().set("auth-secret", Auth.randomSecret());
+            saveConfig();
+        }
+        auth = new Auth(getConfig().getString("auth-secret"));
         getServer().getPluginManager().registerEvents(new ChunkListener(indexer), this);
         if (logDb != null) {
             getServer().getPluginManager().registerEvents(new LogListener(logDb), this);
@@ -72,7 +79,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|logstatus> ...");
+            sender.sendMessage("Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|link|logstatus> ...");
             return true;
         }
         switch (args[0].toLowerCase()) {
@@ -98,10 +105,13 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
                 return handleLookup(sender, args);
             case "rollback":
                 return handleRollback(sender, args);
+            case "link":
+            case "login":
+                return handleLink(sender, args);
             case "logstatus":
                 return handleLogStatus(sender, args);
             default:
-                sender.sendMessage("Unknown subcommand. Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|logstatus> ...");
+                sender.sendMessage("Unknown subcommand. Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|link|logstatus> ...");
                 return true;
         }
     }
@@ -470,6 +480,26 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
                     + "; " + marked + " event(s) updated.");
             cancel();
         }
+    }
+
+    /**
+     * /groundtruth link - one login code for the map. Admins (groundtruth.admin or op) get a long-lived
+     * reusable code; everyone else gets a one-shot code that expires quickly.
+     */
+    private boolean handleLink(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player)) {
+            sender.sendMessage("Run /groundtruth link in-game (it's bound to your player).");
+            return true;
+        }
+        Player p = (Player) sender;
+        boolean admin = p.hasPermission("groundtruth.admin") || p.isOp();
+        long ttl = admin ? 30L * 24 * 3600 * 1000 : 15L * 60 * 1000;
+        String token = auth.token(p.getUniqueId().toString(), p.getName(), admin, ttl);
+        sender.sendMessage("[GroundTruth] Your login code" + (admin ? " (admin)" : "") + ":");
+        sender.sendMessage(token);
+        sender.sendMessage("[GroundTruth] Paste it into the map login box. "
+                + (admin ? "Valid 30 days, reusable." : "One use, expires in 15 minutes."));
+        return true;
     }
 
     private boolean handleLogStatus(CommandSender sender, String[] args) {

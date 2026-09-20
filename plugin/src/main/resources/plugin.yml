@@ -8,5 +8,10 @@ api-version: '1.21'
 commands:
   groundtruth:
     description: GroundTruth index commands
-    usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|logstatus> ...
+    usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|link|logstatus> ...
     aliases: [gt]
+
+permissions:
+  groundtruth.admin:
+    description: Access the GroundTruth admin panel (logs + rollback)
+    default: op
