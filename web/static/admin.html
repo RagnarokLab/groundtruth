@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GroundTruth Admin</title>
+<style>
+  :root { --bg:#0e1620; --panel:#16212e; --line:#26374a; --fg:#dfe9f3; --dim:#8ba0b6; --accent:#3fd0c9; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,sans-serif; }
+  header { display:flex; gap:12px; align-items:center; padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0; color:var(--accent); }
+  header .sp { flex:1; }
+  input, select, button { background:#0b131c; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:inherit; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); color:#04231f; border-color:var(--accent); font-weight:600; }
+  nav { display:flex; gap:6px; padding:8px 16px; border-bottom:1px solid var(--line); background:#121b26; }
+  nav button { border-radius:20px; }
+  nav button.on { background:var(--accent); color:#04231f; border-color:var(--accent); }
+  main { padding:16px; max-width:1200px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .muted { color:var(--dim); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:600; position:sticky; top:0; background:var(--panel); }
+  .scroll { max-height:60vh; overflow:auto; }
+  .tag { display:inline-block; padding:1px 6px; border-radius:10px; background:#1d2c3d; color:var(--dim); font-size:12px; }
+  canvas { width:100%; max-width:760px; background:#0b131c; border:1px solid var(--line); border-radius:8px; }
+  .stat { display:inline-block; margin-right:18px; }
+  .stat b { display:block; font-size:20px; color:var(--accent); }
+  pre.console { background:#080f16; border:1px solid var(--line); border-radius:8px; padding:10px; max-height:65vh; overflow:auto; font:12px/1.4 ui-monospace,monospace; white-space:pre-wrap; }
+  .hide { display:none !important; }
+  #loginBar { padding:8px 16px; background:#121b26; border-bottom:1px solid var(--line); }
+  .err { color:#ff9a8a; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GroundTruth Admin</h1>
+  <span class="sp"></span>
+  <span id="who" class="muted"></span>
+  <button id="closeBtn" style="margin-left:10px">Close</button>
+</header>
+<div id="loginBar" class="row">
+  <span class="muted">Admin code:</span>
+  <input id="code" type="password" placeholder="paste your admin code" size="30">
+  <button class="primary" id="loginBtn">Unlock</button>
+  <span id="loginMsg" class="err"></span>
+</div>
+
+<nav>
+  <button data-tab="dash" class="on">Dashboard</button>
+  <button data-tab="player">Player</button>
+  <button data-tab="events">Events</button>
+  <button data-tab="rollback">Rollback</button>
+  <button data-tab="containers">Containers</button>
+  <button data-tab="console">Console</button>
+</nav>
+
+<main>
+  <section id="tab-dash">
+    <div class="card">
+      <h3 style="margin-top:0">Log health</h3>
+      <div id="health" class="muted">unlock to load…</div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Last 24h</h3>
+      <div id="summary" class="muted">—</div>
+    </div>
+  </section>
+
+  <section id="tab-events" class="hide">
+    <div class="card row">
+      <label>Actor <input id="f_actor" placeholder="player / creeper / tnt" size="16"></label>
+      <label>Action <input id="f_action" placeholder="block-break" size="14"></label>
+      <label>Minutes <input id="f_minutes" type="number" value="1440" size="6" style="width:80px"></label>
+      <label>Limit <input id="f_limit" type="number" value="200" size="6" style="width:80px"></label>
+      <button class="primary" id="runBtn">Search</button>
+      <span id="evMsg" class="muted"></span>
+    </div>
+    <div class="card">
+      <canvas id="dotmap" width="760" height="420"></canvas>
+      <div class="muted">Each dot is a logged event (x/z). Click the map to centre a radius search (not yet wired).</div>
+    </div>
+    <div class="card scroll">
+      <table id="evTable">
+        <thead><tr><th>time</th><th>action</th><th>actor</th><th>x,y,z</th><th>target</th><th>before → after</th><th>details</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-player" class="hide">
+    <div class="card row">
+      <label>Actor <input id="p_actor" placeholder="player / creeper" size="16"></label>
+      <label>Hours <input id="p_hours" type="number" value="24" style="width:70px"></label>
+      <label>Cell <input id="p_cell" type="number" value="16" style="width:70px"></label>
+      <button class="primary" id="p_run">Load</button>
+      <span id="p_msg" class="muted"></span>
+    </div>
+    <div class="card">
+      <canvas id="playermap" width="820" height="460"></canvas>
+      <div class="muted">Heat = where they spent time (cell-sized squares). Line = their path.</div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Stats</h3>
+      <div id="p_stats" class="muted">—</div>
+    </div>
+  </section>
+
+  <section id="tab-rollback" class="hide">
+    <div class="card row">
+      <label>Actor <input id="r_actor" placeholder="player / creeper / tnt" size="16"></label>
+      <label>Minutes <input id="r_minutes" type="number" value="60" style="width:70px"></label>
+      <label>Radius <input id="r_radius" type="number" value="0" style="width:70px"></label>
+      <label>X <input id="r_x" style="width:70px"></label>
+      <label>Z <input id="r_z" style="width:70px"></label>
+      <button id="r_preview">Preview</button>
+      <button class="primary" id="r_apply">Apply rollback</button>
+      <span id="r_msg" class="muted"></span>
+    </div>
+    <div class="card">
+      <canvas id="rollmap" width="820" height="360"></canvas>
+      <div class="muted">Preview highlights the blocks that would change.</div>
+      <div id="r_sample" style="margin-top:8px"></div>
+    </div>
+    <div class="card row">
+      <label>Undo rollback id <input id="u_id" style="width:90px"></label>
+      <button id="u_btn">Undo</button>
+      <span id="u_msg" class="muted"></span>
+    </div>
+    <div class="card scroll">
+      <h3 style="margin-top:0">Audit</h3>
+      <table id="auditTable"><thead><tr><th>id</th><th>time</th><th>by</th><th>query</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <section id="tab-containers" class="hide">
+    <div class="card row">
+      <label>World <input id="c_world" value="world" size="10"></label>
+      <label>X <input id="ct_x" style="width:80px"></label>
+      <label>Z <input id="ct_z" style="width:80px"></label>
+      <label>Radius <input id="ct_r" type="number" value="64" style="width:70px"></label>
+      <button class="primary" id="ct_run">Find containers</button>
+      <span id="ct_msg" class="muted"></span>
+    </div>
+    <div class="card scroll">
+      <table id="ctTable"><thead><tr><th>kind</th><th>x,y,z</th><th>updated</th><th>contents</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Selected container</h3>
+      <div id="ct_detail" class="muted">click a row above…</div>
+    </div>
+  </section>
+
+  <section id="tab-console" class="hide">
+    <div class="card row">
+      <label>Filter <input id="c_grep" placeholder="e.g. Rcon / sassy" size="20"></label>
+      <label>Lines <input id="c_lines" type="number" value="300" style="width:80px"></label>
+      <button id="c_refresh">Refresh</button>
+      <label><input id="c_auto" type="checkbox" checked> auto (5s)</label>
+      <span id="cMsg" class="muted"></span>
+    </div>
+    <div class="card"><pre class="console" id="consoleOut">—</pre></div>
+  </section>
+</main>
+
+<script src="admin.js?v=3"></script>
+</body>
+</html>
