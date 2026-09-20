@@ -21,6 +21,7 @@ import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryMoveItemEvent;
 import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.event.player.PlayerBucketEmptyEvent;
@@ -167,9 +168,19 @@ public class LogListener implements Listener {
                 "{\"container\":\"" + t.name() + "\",\"slot\":" + e.getSlot() + "}", 0);
     }
 
+    /** Snapshot a container's contents when a player closes it (for restoring theft). */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onClose(InventoryCloseEvent e) {
+        InventoryType t = e.getInventory().getType();
+        if (!isContainer(t)) return;
+        Location l = e.getInventory().getLocation();
+        if (l == null) return;
+        log.containerSnapshot(l.getWorld().getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ(),
+                t.name(), snapshotJson(e.getInventory().getContents()), now());
+    }
+
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onMoveItem(InventoryMoveItemEvent e) {
-        Location l = e.getSource().getLocation();
+    public void onMoveItem(InventoryMoveItemEvent e) {        Location l = e.getSource().getLocation();
         if (l == null) return;
         log.logEvent(now(), l.getWorld().getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ(),
                 "container-move", "block", e.getSource().getType().name(), null,
@@ -191,6 +202,8 @@ public class LogListener implements Listener {
                 killer != null ? "player" : "environment", killer != null ? killer.getUniqueId().toString() : null,
                 killer != null ? killer.getName() : null, null, null, null,
                 "{\"cause\":\"" + cause + "\",\"drops\":" + e.getDrops().size() + "}", 0);
+        log.inventorySnapshot(p.getUniqueId().toString(), "death",
+                snapshotJson(p.getInventory().getContents()), now());
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -222,6 +235,8 @@ public class LogListener implements Listener {
         Location l = p.getLocation();
         log.sessionEnd(p.getUniqueId().toString(), now(), l.getWorld().getName(),
                 l.getBlockX(), l.getBlockY(), l.getBlockZ());
+        log.inventorySnapshot(p.getUniqueId().toString(), "logout",
+                snapshotJson(p.getInventory().getContents()), now());
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -236,6 +251,21 @@ public class LogListener implements Listener {
     }
 
     // --- helpers --------------------------------------------------------------------------------
+
+    private static String snapshotJson(ItemStack[] contents) {
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (int i = 0; i < contents.length; i++) {
+            ItemStack it = contents[i];
+            if (it == null || it.getType() == Material.AIR) continue;
+            if (!first) sb.append(',');
+            first = false;
+            sb.append("{\"s\":").append(i)
+              .append(",\"id\":").append(Json.str(it.getType().getKey().toString()))
+              .append(",\"n\":").append(it.getAmount()).append('}');
+        }
+        return sb.append(']').toString();
+    }
 
     private static boolean isContainer(InventoryType t) {
         switch (t) {

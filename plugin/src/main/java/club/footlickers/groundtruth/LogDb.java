@@ -89,6 +89,14 @@ public class LogDb implements AutoCloseable {
                     "x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL)");
             st.execute("CREATE INDEX IF NOT EXISTS idx_pos_uuid_ts  ON log_positions(uuid, ts)");
             st.execute("CREATE INDEX IF NOT EXISTS idx_pos_world_ts ON log_positions(world, ts)");
+            // Last-known container contents + inventory snapshots (death/logout/manual) - for restoring
+            // theft and answering "my stuff vanished".
+            st.execute("CREATE TABLE IF NOT EXISTS log_containers (" +
+                    "world TEXT, x INTEGER, y INTEGER, z INTEGER, kind TEXT, contents TEXT, updated_ts INTEGER, " +
+                    "PRIMARY KEY (world, x, y, z))");
+            st.execute("CREATE TABLE IF NOT EXISTS log_inventories (" +
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT, ts INTEGER, reason TEXT, contents TEXT)");
+            st.execute("CREATE INDEX IF NOT EXISTS idx_inv_uuid ON log_inventories(uuid, ts)");
         }
     }
 
@@ -121,6 +129,14 @@ public class LogDb implements AutoCloseable {
 
     public void position(String uuid, String world, int x, int y, int z, long ts) {
         offer(new Object[] { "position", uuid, world, x, y, z, ts });
+    }
+
+    public void containerSnapshot(String world, int x, int y, int z, String kind, String contents, long ts) {
+        offer(new Object[] { "container", world, x, y, z, kind, contents, ts });
+    }
+
+    public void inventorySnapshot(String uuid, String reason, String contents, long ts) {
+        offer(new Object[] { "inventory", uuid, reason, contents, ts });
     }
 
     // --- writer thread --------------------------------------------------------------------------
@@ -164,7 +180,13 @@ public class LogDb implements AutoCloseable {
                         "ON CONFLICT(uuid) DO UPDATE SET name=excluded.name, last_seen=excluded.last_seen, " +
                         "last_ip=excluded.last_ip");
                  PreparedStatement po = writeConn.prepareStatement(
-                        "INSERT INTO log_positions (uuid,world,x,y,z,ts) VALUES (?,?,?,?,?,?)")) {
+                        "INSERT INTO log_positions (uuid,world,x,y,z,ts) VALUES (?,?,?,?,?,?)");
+                 PreparedStatement cs = writeConn.prepareStatement(
+                        "INSERT INTO log_containers (world,x,y,z,kind,contents,updated_ts) VALUES (?,?,?,?,?,?,?) " +
+                        "ON CONFLICT(world,x,y,z) DO UPDATE SET kind=excluded.kind, contents=excluded.contents, " +
+                        "updated_ts=excluded.updated_ts");
+                 PreparedStatement iv = writeConn.prepareStatement(
+                        "INSERT INTO log_inventories (uuid,ts,reason,contents) VALUES (?,?,?,?)")) {
                 for (Object[] r : batch) {
                     String kind = (String) r[0];
                     switch (kind) {
@@ -203,6 +225,17 @@ public class LogDb implements AutoCloseable {
                             po.setInt(3, (Integer) r[3]); po.setInt(4, (Integer) r[4]); po.setInt(5, (Integer) r[5]);
                             po.setLong(6, (Long) r[6]);
                             po.addBatch();
+                            break;
+                        case "container":
+                            cs.setString(1, (String) r[1]);
+                            cs.setInt(2, (Integer) r[2]); cs.setInt(3, (Integer) r[3]); cs.setInt(4, (Integer) r[4]);
+                            cs.setString(5, (String) r[5]); cs.setString(6, (String) r[6]); cs.setLong(7, (Long) r[7]);
+                            cs.executeUpdate();
+                            break;
+                        case "inventory":
+                            iv.setString(1, (String) r[1]); iv.setLong(2, (Long) r[4]);
+                            iv.setString(3, (String) r[2]); iv.setString(4, (String) r[3]);
+                            iv.executeUpdate();
                             break;
                         default:
                     }
@@ -341,6 +374,60 @@ public class LogDb implements AutoCloseable {
         } catch (SQLException e) {
             try { writeConn.rollback(); } catch (SQLException ignored) {}
             log.warning("[GroundTruth] markReverted failed: " + e.getMessage());
+            return 0;
+        } finally {
+            try { writeConn.setAutoCommit(true); } catch (SQLException ignored) {}
+        }
+    }
+
+    /** Events reverted by a given rollback, oldest first (so an undo re-applies in order). */
+    public List<Hit> findReverted(long rollbackId) {
+        List<Hit> out = new ArrayList<>();
+        synchronized (readLock) {
+            try (PreparedStatement ps = readConn.prepareStatement(
+                    "SELECT id,ts,world,x,y,z,action,actor_name,target,before,after FROM log_events " +
+                    "WHERE reverted_by=? ORDER BY ts ASC")) {
+                ps.setLong(1, rollbackId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        Hit h = new Hit();
+                        h.id = rs.getLong("id"); h.ts = rs.getLong("ts"); h.world = rs.getString("world");
+                        h.x = rs.getInt("x"); h.y = rs.getInt("y"); h.z = rs.getInt("z");
+                        h.action = rs.getString("action"); h.actorName = rs.getString("actor_name");
+                        h.target = rs.getString("target"); h.before = rs.getString("before"); h.after = rs.getString("after");
+                        out.add(h);
+                    }
+                }
+            } catch (SQLException e) { log.warning("[GroundTruth] findReverted failed: " + e.getMessage()); }
+        }
+        return out;
+    }
+
+    /** Clear the reverted flag (after an undo) and record the undo as a new event. */
+    public synchronized int unmarkReverted(List<Long> ids, String actorId, String actorName, String query) {
+        if (ids.isEmpty()) return 0;
+        try {
+            writeConn.setAutoCommit(false);
+            try (PreparedStatement ps = writeConn.prepareStatement(
+                    "INSERT INTO log_events (ts,world,x,y,z,action,actor_kind,actor_id,actor_name,meta) " +
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)")) {
+                ps.setLong(1, System.currentTimeMillis());
+                ps.setString(2, "-"); ps.setInt(3, 0); ps.setInt(4, 0); ps.setInt(5, 0);
+                ps.setString(6, "rollback-undo");
+                ps.setString(7, "player"); ps.setString(8, actorId); ps.setString(9, actorName);
+                ps.setString(10, query);
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = writeConn.prepareStatement(
+                    "UPDATE log_events SET reverted=0, reverted_by=NULL, reverted_at=NULL WHERE id=?")) {
+                for (Long id : ids) { ps.setLong(1, id); ps.addBatch(); }
+                ps.executeBatch();
+            }
+            writeConn.commit();
+            return ids.size();
+        } catch (SQLException e) {
+            try { writeConn.rollback(); } catch (SQLException ignored) {}
+            log.warning("[GroundTruth] unmarkReverted failed: " + e.getMessage());
             return 0;
         } finally {
             try { writeConn.setAutoCommit(true); } catch (SQLException ignored) {}

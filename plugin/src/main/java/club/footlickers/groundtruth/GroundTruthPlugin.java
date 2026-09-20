@@ -346,18 +346,44 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         return true;
     }
 
+    private final Map<java.util.UUID, PendingRollback> pendingRollbacks = new HashMap<>();
+
+    private static class PendingRollback {
+        final List<LogDb.Hit> hits;
+        final String query;
+        PendingRollback(List<LogDb.Hit> hits, String query) { this.hits = hits; this.query = query; }
+    }
+
     /**
-     * /groundtruth rollback <player> [minutes] [radius] - restore blocks that <player> placed or
-     * broke in the window (radius 0 = anywhere in the sender's world). Preview-free for now; L2 adds
-     * a confirm step and a tick budget for large rollbacks.
+     * /groundtruth rollback <player> [minutes] [radius]   -> preview (then `confirm` / `cancel`)
+     * /groundtruth rollback undo <rollback_id>            -> re-apply the `after` states
      */
     private boolean handleRollback(CommandSender sender, String[] args) {
         if (logDb == null) { sender.sendMessage("Logging isn't enabled on this server."); return true; }
         if (!sender.isOp()) { sender.sendMessage("Ops only."); return true; }
         if (args.length < 2) {
-            sender.sendMessage("Usage: /groundtruth rollback <player> [minutes] [radius]");
+            sender.sendMessage("Usage: /groundtruth rollback <player> [minutes] [radius] | confirm | cancel | undo <id>");
             return true;
         }
+        String sub = args[1].toLowerCase();
+        if (sub.equals("confirm")) return applyPendingRollback(sender);
+        if (sub.equals("cancel")) {
+            pendingRollbacks.remove(senderKey(sender));
+            sender.sendMessage("[GroundTruth] Pending rollback cancelled.");
+            return true;
+        }
+        if (sub.equals("undo")) {
+            if (args.length < 3) { sender.sendMessage("Usage: /groundtruth rollback undo <rollback_id>"); return true; }
+            long id;
+            try { id = Long.parseLong(args[2]); }
+            catch (NumberFormatException e) { sender.sendMessage("Rollback id must be a number."); return true; }
+            List<LogDb.Hit> hits = logDb.findReverted(id);
+            if (hits.isEmpty()) { sender.sendMessage("[GroundTruth] No events found for rollback #" + id + "."); return true; }
+            new RollbackTask(hits, sender, "{\"undo_of\":" + id + "}", true).runTaskTimer(this, 1L, 1L);
+            return true;
+        }
+
+        // preview
         String player = args[1];
         int minutes = args.length > 2 ? parseInt(args[2], 15) : 15;
         int radius = args.length > 3 ? parseInt(args[3], 0) : 0;
@@ -369,34 +395,80 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         }
         long since = System.currentTimeMillis() - minutes * 60_000L;
         List<LogDb.Hit> hits = logDb.findRevertible(world == null ? null : world.getName(),
-                player, ox, oz, radius, since, 5000);
+                player, ox, oz, radius, since, 50000);
         if (hits.isEmpty()) {
             sender.sendMessage("[GroundTruth] Nothing to roll back for " + player + " in the last " + minutes + " min.");
             return true;
         }
-        List<Long> ids = new java.util.ArrayList<>();
-        int applied = 0, failed = 0;
-        for (LogDb.Hit h : hits) {
-            World w = h.world != null ? Bukkit.getWorld(h.world) : null;
-            if (w == null) { failed++; continue; }
-            Block b = w.getBlockAt(h.x, h.y, h.z);
-            try {
-                b.setBlockData(h.before != null ? Bukkit.createBlockData(h.before)
-                        : Material.AIR.createBlockData(), false);
-                ids.add(h.id);
-                applied++;
-            } catch (Exception e) {
-                failed++;
-            }
+        String query = "{\"player\":" + LogListener.Json.str(player) + ",\"minutes\":" + minutes
+                + ",\"radius\":" + radius + ",\"blocks\":" + hits.size() + "}";
+        pendingRollbacks.put(senderKey(sender), new PendingRollback(hits, query));
+        sender.sendMessage("[GroundTruth] Rollback PREVIEW: " + hits.size() + " block(s) by " + player
+                + " (last " + minutes + " min" + (radius > 0 ? ", within " + radius + " blocks" : "") + ").");
+        for (int i = 0; i < Math.min(5, hits.size()); i++) {
+            LogDb.Hit h = hits.get(i);
+            sender.sendMessage("  " + h.action + " @ " + h.x + "," + h.y + "," + h.z + " -> " + h.before);
         }
-        int marked = logDb.markReverted(ids,
-                sender instanceof Player ? ((Player) sender).getUniqueId().toString() : "console",
-                sender.getName(),
-                "{\"player\":" + LogListener.Json.str(player) + ",\"minutes\":" + minutes + ",\"radius\":" + radius + "}");
-        sender.sendMessage("[GroundTruth] Rolled back " + applied + " block(s) by " + player
-                + " (last " + minutes + " min" + (radius > 0 ? ", within " + radius + " blocks" : "") + ")"
-                + (failed > 0 ? ", " + failed + " failed" : "") + "; " + marked + " event(s) marked reverted.");
+        if (hits.size() > 5) sender.sendMessage("  ... and " + (hits.size() - 5) + " more");
+        sender.sendMessage("[GroundTruth] Run /groundtruth rollback confirm to apply, or rollback cancel.");
         return true;
+    }
+
+    private boolean applyPendingRollback(CommandSender sender) {
+        PendingRollback pr = pendingRollbacks.remove(senderKey(sender));
+        if (pr == null) {
+            sender.sendMessage("[GroundTruth] Nothing pending - run /groundtruth rollback <player> first.");
+            return true;
+        }
+        sender.sendMessage("[GroundTruth] Applying rollback of " + pr.hits.size() + " block(s)...");
+        new RollbackTask(pr.hits, sender, pr.query, false).runTaskTimer(this, 1L, 1L);
+        return true;
+    }
+
+    private static java.util.UUID senderKey(CommandSender sender) {
+        return sender instanceof Player ? ((Player) sender).getUniqueId() : new java.util.UUID(0, 0);
+    }
+
+    /** Applies block edits spread over ticks so a large rollback can't freeze the server. */
+    private class RollbackTask extends org.bukkit.scheduler.BukkitRunnable {
+        private final List<LogDb.Hit> hits;
+        private final CommandSender sender;
+        private final String query;
+        private final boolean undo;
+        private final List<Long> ids = new java.util.ArrayList<>();
+        private int i = 0, applied = 0, failed = 0;
+
+        RollbackTask(List<LogDb.Hit> hits, CommandSender sender, String query, boolean undo) {
+            this.hits = hits; this.sender = sender; this.query = query; this.undo = undo;
+        }
+
+        @Override
+        public void run() {
+            int budget = 400; // blocks per tick
+            while (i < hits.size() && budget-- > 0) {
+                LogDb.Hit h = hits.get(i++);
+                World w = h.world != null ? Bukkit.getWorld(h.world) : null;
+                if (w == null) { failed++; continue; }
+                String state = undo ? h.after : h.before;
+                try {
+                    Block b = w.getBlockAt(h.x, h.y, h.z);
+                    b.setBlockData(state != null ? Bukkit.createBlockData(state)
+                            : Material.AIR.createBlockData(), false);
+                    ids.add(h.id);
+                    applied++;
+                } catch (Exception e) {
+                    failed++;
+                }
+            }
+            if (i < hits.size()) return; // more next tick
+            int marked = undo
+                    ? logDb.unmarkReverted(ids, senderKey(sender).toString(), sender.getName(), query)
+                    : logDb.markReverted(ids, senderKey(sender).toString(), sender.getName(), query);
+            sender.sendMessage("[GroundTruth] " + (undo ? "Undo" : "Rollback") + " complete: " + applied
+                    + " block(s)" + (failed > 0 ? ", " + failed + " failed" : "")
+                    + "; " + marked + " event(s) updated.");
+            cancel();
+        }
     }
 
     private boolean handleLogStatus(CommandSender sender, String[] args) {
