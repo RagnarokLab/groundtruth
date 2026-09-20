@@ -1126,6 +1126,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(400); self.end_headers(); return
             return
 
+        if parsed.path == "/api/track":
+            # a player's OWN session trail - requires their login token, returns only their track
+            payload = verify_token(qs.get("code", [""])[0])
+            if not payload:
+                self._send_json({"error": "login required"})
+                return
+            hours = int(qs.get("hours", ["12"])[0])
+            since = int(time.time() * 1000) - hours * 3600000
+            self._send_json(admin_track(qs.get("world", [None])[0], payload.get("u"), since, 0))
+            return
+
         if parsed.path == "/api/auth":
             code = qs.get("code", [""])[0]
             payload = verify_token(code)

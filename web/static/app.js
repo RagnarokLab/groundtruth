@@ -365,6 +365,7 @@ function draw() {
   if (biomeOverlayEl && biomeOverlayEl.checked) drawTileLayer('biome', 0.55);
   drawDetail();   // block-resolution detail on top when zoomed in
   ensureDetail();
+  drawOverlays(); // heat / track / rollback-preview overlays on the real map
 
   // Per-chunk overlays: slime stripes (computed live from the seed, visible chunks only) and the
   // biome outline (coords fetched on demand from /api/biome_chunks when a biome is ticked).
@@ -1042,9 +1043,11 @@ const adminBtn = document.getElementById('adminBtn');
 
 function applyIdentity(id) {
   const row = document.getElementById('loginRow');
-  if (!id) { loginStatus.textContent = ''; adminBtn.style.display = 'none'; if (row) row.style.display = ''; return; }
+  const trail = document.getElementById('trailRow');
+  if (!id) { loginStatus.textContent = ''; adminBtn.style.display = 'none'; if (row) row.style.display = ''; if (trail) trail.style.display = 'none'; return; }
   loginStatus.textContent = 'logged in as ' + id.name + (id.admin ? ' (admin)' : '');
   adminBtn.style.display = id.admin ? '' : 'none';
+  if (trail) trail.style.display = '';
   // admins keep the input box (they'll paste a fresh code next time); players' box goes away for good
   if (row) row.style.display = id.admin ? '' : 'none';
 }
@@ -1069,13 +1072,89 @@ let adminFrame = null;
 adminBtn.addEventListener('click', () => {
   if (adminFrame) { adminFrame.remove(); adminFrame = null; return; }
   adminFrame = document.createElement('iframe');
-  adminFrame.src = '/admin.html';
+  adminFrame.src = '/admin.html?v=' + Date.now();
   adminFrame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0;z-index:300;background:#0e1620';
   document.body.appendChild(adminFrame);
 });
 window.addEventListener('message', (e) => {
-  if (e.data === 'gt-admin-close' && adminFrame) { adminFrame.remove(); adminFrame = null; }
+  if (e.data === 'gt-admin-close' && adminFrame) { adminFrame.remove(); adminFrame = null; return; }
+  if (e.data && e.data.type === 'gt-overlay') setOverlay(e.data);
 });
+
+document.getElementById('trailToggle').addEventListener('change', (e) => toggleMyTrail(e.target.checked));
+document.getElementById('trailClear').addEventListener('click', () => {
+  myTrail = [];
+  myTrailOn = false;
+  document.getElementById('trailToggle').checked = false;
+  draw();
+});
+
+// --- map overlays: heat / track / rollback-preview, drawn on the REAL map ----------------------
+let overlay = { mode: null, cells: [], cell: 16, points: [], blocks: [] };
+let myTrailOn = false, myTrail = [];
+
+function drawOverlays() {
+  if (overlay.cells.length) {
+    let maxN = 1;
+    for (const c of overlay.cells) maxN = Math.max(maxN, c[2]);
+    const csz = (overlay.cell / 16) * scale;
+    for (const [gx, gz, n] of overlay.cells) {
+      const [sx, sy] = worldToScreen((gx * overlay.cell) / 16, (gz * overlay.cell) / 16);
+      ctx.fillStyle = 'rgba(63,208,201,' + (0.12 + 0.55 * (n / maxN)).toFixed(2) + ')';
+      ctx.fillRect(sx, sy, csz, csz);
+    }
+  }
+  if (overlay.blocks.length) {
+    ctx.fillStyle = '#ff5c5c';
+    for (const b of overlay.blocks) {
+      const [sx, sy] = worldToScreen(b[0] / 16, b[2] / 16);
+      ctx.fillRect(sx - 1.5, sy - 1.5, 3, 3);
+    }
+  }
+  const track = overlay.points.length ? overlay.points : (myTrailOn ? myTrail : null);
+  if (track && track.length) {
+    ctx.save();
+    ctx.strokeStyle = '#ffd25c';
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    track.forEach((p, i) => {
+      const [sx, sy] = worldToScreen(p[0] / 16, p[2] / 16);
+      if (i) ctx.lineTo(sx, sy); else ctx.moveTo(sx, sy);
+    });
+    ctx.stroke();
+    const s = track[0], e = track[track.length - 1];
+    ctx.fillStyle = '#8adf6b';
+    let q = worldToScreen(s[0] / 16, s[2] / 16);
+    ctx.beginPath(); ctx.arc(q[0], q[1], 5, 0, 7); ctx.fill();
+    ctx.fillStyle = '#ff8a5c';
+    q = worldToScreen(e[0] / 16, e[2] / 16);
+    ctx.beginPath(); ctx.arc(q[0], q[1], 5, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function setOverlay(d) {
+  overlay = { mode: d.mode || null, cells: d.cells || [], cell: d.cell || 16,
+              points: d.points || [], blocks: d.blocks || [] };
+  if (d.fit) { // [minX,minZ,maxX,maxZ] in blocks - centre the map on it
+    panX = ((d.fit[0] + d.fit[2]) / 2) / 16;
+    panZ = ((d.fit[1] + d.fit[3]) / 2) / 16;
+  }
+  draw();
+}
+
+async function toggleMyTrail(on) {
+  myTrailOn = on;
+  if (!on) { myTrail = []; draw(); return; }
+  const code = localStorage.getItem('gt_code');
+  if (!code) return;
+  try {
+    const d = await (await fetch('/api/track?code=' + encodeURIComponent(code) + '&hours=12')).json();
+    myTrail = d.points || [];
+  } catch (e) { myTrail = []; }
+  draw();
+}
 
 try { applyIdentity(JSON.parse(localStorage.getItem('gt_identity') || 'null')); } catch (e) {}
 const urlCode = new URLSearchParams(location.search).get('code');
