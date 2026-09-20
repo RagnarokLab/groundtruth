@@ -503,6 +503,168 @@ def admin_summary(world=None, since_ms=0):
         conn.close()
 
 
+def _log_conn():
+    return sqlite3.connect(f"file:{LOG_DB_PATH}?mode=ro", uri=True)
+
+
+REVERTIBLE_ACTIONS = "('block-place','block-break','entity-change-block','fluid-place','fluid-pickup')"
+
+
+def _actor_clause(actor, alias="pl", col="name"):
+    return f" AND ({alias}.{col} LIKE ? OR p.uuid LIKE ?)", ["%" + actor + "%", "%" + actor + "%"]
+
+
+def admin_heatmap(world=None, actor=None, since_ms=0, until_ms=0, cell=16, cap=400000):
+    """Density of player position samples, bucketed into `cell`-sized squares (chunk-aligned by default)."""
+    if not os.path.exists(LOG_DB_PATH):
+        return {"enabled": False, "cells": []}
+    conn = _log_conn()
+    try:
+        where, args = "WHERE 1=1", []
+        if world:
+            where += " AND p.world=?"; args.append(world)
+        if actor:
+            c, a = _actor_clause(actor); where += c; args += a
+        if since_ms:
+            where += " AND p.ts>=?"; args.append(since_ms)
+        if until_ms:
+            where += " AND p.ts<=?"; args.append(until_ms)
+        rows = conn.execute(
+            f"SELECT p.x,p.z FROM log_positions p LEFT JOIN log_players pl ON pl.uuid=p.uuid {where} LIMIT ?",
+            args + [cap]).fetchall()
+        cells = {}
+        for x, z in rows:
+            k = (x // cell, z // cell)
+            cells[k] = cells.get(k, 0) + 1
+        return {"enabled": True, "cell": cell, "capped": len(rows) >= cap,
+                "cells": [[gx, gz, n] for (gx, gz), n in cells.items()]}
+    finally:
+        conn.close()
+
+
+def admin_track(world=None, actor=None, since_ms=0, until_ms=0, cap=30000):
+    """Ordered position samples for one actor (a walkable line)."""
+    if not os.path.exists(LOG_DB_PATH):
+        return {"points": []}
+    conn = _log_conn()
+    try:
+        where, args = "WHERE 1=1", []
+        if world:
+            where += " AND p.world=?"; args.append(world)
+        if actor:
+            c, a = _actor_clause(actor); where += c; args += a
+        if since_ms:
+            where += " AND p.ts>=?"; args.append(since_ms)
+        if until_ms:
+            where += " AND p.ts<=?"; args.append(until_ms)
+        rows = conn.execute(
+            f"SELECT p.x,p.y,p.z,p.ts FROM log_positions p LEFT JOIN log_players pl ON pl.uuid=p.uuid "
+            f"{where} ORDER BY p.ts ASC LIMIT ?", args + [cap]).fetchall()
+        return {"points": [[r[0], r[1], r[2], r[3]] for r in rows], "capped": len(rows) >= cap}
+    finally:
+        conn.close()
+
+
+def admin_rollback_preview(world, actor, minutes, radius=0, x=None, z=None, limit=20000):
+    """Same filter semantics as the plugin's findRevertible, so the preview matches what would apply."""
+    if not os.path.exists(LOG_DB_PATH):
+        return {"count": 0, "sample": [], "blocks": []}
+    since = int(time.time() * 1000) - minutes * 60000
+    conn = _log_conn()
+    try:
+        where, args = "WHERE reverted=0 AND action IN " + REVERTIBLE_ACTIONS, []
+        if world:
+            where += " AND world=?"; args.append(world)
+        if actor:
+            where += " AND (actor_name LIKE ? OR actor_id LIKE ?)"; args += ["%" + actor + "%", "%" + actor + "%"]
+        if radius and x is not None and z is not None:
+            where += " AND x>=? AND x<=? AND z>=? AND z<=?"
+            args += [x - radius, x + radius, z - radius, z + radius]
+        where += " AND ts>=?"; args.append(since)
+        total = conn.execute(f"SELECT COUNT(*) FROM log_events {where}", args).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT ts,action,actor_name,actor_id,x,y,z,target,before FROM log_events {where} "
+            f"ORDER BY ts DESC LIMIT ?", args + [limit]).fetchall()
+        sample = [{"ts": r[0], "action": r[1], "actor": r[2] or r[3], "x": r[4], "y": r[5], "z": r[6],
+                   "target": r[7], "before": r[8]} for r in rows[:25]]
+        blocks = [[r[4], r[5], r[6]] for r in rows]
+        return {"count": total, "sample": sample, "blocks": blocks, "capped": total > limit}
+    finally:
+        conn.close()
+
+
+def admin_audit(limit=100):
+    if not os.path.exists(LOG_DB_PATH):
+        return {"rows": []}
+    conn = _log_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id,ts,actor_name,meta FROM log_events WHERE action IN ('rollback','rollback-undo') "
+            "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return {"rows": [{"id": r[0], "ts": r[1], "actor": r[2], "meta": r[3]} for r in rows]}
+    finally:
+        conn.close()
+
+
+def admin_containers(world=None, x=None, z=None, radius=0, limit=200):
+    if not os.path.exists(LOG_DB_PATH):
+        return {"rows": []}
+    conn = _log_conn()
+    try:
+        where, args = "WHERE 1=1", []
+        if world:
+            where += " AND world=?"; args.append(world)
+        if radius and x is not None and z is not None:
+            where += " AND x>=? AND x<=? AND z>=? AND z<=?"
+            args += [x - radius, x + radius, z - radius, z + radius]
+        rows = conn.execute(
+            f"SELECT world,x,y,z,kind,contents,updated_ts FROM log_containers {where} "
+            f"ORDER BY updated_ts DESC LIMIT ?", args + [limit]).fetchall()
+        return {"rows": [{"world": r[0], "x": r[1], "y": r[2], "z": r[3], "kind": r[4],
+                          "contents": json.loads(r[5]) if r[5] else [], "updated": r[6]} for r in rows]}
+    finally:
+        conn.close()
+
+
+def admin_container(world, x, y, z, limit=100):
+    """One container's last-known contents plus the access log (takes/puts/opens/moves) at that spot."""
+    if not os.path.exists(LOG_DB_PATH):
+        return {"contents": [], "events": []}
+    conn = _log_conn()
+    try:
+        row = conn.execute(
+            "SELECT kind,contents,updated_ts FROM log_containers WHERE world=? AND x=? AND y=? AND z=?",
+            (world, x, y, z)).fetchone()
+        ev = conn.execute(
+            "SELECT ts,action,actor_name,target,before,after,meta FROM log_events "
+            "WHERE world=? AND x=? AND y=? AND z=? AND action LIKE 'container%' ORDER BY ts DESC LIMIT ?",
+            (world, x, y, z, limit)).fetchall()
+        return {"kind": row[0] if row else None,
+                "contents": json.loads(row[1]) if row and row[1] else [],
+                "updated": row[2] if row else None,
+                "events": [{"ts": r[0], "action": r[1], "actor": r[2], "target": r[3],
+                            "before": r[4], "after": r[5], "meta": r[6]} for r in ev]}
+    finally:
+        conn.close()
+
+
+def admin_inventories(uuid=None, limit=100):
+    if not os.path.exists(LOG_DB_PATH):
+        return {"rows": []}
+    conn = _log_conn()
+    try:
+        where, args = "WHERE 1=1", []
+        if uuid:
+            where += " AND uuid=?"; args.append(uuid)
+        rows = conn.execute(
+            f"SELECT id,uuid,ts,reason,contents FROM log_inventories {where} ORDER BY ts DESC LIMIT ?",
+            args + [limit]).fetchall()
+        return {"rows": [{"id": r[0], "uuid": r[1], "ts": r[2], "reason": r[3],
+                          "contents": json.loads(r[4]) if r[4] else []} for r in rows]}
+    finally:
+        conn.close()
+
+
 def admin_console(lines=200, grep=None):
     """Tail of the Minecraft server log - so admins can see RCON-issued output (e.g. Sassy) without
     needing the Crafty console."""
@@ -844,6 +1006,37 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
+
+        if parsed.path in ("/api/admin/rollback/apply", "/api/admin/rollback/undo"):
+            ok, why = admin_auth(self, qs)
+            if not ok:
+                body = json.dumps({"error": "Denied."}).encode()
+                self.send_response(429 if why == "banned" else 401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            try:
+                if parsed.path.endswith("/apply"):
+                    actor = qs.get("actor", [""])[0]
+                    minutes = int(qs.get("minutes", ["60"])[0])
+                    radius = int(qs.get("r", ["0"])[0])
+                    if not actor:
+                        self.send_response(400); self.end_headers(); return
+                    out1 = rcon_cmd(f"groundtruth rollback {actor} {minutes} {radius}")
+                    out2 = rcon_cmd("groundtruth rollback confirm")
+                    self._send_json({"ok": True, "output": [out1, out2]})
+                else:
+                    rid = int(qs.get("id", ["0"])[0])
+                    self._send_json({"ok": True, "output": rcon_cmd(f"groundtruth rollback undo {rid}")})
+            except Exception as e:
+                try:
+                    self.send_response(500); self.end_headers(); self.wfile.write(str(e).encode())
+                except Exception:
+                    pass
+            return
+
         if parsed.path == "/upload":
             if qs.get("k", [""])[0] != UPLOAD_KEY:
                 self.send_response(403); self.end_headers(); return
@@ -969,6 +1162,35 @@ class Handler(BaseHTTPRequestHandler):
                 elif parsed.path == "/api/admin/console":
                     self._send_json(admin_console(int(qs.get("lines", ["200"])[0]),
                                                   qs.get("grep", [None])[0]))
+                elif parsed.path == "/api/admin/heatmap":
+                    self._send_json(admin_heatmap(
+                        qs.get("world", [None])[0], qs.get("actor", [None])[0],
+                        int(qs.get("since", ["0"])[0]), int(qs.get("until", ["0"])[0]),
+                        int(qs.get("cell", ["16"])[0])))
+                elif parsed.path == "/api/admin/track":
+                    self._send_json(admin_track(
+                        qs.get("world", [None])[0], qs.get("actor", [None])[0],
+                        int(qs.get("since", ["0"])[0]), int(qs.get("until", ["0"])[0])))
+                elif parsed.path == "/api/admin/rollback/preview":
+                    self._send_json(admin_rollback_preview(
+                        qs.get("world", [None])[0], qs.get("actor", [None])[0],
+                        int(qs.get("minutes", ["60"])[0]), int(qs.get("r", ["0"])[0]),
+                        int(qs["x"][0]) if "x" in qs else None,
+                        int(qs["z"][0]) if "z" in qs else None))
+                elif parsed.path == "/api/admin/audit":
+                    self._send_json(admin_audit(int(qs.get("limit", ["100"])[0])))
+                elif parsed.path == "/api/admin/containers":
+                    self._send_json(admin_containers(
+                        qs.get("world", [None])[0],
+                        int(qs["x"][0]) if "x" in qs else None,
+                        int(qs["z"][0]) if "z" in qs else None,
+                        int(qs.get("r", ["0"])[0]), int(qs.get("limit", ["200"])[0])))
+                elif parsed.path == "/api/admin/container":
+                    self._send_json(admin_container(qs.get("world", [""])[0],
+                                                    int(qs["x"][0]), int(qs["y"][0]), int(qs["z"][0])))
+                elif parsed.path == "/api/admin/inventories":
+                    self._send_json(admin_inventories(qs.get("uuid", [None])[0],
+                                                      int(qs.get("limit", ["100"])[0])))
                 elif parsed.path == "/api/admin/log":
                     x = int(qs["x"][0]) if "x" in qs else None
                     z = int(qs["z"][0]) if "z" in qs else None
