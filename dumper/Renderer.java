@@ -69,6 +69,7 @@ public final class Renderer {
                 case "--max-zoom": maxZoom = Integer.parseInt(args[++i]); break;
                 case "--colors": loadColors(args[++i]); break;
                 case "--biome-tints": Dumper.loadBiomeTints(args[++i]); break;
+                case "--only-visited": ONLY_VISITED = true; break;
                 default: System.out.println("unknown arg " + args[i]); return;
             }
         }
@@ -136,8 +137,13 @@ public final class Renderer {
                 String[] bioChunk = biomeLayer ? null : new String[tile * tile]; // biome per chunk (terrain tint)
                 String[] blockAt = new String[tile * tile];
                 int[] yAt = new int[tile * tile];
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT cx,cz,biome,surface_block,surface_y FROM chunks WHERE world=? AND cx>=? AND cx<? AND cz>=? AND cz<?")) {
+                String sql = "SELECT cx,cz,biome,surface_block,surface_y FROM chunks "
+                        + "WHERE world=? AND cx>=? AND cx<? AND cz>=? AND cz<?";
+                if (ONLY_VISITED) {
+                    sql += " AND EXISTS (SELECT 1 FROM chunk_visits v WHERE v.world=chunks.world "
+                         + "AND v.cx=chunks.cx AND v.cz=chunks.cz)";
+                }
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
                     ps.setString(1, world);
                     ps.setInt(2, cx0 - m); ps.setInt(3, cx0 + tile + m);
                     ps.setInt(4, cz0 - m); ps.setInt(5, cz0 + tile + m);
@@ -238,6 +244,9 @@ public final class Renderer {
     }
 
     // --- colours ---
+
+    /** When true, only chunks a player has actually visited are drawn (others stay transparent). */
+    static boolean ONLY_VISITED = false;
 
     /** Terrain colour: the surface block's real colour, biome-tinted, then shaded by height. */
     static int terrainColor(String block, String biome, int y, int minY) {

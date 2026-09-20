@@ -44,9 +44,16 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         // one login code for everyone: the plugin mints signed tokens, the web verifies them
         if (!getConfig().isString("auth-secret") || getConfig().getString("auth-secret", "").isEmpty()) {
             getConfig().set("auth-secret", Auth.randomSecret());
-            saveConfig();
         }
         auth = new Auth(getConfig().getString("auth-secret"));
+        // write defaults into config.yml so the knobs are discoverable
+        getConfig().addDefault("dumper-script", "/opt/groundtruth-dumper/live-dump.sh");
+        getConfig().addDefault("render-only-visited", false);
+        getConfig().addDefault("admin-code-hours", 24);
+        getConfig().addDefault("inventory-snapshot-seconds", 300);
+        getConfig().addDefault("heat-aggregate-seconds", 600);
+        getConfig().options().copyDefaults(true);
+        saveConfig();
         getServer().getPluginManager().registerEvents(new ChunkListener(indexer), this);
         if (logDb != null) {
             getServer().getPluginManager().registerEvents(new LogListener(logDb), this);
@@ -103,6 +110,10 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
                     lastSample.put(p.getUniqueId(), l.clone());
                     logDb.position(p.getUniqueId().toString(), l.getWorld().getName(),
                             l.getBlockX(), l.getBlockY(), l.getBlockZ(), System.currentTimeMillis());
+                    final String u = p.getUniqueId().toString();
+                    final String w = l.getWorld().getName();
+                    final int vcx = l.getBlockX() >> 4, vcz = l.getBlockZ() >> 4;
+                    getServer().getScheduler().runTaskAsynchronously(this, () -> storage.recordVisit(u, w, vcx, vcz));
                 }
             }
         }, 100L, 100L);
@@ -274,8 +285,11 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         }
         String db = new File(getDataFolder(), "groundtruth.db").getAbsolutePath();
         int minY = world.getMinHeight();
+        // optional: only draw chunks a player has actually visited (off by default per-server)
+        String onlyVisited = getConfig().getBoolean("render-only-visited", false) ? "only-visited" : "";
         try {
-            Process p = new ProcessBuilder("bash", script, name, regionDir.getAbsolutePath(), db, String.valueOf(minY))
+            Process p = new ProcessBuilder("bash", script, name, regionDir.getAbsolutePath(), db,
+                    String.valueOf(minY), onlyVisited)
                     .redirectErrorStream(true)
                     .redirectOutput(new File(getDataFolder(), "dump-" + name + ".log"))
                     .start();

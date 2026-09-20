@@ -107,6 +107,13 @@ public class Storage {
                     "public INTEGER NOT NULL DEFAULT 0, created_ts INTEGER, updated_ts INTEGER, " +
                     "UNIQUE(uuid, name))");
             st.execute("CREATE INDEX IF NOT EXISTS idx_waypoints_public ON waypoints(public, world)");
+            // Which chunks each player has actually been in - powers the optional "render only visited
+            // areas" mode (off by default) and "who has been here" investigations.
+            st.execute("CREATE TABLE IF NOT EXISTS chunk_visits (" +
+                    "uuid TEXT NOT NULL, world TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL, " +
+                    "first_seen INTEGER, last_seen INTEGER, visits INTEGER NOT NULL DEFAULT 1, " +
+                    "PRIMARY KEY (uuid, world, cx, cz))");
+            st.execute("CREATE INDEX IF NOT EXISTS idx_visits_chunk ON chunk_visits(world, cx, cz)");
         }
             // Terrain-layer columns (added 2026-09-20 for the map). Safe no-ops on a DB that already
             // has them; lets an older DB be upgraded in place. The offline dumper writes the same columns.
@@ -261,6 +268,30 @@ public class Storage {
     private static double dist2(StructureHit h, int ox, int oz) {
         double dx = h.x - ox, dz = h.z - oz;
         return dx * dx + dz * dz;
+    }
+
+    /** Record that a player has been in a chunk (first/last seen + a visit count). Cheap upsert. */
+    public void recordVisit(String uuid, String world, int cx, int cz) {
+        String sql = "INSERT INTO chunk_visits (uuid,world,cx,cz,first_seen,last_seen,visits) VALUES (?,?,?,?,?,?,1) " +
+                "ON CONFLICT(uuid,world,cx,cz) DO UPDATE SET last_seen=excluded.last_seen, visits=visits+1";
+        long now = System.currentTimeMillis() / 1000L;
+        synchronized (this) {
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    ps.setString(1, uuid);
+                    ps.setString(2, world);
+                    ps.setInt(3, cx);
+                    ps.setInt(4, cz);
+                    ps.setLong(5, now);
+                    ps.setLong(6, now);
+                    ps.executeUpdate();
+                    return;
+                } catch (SQLException e) {
+                    if (attempt == 0 && isStale(e)) { reopen(); continue; }
+                    return;
+                }
+            }
+        }
     }
 
     public long countChunks(String world) {        return count("SELECT COUNT(*) FROM chunks WHERE world=?", world);
