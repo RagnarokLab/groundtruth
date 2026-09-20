@@ -47,7 +47,7 @@ function fmtTs(ms) {
 }
 
 // --- tabs -----------------------------------------------------------------------------------
-const TABS = ['dash', 'player', 'events', 'rollback', 'containers', 'console'];
+const TABS = ['dash', 'player', 'events', 'rollback', 'containers', 'inventory', 'console'];
 document.querySelectorAll('nav button').forEach((b) => {
   b.onclick = () => {
     tab = b.dataset.tab;
@@ -57,7 +57,8 @@ document.querySelectorAll('nav button').forEach((b) => {
     if (tab === 'player') loadPlayer().catch((e) => setMsg($('p_msg'), String(e.message || e), true));
     if (tab === 'events') runEvents();
     if (tab === 'rollback') loadAudit();
-    if (tab === 'containers') findContainers().catch(() => {});
+    if (tab === 'containers') { findContainers().catch(() => {}); findFlow().catch(() => {}); }
+    if (tab === 'inventory') loadInventories().catch(() => {});
     if (tab === 'console') loadConsole();
   };
 });
@@ -353,6 +354,50 @@ async function showContainer(world, x, y, z) {
   $('ct_detail').innerHTML = `<b>${escapeHtml(d.kind || 'container')} @ ${x},${y},${z}</b> (${fmtTs(d.updated)})<div style="margin:6px 0">${items || 'empty'}</div><b>access log</b>${evs || '<div class="muted">none</div>'}`;
 }
 $('ct_run').onclick = () => findContainers().catch((e) => setMsg($('ct_msg'), String(e.message || e), true));
+
+// --- container flow (aggregated hopper moves) ---------------------------------------------------
+async function findFlow() {
+  const world = $('c_world').value.trim() || 'world';
+  const x = $('ct_x').value.trim(), z = $('ct_z').value.trim();
+  const r = parseInt($('ct_r').value || '64', 10);
+  const item = $('fl_item').value.trim();
+  const min = parseInt($('fl_min').value || '1', 10);
+  const q = new URLSearchParams({ world, min: String(min) });
+  if (x && z) { q.set('x', x); q.set('z', z); q.set('r', String(r)); }
+  if (item) q.set('item', item);
+  setMsg($('fl_msg'), 'loading…');
+  const d = await api('/api/admin/flow?' + q.toString());
+  $('flTable').querySelector('tbody').innerHTML = (d.rows || []).map((f) => {
+    const hr = new Date(f.bucket * 3600000).toLocaleString();
+    return `<tr><td>${escapeHtml(f.item)}</td><td><b>${f.n}</b></td><td>${f.x},${f.y},${f.z}</td><td class="muted">${hr}</td></tr>`;
+  }).join('');
+  setMsg($('fl_msg'), (d.rows || []).length + ' flow row(s)');
+}
+$('fl_run').onclick = () => findFlow().catch((e) => setMsg($('fl_msg'), String(e.message || e), true));
+
+// --- character inventory snapshots + diff -------------------------------------------------------
+async function loadInventories() {
+  const uuid = $('iv_uuid').value.trim();
+  const q = uuid ? '?uuid=' + encodeURIComponent(uuid) : '?limit=50';
+  setMsg($('iv_msg'), 'loading…');
+  const d = await api('/api/admin/inventories' + q);
+  $('ivTable').querySelector('tbody').innerHTML = (d.rows || []).map((r) =>
+    `<tr><td><input type="radio" name="ivpick" value="${r.id}"></td><td>${r.id}</td><td>${fmtTs(r.ts)}</td>
+     <td>${escapeHtml(r.reason)}</td><td>${(r.contents || []).length}</td></tr>`).join('');
+  setMsg($('iv_msg'), (d.rows || []).length + ' snapshot(s)');
+}
+async function diffInventories() {
+  const picks = [...document.querySelectorAll('input[name=ivpick]:checked')].map((i) => +i.value);
+  if (picks.length !== 2) { setMsg($('iv_dmsg'), 'pick exactly two snapshots', true); return; }
+  const d = await api(`/api/admin/inventory_diff?a=${picks[0]}&b=${picks[1]}`);
+  if (d.error) { setMsg($('iv_dmsg'), d.error, true); return; }
+  setMsg($('iv_dmsg'), `#${d.a.id} (${escapeHtml(d.a.reason)}) → #${d.b.id} (${escapeHtml(d.b.reason)})`);
+  $('iv_diffout').innerHTML = (d.diff || []).map((x) =>
+    `<div>${x.delta > 0 ? '<span style="color:#8adf6b">+' + x.delta + '</span>' : '<span style="color:#ff8a5c">' + x.delta + '</span>'} ${escapeHtml(x.item)} <span class="muted">(${x.a} → ${x.b})</span></div>`
+  ).join('') || '<div class="muted">no changes</div>';
+}
+$('iv_load').onclick = () => loadInventories().catch((e) => setMsg($('iv_msg'), String(e.message || e), true));
+$('iv_diff').onclick = () => diffInventories().catch((e) => setMsg($('iv_dmsg'), String(e.message || e), true));
 $('p_run').onclick = () => loadPlayer().catch((e) => setMsg($('p_msg'), String(e.message || e), true));
 $('r_preview').onclick = () => previewRollback().catch((e) => setMsg($('r_msg'), String(e.message || e), true));
 $('r_apply').onclick = () => applyRollback().catch((e) => setMsg($('r_msg'), String(e.message || e), true));

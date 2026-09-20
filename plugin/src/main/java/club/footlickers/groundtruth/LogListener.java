@@ -19,7 +19,9 @@ import org.bukkit.event.block.BlockMultiPlaceEvent;
 import org.bukkit.event.entity.EntityChangeBlockEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
+import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryMoveItemEvent;
@@ -190,6 +192,13 @@ public class LogListener implements Listener {
     @EventHandler(priority = EventPriority.MONITOR)
     public void onClose(InventoryCloseEvent e) {
         InventoryType t = e.getInventory().getType();
+        if (t == InventoryType.ENDER_CHEST && e.getPlayer() instanceof Player) {
+            // ender chests aren't a block - snapshot per player
+            Player p = (Player) e.getPlayer();
+            log.inventorySnapshot(p.getUniqueId().toString(), "ender_chest",
+                    snapshotJson(e.getInventory().getContents()), now());
+            return;
+        }
         if (!isContainer(t)) return;
         Location l = e.getInventory().getLocation();
         if (l == null) return;
@@ -198,13 +207,34 @@ public class LogListener implements Listener {
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onMoveItem(InventoryMoveItemEvent e) {        Location l = e.getSource().getLocation();
-        if (l == null) return;
+    public void onMoveItem(InventoryMoveItemEvent e) {
+        // Hoppers/droppers: AGGREGATED into log_container_flow, not one row per item (was 96% of the log).
+        Location l = e.getSource().getLocation();
+        ItemStack it = e.getItem();
+        if (l == null || it == null) return;
+        log.containerFlow(l.getWorld().getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ(),
+                it.getType().getKey().toString(), it.getAmount());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onDrop(PlayerDropItemEvent e) {
+        Player p = e.getPlayer();
+        Location l = p.getLocation();
+        ItemStack it = e.getItemDrop().getItemStack();
         log.logEvent(now(), l.getWorld().getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ(),
-                "container-move", "block", e.getSource().getType().name(), null,
-                null, null, null,
-                itemId(e.getItem()), itemJson(e.getItem()), null,
-                "{\"to\":\"" + e.getDestination().getType().name() + "\"}", 0);
+                "item-drop", "player", p.getUniqueId().toString(), p.getName(),
+                null, null, null, itemId(it), itemJson(it), null, null, 0);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPickup(EntityPickupItemEvent e) {
+        if (!(e.getEntity() instanceof Player)) return;
+        Player p = (Player) e.getEntity();
+        Location l = p.getLocation();
+        ItemStack it = e.getItem().getItemStack();
+        log.logEvent(now(), l.getWorld().getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ(),
+                "item-pickup", "player", p.getUniqueId().toString(), p.getName(),
+                null, null, null, itemId(it), null, itemJson(it), null, 0);
     }
 
     // --- deaths ---------------------------------------------------------------------------------
@@ -290,7 +320,7 @@ public class LogListener implements Listener {
 
     // --- helpers --------------------------------------------------------------------------------
 
-    private static String snapshotJson(ItemStack[] contents) {
+    static String snapshotJson(ItemStack[] contents) {
         StringBuilder sb = new StringBuilder("[");
         boolean first = true;
         for (int i = 0; i < contents.length; i++) {

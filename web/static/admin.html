@@ -55,6 +55,7 @@
   <button data-tab="events">Events</button>
   <button data-tab="rollback">Rollback</button>
   <button data-tab="containers">Containers</button>
+  <button data-tab="inventory">Inventory</button>
   <button data-tab="console">Console</button>
 </nav>
 
@@ -152,6 +153,34 @@
       <h3 style="margin-top:0">Selected container</h3>
       <div id="ct_detail" class="muted">click a row above…</div>
     </div>
+    <div class="card">
+      <h3 style="margin-top:0">Container flow (hoppers/droppers, aggregated per item per hour)</h3>
+      <div class="row">
+        <label>Item filter <input id="fl_item" placeholder="iron_ingot" size="16"></label>
+        <label>Min count <input id="fl_min" type="number" value="1" style="width:70px"></label>
+        <button id="fl_run">Load flow</button>
+        <span id="fl_msg" class="muted"></span>
+      </div>
+      <div class="scroll" style="max-height:40vh">
+        <table id="flTable"><thead><tr><th>item</th><th>count</th><th>x,y,z</th><th>hour</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-inventory" class="hide">
+    <div class="card row">
+      <label>Player uuid <input id="iv_uuid" placeholder="uuid" size="40"></label>
+      <button class="primary" id="iv_load">Load snapshots</button>
+      <span id="iv_msg" class="muted"></span>
+    </div>
+    <div class="card scroll" style="max-height:45vh">
+      <table id="ivTable"><thead><tr><th>pick</th><th>id</th><th>time</th><th>reason</th><th>stacks</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card row">
+      <button id="iv_diff">Diff the two picked</button>
+      <span id="iv_dmsg" class="muted"></span>
+    </div>
+    <div class="card"><div id="iv_diffout"></div></div>
   </section>
 
   <section id="tab-console" class="hide">

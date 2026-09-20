@@ -50,6 +50,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         if (logDb != null) {
             getServer().getPluginManager().registerEvents(new LogListener(logDb), this);
             startPositionSampler();
+            startInventorySampler();
         }
         getCommand("groundtruth").setExecutor(this);
         getLogger().info("[GroundTruth] Ready. New chunks are indexed live; run /groundtruth dump <world> to backfill existing ones.");
@@ -59,6 +60,31 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     public void onDisable() {
         if (storage != null) storage.close();
         if (logDb != null) logDb.close();
+    }
+
+    /**
+     * Character inventory logging: every N seconds, snapshot each online player's inventory IF it
+     * changed since the last snapshot. That gives a real inventory history (for "my stuff vanished")
+     * without a row every time something moves.
+     */
+    private final Map<java.util.UUID, Integer> invHash = new HashMap<>();
+
+    private void startInventorySampler() {
+        int secs = getConfig().getInt("inventory-snapshot-seconds", 300);
+        if (secs <= 0) return;
+        getServer().getScheduler().runTaskTimer(this, () -> {
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                int h = 1;
+                for (org.bukkit.inventory.ItemStack it : p.getInventory().getContents()) {
+                    h = h * 31 + (it == null ? 0 : it.getType().ordinal() * 131 + it.getAmount());
+                }
+                Integer prev = invHash.get(p.getUniqueId());
+                if (prev != null && prev == h) continue;
+                invHash.put(p.getUniqueId(), h);
+                logDb.inventorySnapshot(p.getUniqueId().toString(), "periodic",
+                        LogListener.snapshotJson(p.getInventory().getContents()), System.currentTimeMillis());
+            }
+        }, secs * 20L, secs * 20L);
     }
 
     /** Samples player positions for the heatmap: at most one row per player per ~8 blocks / 5s. */

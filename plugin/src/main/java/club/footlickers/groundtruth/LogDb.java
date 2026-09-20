@@ -97,6 +97,15 @@ public class LogDb implements AutoCloseable {
             st.execute("CREATE TABLE IF NOT EXISTS log_inventories (" +
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT, ts INTEGER, reason TEXT, contents TEXT)");
             st.execute("CREATE INDEX IF NOT EXISTS idx_inv_uuid ON log_inventories(uuid, ts)");
+            // Aggregated container flow: hoppers/droppers moving farm items used to be one log row per
+            // item (96% of the whole log!). Now they accumulate in memory and land as one row per
+            // (container, item, hour) with a count - a chest being drained still shows up as a big
+            // count, and farm items can be filtered out when reading.
+            st.execute("CREATE TABLE IF NOT EXISTS log_container_flow (" +
+                    "world TEXT NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, " +
+                    "item TEXT NOT NULL, bucket INTEGER NOT NULL, n INTEGER NOT NULL, updated_ts INTEGER, " +
+                    "PRIMARY KEY (world, x, y, z, item, bucket))");
+            st.execute("CREATE INDEX IF NOT EXISTS idx_flow_pos ON log_container_flow(world, x, z, bucket)");
         }
     }
 
@@ -139,6 +148,20 @@ public class LogDb implements AutoCloseable {
         offer(new Object[] { "inventory", uuid, reason, contents, ts });
     }
 
+    /**
+     * Accumulate a container move (hopper/dropper) in memory. Flushed to log_container_flow as one row
+     * per (container, item, hour) with a count - keeps "who drained this chest" readable without one
+     * log row per item.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, long[]> flow = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public void containerFlow(String world, int x, int y, int z, String item, int n) {
+        if (item == null) return;
+        long bucket = System.currentTimeMillis() / 3600000L;
+        String key = world + '|' + x + '|' + y + '|' + z + '|' + item + '|' + bucket;
+        flow.compute(key, (k, v) -> { if (v == null) return new long[] { n }; v[0] += n; return v; });
+    }
+
     // --- writer thread --------------------------------------------------------------------------
 
     private void writerLoop() {
@@ -146,7 +169,7 @@ public class LogDb implements AutoCloseable {
         while (running || !queue.isEmpty()) {
             try {
                 Object[] first = queue.poll(500, TimeUnit.MILLISECONDS);
-                if (first == null) continue;
+                if (first == null) { maybeFlushFlow(); continue; }
                 batch.add(first);
                 queue.drainTo(batch, BATCH_MAX - 1);
                 writeBatch(batch);
@@ -162,8 +185,59 @@ public class LogDb implements AutoCloseable {
         }
     }
 
-    private void writeBatch(List<Object[]> batch) throws SQLException {
+    private volatile long lastFlowFlush = 0;
+
+    private void maybeFlushFlow() {
+        if (flow.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        if (now - lastFlowFlush < 20000) return;
+        lastFlowFlush = now;
+        flushFlow();
+    }
+
+    /** Drain the in-memory container-flow counters into log_container_flow (upsert by the hour). */
+    private void flushFlow() {
+        if (flow.isEmpty()) return;
+        List<Object[]> batch = new ArrayList<>();
+        java.util.Iterator<java.util.Map.Entry<String, long[]>> it = flow.entrySet().iterator();
+        while (it.hasNext() && batch.size() < 20000) {
+            java.util.Map.Entry<String, long[]> e = it.next();
+            batch.add(new Object[] { e.getKey(), e.getValue()[0] });
+            it.remove();
+        }
         synchronized (this) {
+            try {
+                writeConn.setAutoCommit(false);
+                try (PreparedStatement ps = writeConn.prepareStatement(
+                        "INSERT INTO log_container_flow (world,x,y,z,item,bucket,n,updated_ts) VALUES (?,?,?,?,?,?,?,?) " +
+                        "ON CONFLICT(world,x,y,z,item,bucket) DO UPDATE SET n = n + excluded.n, " +
+                        "updated_ts = excluded.updated_ts")) {
+                    long now = System.currentTimeMillis();
+                    for (Object[] row : batch) {
+                        String[] p = ((String) row[0]).split("\\|", -1);
+                        ps.setString(1, p[0]);
+                        ps.setInt(2, Integer.parseInt(p[1]));
+                        ps.setInt(3, Integer.parseInt(p[2]));
+                        ps.setInt(4, Integer.parseInt(p[3]));
+                        ps.setString(5, p[4]);
+                        ps.setLong(6, Long.parseLong(p[5]));
+                        ps.setLong(7, (Long) row[1]);
+                        ps.setLong(8, now);
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
+                }
+                writeConn.commit();
+            } catch (SQLException e) {
+                try { writeConn.rollback(); } catch (SQLException ignored) {}
+                log.warning("[GroundTruth] flow flush failed: " + e.getMessage());
+            } finally {
+                try { writeConn.setAutoCommit(true); } catch (SQLException ignored) {}
+            }
+        }
+    }
+
+    private void writeBatch(List<Object[]> batch) throws SQLException {        synchronized (this) {
             writeConn.setAutoCommit(false);
             try (PreparedStatement ev = writeConn.prepareStatement(
                         "INSERT INTO log_events (ts,world,x,y,z,action,actor_kind,actor_id,actor_name," +
@@ -459,6 +533,7 @@ public class LogDb implements AutoCloseable {
     public void close() {
         running = false;
         try { writer.join(5000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        try { flushFlow(); } catch (Exception ignored) {}
         try { writeConn.close(); } catch (SQLException ignored) {}
         try { readConn.close(); } catch (SQLException ignored) {}
     }

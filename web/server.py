@@ -648,6 +648,56 @@ def admin_container(world, x, y, z, limit=100):
         conn.close()
 
 
+def admin_flow(world=None, x=None, z=None, radius=0, item=None, min_n=1, limit=300):
+    """Aggregated container flow (hoppers/droppers): one row per container+item+hour with a count."""
+    if not os.path.exists(LOG_DB_PATH):
+        return {"rows": []}
+    conn = _log_conn()
+    try:
+        where, args = "WHERE n>=?", [min_n]
+        if world:
+            where += " AND world=?"; args.append(world)
+        if radius and x is not None and z is not None:
+            where += " AND x>=? AND x<=? AND z>=? AND z<=?"
+            args += [x - radius, x + radius, z - radius, z + radius]
+        if item:
+            where += " AND item LIKE ?"; args.append("%" + item + "%")
+        rows = conn.execute(
+            f"SELECT world,x,y,z,item,bucket,n,updated_ts FROM log_container_flow {where} "
+            f"ORDER BY n DESC LIMIT ?", args + [limit]).fetchall()
+        return {"rows": [{"world": r[0], "x": r[1], "y": r[2], "z": r[3], "item": r[4],
+                          "bucket": r[5], "n": r[6], "updated": r[7]} for r in rows]}
+    finally:
+        conn.close()
+
+
+def _sum_items(contents):
+    d = {}
+    for s in contents:
+        d[s["id"]] = d.get(s["id"], 0) + s.get("n", 0)
+    return d
+
+
+def admin_inventory_diff(a, b):
+    """Diff two inventory snapshots (by id) - 'what changed between these two points'."""
+    if not os.path.exists(LOG_DB_PATH):
+        return {"error": "no log db"}
+    conn = _log_conn()
+    try:
+        ra = conn.execute("SELECT ts,reason,contents FROM log_inventories WHERE id=?", (a,)).fetchone()
+        rb = conn.execute("SELECT ts,reason,contents FROM log_inventories WHERE id=?", (b,)).fetchone()
+        if not ra or not rb:
+            return {"error": "snapshot not found"}
+        da = _sum_items(json.loads(ra[2]) if ra[2] else [])
+        db_ = _sum_items(json.loads(rb[2]) if rb[2] else [])
+        diff = [{"item": k, "a": da.get(k, 0), "b": db_.get(k, 0), "delta": db_.get(k, 0) - da.get(k, 0)}
+                for k in sorted(set(da) | set(db_)) if da.get(k, 0) != db_.get(k, 0)]
+        return {"a": {"id": a, "ts": ra[0], "reason": ra[1]},
+                "b": {"id": b, "ts": rb[0], "reason": rb[1]}, "diff": diff}
+    finally:
+        conn.close()
+
+
 def admin_inventories(uuid=None, limit=100):
     if not os.path.exists(LOG_DB_PATH):
         return {"rows": []}
@@ -1199,6 +1249,15 @@ class Handler(BaseHTTPRequestHandler):
                 elif parsed.path == "/api/admin/container":
                     self._send_json(admin_container(qs.get("world", [""])[0],
                                                     int(qs["x"][0]), int(qs["y"][0]), int(qs["z"][0])))
+                elif parsed.path == "/api/admin/flow":
+                    self._send_json(admin_flow(
+                        qs.get("world", [None])[0],
+                        int(qs["x"][0]) if "x" in qs else None,
+                        int(qs["z"][0]) if "z" in qs else None,
+                        int(qs.get("r", ["0"])[0]), qs.get("item", [None])[0],
+                        int(qs.get("min", ["1"])[0]), int(qs.get("limit", ["300"])[0])))
+                elif parsed.path == "/api/admin/inventory_diff":
+                    self._send_json(admin_inventory_diff(int(qs["a"][0]), int(qs["b"][0])))
                 elif parsed.path == "/api/admin/inventories":
                     self._send_json(admin_inventories(qs.get("uuid", [None])[0],
                                                       int(qs.get("limit", ["100"])[0])))
