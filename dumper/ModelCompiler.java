@@ -97,6 +97,38 @@ public final class ModelCompiler {
                 compiled++;
                 continue;
             }
+            String bannerCol = bannerColourFor(base);
+            if (bannerCol != null) { // banners are block entities too - synthesise pole+bar+flag
+                boolean wall = base.endsWith("_wall_banner");
+                String modelName = "minecraft:block/gt_banner_" + base;
+                if (!OUT_MODELS.containsKey(modelName)) {
+                    OUT_MODELS.put(modelName, Map.of("faces", bannerModel("entity/banner/banner_base")));
+                }
+                Map<String, Object> variants = new LinkedHashMap<>();
+                if (wall) {
+                    // wall banners hang on a wall; approximate the vanilla wall transform with a y rotation
+                    String[] facings = { "north", "south", "east", "west" };
+                    int[] rot = { 0, 180, 90, 270 };
+                    for (int i = 0; i < 4; i++) {
+                        Map<String, Object> a = new LinkedHashMap<>();
+                        a.put("model", modelName);
+                        if (rot[i] != 0) a.put("y", rot[i]);
+                        variants.put("facing=" + facings[i], a);
+                    }
+                } else {
+                    for (int r = 0; r < 16; r++) { // standing banners: rotation=0..15 (22.5 deg steps)
+                        Map<String, Object> a = new LinkedHashMap<>();
+                        a.put("model", modelName);
+                        if (r != 0) a.put("y", r * 22.5);
+                        variants.put("rotation=" + r, a);
+                    }
+                }
+                Map<String, Object> rule = new LinkedHashMap<>();
+                rule.put("variants", variants);
+                blocksOut.put(full, rule);
+                compiled++;
+                continue;
+            }
             try {
                 Map<String, Object> bs = parse(raw);
                 blocksOut.put(full, normalizeBlockstate(bs));
@@ -402,6 +434,63 @@ public final class ModelCompiler {
         return faces;
     }
 
+    /** Banner colour -> its dye name for <colour>_banner / <colour>_wall_banner, or null. */
+    private static String bannerColourFor(String base) {
+        String c = base.endsWith("_wall_banner") ? base.substring(0, base.length() - 12)
+                 : base.endsWith("_banner") ? base.substring(0, base.length() - 7) : null;
+        if (c == null) return null;
+        switch (c) {
+            case "white": case "orange": case "magenta": case "light_blue": case "yellow": case "lime":
+            case "pink": case "gray": case "light_gray": case "cyan": case "purple": case "blue":
+            case "brown": case "green": case "red": case "black":
+                return c;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * A banner model (pole + bar + flag) from vanilla's {@code BannerModel}/{@code BannerFlagModel},
+     * with the renderer's transform (scale 2/3, y/z flip, translate 0.5,0,0.5) already baked in, and
+     * expressed in the mesher's 0..16 units (16 = 1 block, so the banner can extend above its block).
+     * The flag faces are marked with {@code dye:1} so the mesher tints them by the banner colour; the
+     * pole/bar keep the wood texture colour.
+     */
+    private static List<Object> bannerModel(String texPath) {
+        List<Object> faces = new ArrayList<>();
+        // {from x,y,z, to x,y,z, texOffs u,v, w,h,d, dye}
+        double[][] boxes = {
+            { 7.3333, 0.0,     7.3333, 8.6667, 28.0,    8.6667, 44, 0,  2, 42, 2, 0 }, // pole
+            { 1.3333, 28.0,    7.3333, 14.6667, 29.3333, 8.6667, 0, 42, 20, 2, 2, 0 }, // bar
+            { 1.3333, 2.6667,  8.6667, 14.6667, 29.3333, 9.3333, 0, 0,  20, 40, 1, 1 }, // flag (dyed)
+        };
+        for (double[] b : boxes) {
+            double[] from = { b[0], b[1], b[2] }, to = { b[3], b[4], b[5] };
+            double ou = b[6], ov = b[7];
+            double w = b[8], h = b[9], d = b[10];
+            int dye = (int) b[11];
+            double[][] cs = corners(new double[] { 0, 0, 0 }, new double[] { 16, 16, 16 }, null);
+            for (String dir : new String[] { "down", "up", "west", "north", "east", "south" }) {
+                double[][] quad = faceCorners(dir, cs);
+                List<Object> c = new ArrayList<>();
+                for (double[] p : quad) {
+                    // map the 0/16 unit corner onto this box's from..to extents
+                    c.add(List.of(round(from[0] + p[0] / 16 * (to[0] - from[0])),
+                                  round(from[1] + p[1] / 16 * (to[1] - from[1])),
+                                  round(from[2] + p[2] / 16 * (to[2] - from[2]))));
+                }
+                double[] uv = cubeUv(dir, w, h, d, ou, ov);
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("c", c);
+                f.put("uv", List.of(round(uv[0]), round(uv[1]), round(uv[2]), round(uv[3])));
+                f.put("t", texPath);
+                if (dye == 1) f.put("dye", 1);
+                faces.add(f);
+            }
+        }
+        return faces;
+    }
+
     /** Register one chest variant (model synthesised once per type) and add its blockstate entry. */
     private static void chestVariant(Map<String, Object> variants, String base, String variant,
                                      String type, String key, int y) {
@@ -515,6 +604,7 @@ public final class ModelCompiler {
         if (f.get("t") != null) sb.append(",\"t\":").append(q((String) f.get("t")));
         if (f.get("ti") != null) sb.append(",\"ti\":").append(f.get("ti"));
         if (f.get("cf") != null) sb.append(",\"cf\":").append(q((String) f.get("cf")));
+        if (f.get("dye") != null) sb.append(",\"dye\":").append(f.get("dye"));
         sb.append("}");
     }
 

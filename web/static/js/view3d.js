@@ -14,6 +14,15 @@
 
   const N_CHUNKS = 10;      // voxel area side length in chunks (160 blocks)
   const TILE = 16;
+  // the 16 dye colours (RGB 0..1) - banner flags are tinted by their base colour
+  const DYE_COLOURS = {
+    white: [0.99, 0.99, 0.99], orange: [0.98, 0.50, 0.11], magenta: [0.78, 0.31, 0.74],
+    light_blue: [0.23, 0.70, 0.85], yellow: [1.00, 0.85, 0.24], lime: [0.50, 0.78, 0.12],
+    pink: [0.95, 0.55, 0.67], gray: [0.28, 0.31, 0.32], light_gray: [0.62, 0.62, 0.59],
+    cyan: [0.09, 0.61, 0.61], purple: [0.54, 0.20, 0.72], blue: [0.24, 0.27, 0.67],
+    brown: [0.51, 0.33, 0.20], green: [0.37, 0.49, 0.09], red: [0.69, 0.18, 0.15],
+    black: [0.11, 0.11, 0.13],
+  };
 
   let renderer = null, scene = null, camera = null, controls = null;
   let raf = null, canvas = null, closeBtn = null, statusEl = null;
@@ -650,6 +659,12 @@
           const texSize = ent ? (ent.size || 64) : 16;
           let color = [1, 1, 1];
           if (!ent && f.ti != null && inf) { const t = tintOf(biome, inf.tint || 'none'); if (t) color = t; }
+          // banners: the flag faces are dyed by the banner's base colour (from the block name)
+          if (f.dye) {
+            const m = baseId.match(/^(?:minecraft:)?([a-z_]+?)_(?:wall_)?banner$/);
+            const dye = m && DYE_COLOURS[m[1]];
+            if (dye) color = dye;
+          }
           const uv0 = f.uv;
           // UVs are indexed by vertex exactly as vanilla's CuboidFace.UVs.getVertexU/V: corners
           // 0,1 take minU and 2,3 take maxU; corners 0,3 take minV and 1,2 take maxV. (Swapping the
