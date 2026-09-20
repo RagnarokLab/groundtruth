@@ -223,9 +223,12 @@ async function loadPlayer() {
     api(`/api/admin/heatmap?since=${since}&cell=${cell}${aq}`),
     api(`/api/admin/track?since=${since}${aq}`),
   ]);
-  drawPlayer(heat.cells || [], track.points || [], cell);
-  setMsg($('p_msg'), `${(heat.cells || []).length} heat cells · ${(track.points || []).length} points`);
-  sendOverlay({ cells: heat.cells || [], cell, points: track.points || [], fit: fitOf(track.points) });
+  drawPlayer(heat.cells || [], actor ? (track.points || []) : [], cell);
+  setMsg($('p_msg'), `${(heat.cells || []).length} heat cells · ${(track.points || []).length} points`
+    + (actor ? '' : ' · type an actor to see a trail'));
+  // only send a trail when a specific actor was chosen - otherwise it's everyone's track mixed together
+  sendOverlay({ cells: heat.cells || [], cell, points: actor ? (track.points || []) : [],
+                fit: fitOf(actor ? track.points : []) });
   const ev = await api(`/api/admin/log?since=${since}&limit=1000${aq}`);
   const by = {};
   for (const e of ev.events || []) by[e.action] = (by[e.action] || 0) + 1;

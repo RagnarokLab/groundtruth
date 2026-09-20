@@ -77,6 +77,7 @@ let panX = 0, panZ = 0; // world chunk coords at screen center
 // overlay state must be declared BEFORE draw() is ever called (drawOverlays reads it)
 let overlay = { mode: null, cells: [], cell: 16, points: [], blocks: [] };
 let myTrailOn = false, myTrail = [];
+const overlayLayers = { heat: true, trail: true, blocks: true };
 let dragging = false, dragStartX = 0, dragStartY = 0, dragPanX0 = 0, dragPanZ0 = 0, dragMoved = false;
 
 // Per-viewer display settings (colours) - accessibility/preference, not shared data,
@@ -1047,10 +1048,12 @@ const adminBtn = document.getElementById('adminBtn');
 function applyIdentity(id) {
   const row = document.getElementById('loginRow');
   const trail = document.getElementById('trailRow');
-  if (!id) { loginStatus.textContent = ''; adminBtn.style.display = 'none'; if (row) row.style.display = ''; if (trail) trail.style.display = 'none'; return; }
+  const ov = document.getElementById('overlayRow');
+  if (!id) { loginStatus.textContent = ''; adminBtn.style.display = 'none'; if (row) row.style.display = ''; if (trail) trail.style.display = 'none'; if (ov) ov.style.display = 'none'; return; }
   loginStatus.textContent = 'logged in as ' + id.name + (id.admin ? ' (admin)' : '');
   adminBtn.style.display = id.admin ? '' : 'none';
   if (trail) trail.style.display = '';
+  if (ov) ov.style.display = id.admin ? '' : 'none';
   // admins keep the input box (they'll paste a fresh code next time); players' box goes away for good
   if (row) row.style.display = id.admin ? '' : 'none';
 }
@@ -1092,9 +1095,23 @@ document.getElementById('trailClear').addEventListener('click', () => {
   draw();
 });
 
+// overlay layer toggles (what the admin panel pushes to the map)
+function syncOverlayLayers() {
+  overlayLayers.heat = document.getElementById('ovHeat').checked;
+  overlayLayers.trail = document.getElementById('ovTrail').checked;
+  overlayLayers.blocks = document.getElementById('ovBlocks').checked;
+  draw();
+}
+['ovHeat', 'ovTrail', 'ovBlocks'].forEach((id) =>
+  document.getElementById(id).addEventListener('change', syncOverlayLayers));
+document.getElementById('ovClear').addEventListener('click', () => {
+  overlay = { mode: null, cells: [], cell: 16, points: [], blocks: [] };
+  draw();
+});
+
 // --- map overlays: heat / track / rollback-preview, drawn on the REAL map ----------------------
 function drawOverlays() {
-  if (overlay.cells.length) {
+  if (overlayLayers.heat && overlay.cells.length) {
     let maxN = 1;
     for (const c of overlay.cells) maxN = Math.max(maxN, c[2]);
     const csz = (overlay.cell / 16) * scale;
@@ -1104,14 +1121,15 @@ function drawOverlays() {
       ctx.fillRect(sx, sy, csz, csz);
     }
   }
-  if (overlay.blocks.length) {
+  if (overlayLayers.blocks && overlay.blocks.length) {
     ctx.fillStyle = '#ff5c5c';
     for (const b of overlay.blocks) {
       const [sx, sy] = worldToScreen(b[0] / 16, b[2] / 16);
       ctx.fillRect(sx - 1.5, sy - 1.5, 3, 3);
     }
   }
-  const track = overlay.points.length ? overlay.points : (myTrailOn ? myTrail : null);
+  const track = (overlayLayers.trail && overlay.points.length) ? overlay.points
+              : (myTrailOn ? myTrail : null);
   if (track && track.length) {
     ctx.save();
     ctx.strokeStyle = '#ffd25c';

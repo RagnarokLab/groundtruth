@@ -92,6 +92,13 @@
       <input id="trailToggle" type="checkbox"> my trail
       <button id="trailClear" style="padding:1px 6px">clear</button>
     </label>
+    <div id="overlayRow" style="display:none;font-weight:normal;margin-top:4px">
+      overlay:
+      <label><input id="ovHeat" type="checkbox" checked> heat</label>
+      <label><input id="ovTrail" type="checkbox" checked> trail</label>
+      <label><input id="ovBlocks" type="checkbox" checked> rollback</label>
+      <button id="ovClear" style="padding:1px 6px">clear</button>
+    </div>
     <button id="adminBtn" style="margin-top:6px;display:none">Admin panel</button>
     <input id="search" type="text" placeholder="jump to structure (e.g. village)">
     <div id="results"></div>
@@ -195,7 +202,7 @@
 
 <script src="js/three.min.js?v=2"></script>
 <script src="js/OrbitControls.js?v=2"></script>
-<script src="app.js?v=11"></script>
+<script src="app.js?v=12"></script>
 <script src="js/view3d.js?v=34"></script>
 </body>
 </html>
