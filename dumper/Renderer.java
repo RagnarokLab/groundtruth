@@ -68,6 +68,7 @@ public final class Renderer {
                 case "--min-y": minY = Integer.parseInt(args[++i]); break;
                 case "--max-zoom": maxZoom = Integer.parseInt(args[++i]); break;
                 case "--colors": loadColors(args[++i]); break;
+                case "--biome-tints": Dumper.loadBiomeTints(args[++i]); break;
                 default: System.out.println("unknown arg " + args[i]); return;
             }
         }
@@ -132,6 +133,7 @@ public final class Renderer {
                 int m = biomeLayer ? 1 : 0;
                 int pw = tile + 2 * m; // padded width for the biome margin
                 String[] biomeAt = biomeLayer ? new String[pw * pw] : null;
+                String[] bioChunk = biomeLayer ? null : new String[tile * tile]; // biome per chunk (terrain tint)
                 String[] blockAt = new String[tile * tile];
                 int[] yAt = new int[tile * tile];
                 try (PreparedStatement ps = conn.prepareStatement(
@@ -146,6 +148,7 @@ public final class Renderer {
                             if (px < 0 || py < 0 || px >= tile || py >= tile) continue;
                             blockAt[py * tile + px] = rs.getString(4);
                             yAt[py * tile + px] = rs.getInt(5);
+                            if (bioChunk != null) bioChunk[py * tile + px] = rs.getString(3);
                         }
                     }
                 }
@@ -164,7 +167,9 @@ public final class Renderer {
                             img.setRGB(px, py, 0xFF000000 | rgb);
                         } else {
                             if (blockAt[py * tile + px] == null) continue;
-                            img.setRGB(px, py, 0xFF000000 | terrainColor(blockAt[py * tile + px], yAt[py * tile + px], minY));
+                            img.setRGB(px, py, 0xFF000000 | terrainColor(blockAt[py * tile + px],
+                                    bioChunk != null ? bioChunk[py * tile + px] : null,
+                                    yAt[py * tile + px], minY));
                         }
                     }
                 }
@@ -233,9 +238,10 @@ public final class Renderer {
 
     // --- colours ---
 
-    /** Terrain colour: block colour darkened/lightened by height, so relief and builds read clearly. */
-    static int terrainColor(String block, int y, int minY) {
+    /** Terrain colour: the surface block's real colour, biome-tinted, then shaded by height. */
+    static int terrainColor(String block, String biome, int y, int minY) {
         int base = blockColor(block);
+        if (biome != null) base = Dumper.tintColor(biome, block, base); // grass/foliage/water per biome
         float t = Math.max(0f, Math.min(1f, (y - minY) / 200f)); // 0 low .. 1 high
         float shade = 0.65f + 0.5f * t;
         return scale(base, shade);

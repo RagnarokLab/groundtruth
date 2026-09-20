@@ -100,6 +100,13 @@ public class Storage {
                         "first_seen INTEGER, " +
                         "UNIQUE(world, type, min_x, min_y, min_z))");
             st.execute("CREATE INDEX IF NOT EXISTS idx_structures_world_type ON structures(world, type)");
+            // Player waypoints (public or private), set from in-game or the website.
+            st.execute("CREATE TABLE IF NOT EXISTS waypoints (" +
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT, name TEXT NOT NULL, world TEXT NOT NULL, " +
+                    "x INTEGER, y INTEGER, z INTEGER, colour TEXT, icon TEXT, " +
+                    "public INTEGER NOT NULL DEFAULT 0, created_ts INTEGER, updated_ts INTEGER, " +
+                    "UNIQUE(uuid, name))");
+            st.execute("CREATE INDEX IF NOT EXISTS idx_waypoints_public ON waypoints(public, world)");
         }
             // Terrain-layer columns (added 2026-09-20 for the map). Safe no-ops on a DB that already
             // has them; lets an older DB be upgraded in place. The offline dumper writes the same columns.
@@ -256,8 +263,7 @@ public class Storage {
         return dx * dx + dz * dz;
     }
 
-    public long countChunks(String world) {
-        return count("SELECT COUNT(*) FROM chunks WHERE world=?", world);
+    public long countChunks(String world) {        return count("SELECT COUNT(*) FROM chunks WHERE world=?", world);
     }
 
     public long countStructures(String world) {
