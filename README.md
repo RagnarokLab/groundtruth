@@ -70,6 +70,10 @@ The atlas, block colours, biome tints and compiled block models are **generated 
 operator's own Minecraft client jar** at runtime. They are Mojang-derived and are **never** committed
 or redistributed — `.gitignore` excludes them. Only the code that generates them lives here.
 
+## Licence
+
+MIT - see `LICENSE`.
+
 ## Status
 
 Early / alpha. Built for a private server first.
