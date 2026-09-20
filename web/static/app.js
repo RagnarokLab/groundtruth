@@ -243,7 +243,8 @@ function drawTileLayer(layer, alpha) {
       const cx = tileMeta.minCx + tx * spanChunks;
       const cz = tileMeta.minCz + tz * spanChunks;
       const [sx, sy] = worldToScreen(cx, cz);
-      const img = tileImage(`/tiles/${encodeURIComponent(currentWorld)}/${layer}/${z}/${tx}_${tz}.png`);
+      const img = tileImage(`/tiles/${encodeURIComponent(currentWorld)}/${layer}/${z}/${tx}_${tz}.png`
+        + (tileMeta && tileMeta.built ? `?v=${tileMeta.built}` : ''));
       if (img._ok) ctx.drawImage(img, sx, sy, sizePx, sizePx);
     }
   }
@@ -945,7 +946,7 @@ async function load() {
   try {
     const [sres, mres] = await Promise.all([
       fetch(`/api/structures?world=${encodeURIComponent(currentWorld)}`),
-      fetch(`/tiles/${encodeURIComponent(currentWorld)}/meta.json`)
+      fetch(`/tiles/${encodeURIComponent(currentWorld)}/meta.json?v=${Date.now()}`)
         .then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ]);
     const sdata = await sres.json();

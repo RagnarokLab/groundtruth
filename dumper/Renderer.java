@@ -231,6 +231,7 @@ public final class Renderer {
                 + "  \"minCz\": " + minCz + ", \"maxCz\": " + maxCz + ",\n"
                 + "  \"maxZoom\": " + maxZ + ",\n"
                 + "  \"minY\": " + minY + ",\n"
+                + "  \"built\": " + (System.currentTimeMillis() / 1000L) + ",\n"
                 + "  \"layers\": [\"terrain\", \"biome\"]\n"
                 + "}\n";
         Files.write(new File(outDir, world + "/meta.json").toPath(), json.getBytes());
