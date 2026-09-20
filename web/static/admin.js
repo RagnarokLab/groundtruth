@@ -3,6 +3,7 @@
 
 const $ = (id) => document.getElementById(id);
 let CODE = localStorage.getItem('gt_code') || localStorage.getItem('gt_admin_code') || '';
+const IDENT = (() => { try { return JSON.parse(localStorage.getItem('gt_identity') || 'null') || {}; } catch (e) { return {}; } })();
 let tab = 'dash';
 let evTimer = null, conTimer = null;
 
@@ -217,11 +218,12 @@ async function loadPlayer() {
   const actor = $('p_actor').value.trim();
   const hours = parseInt($('p_hours').value || '24', 10);
   const cell = parseInt($('p_cell').value || '16', 10);
+  const source = $('p_source') ? $('p_source').value : 'raw';
   const since = Date.now() - hours * 3600000;
   const aq = actor ? '&actor=' + encodeURIComponent(actor) : '';
   setMsg($('p_msg'), 'loading…');
   const [heat, track] = await Promise.all([
-    api(`/api/admin/heatmap?since=${since}&cell=${cell}${aq}`),
+    api(`/api/admin/heatmap?since=${since}&cell=${cell}&source=${source}${aq}`),
     api(`/api/admin/track?since=${since}${aq}`),
   ]);
   drawPlayer(heat.cells || [], actor ? (track.points || []) : [], cell);
@@ -398,6 +400,29 @@ async function diffInventories() {
 }
 $('iv_load').onclick = () => loadInventories().catch((e) => setMsg($('iv_msg'), String(e.message || e), true));
 $('iv_diff').onclick = () => diffInventories().catch((e) => setMsg($('iv_dmsg'), String(e.message || e), true));
+
+// --- permission tiers: rollback buttons need the rollback flag ----------------------------------
+if (!IDENT.rollback) {
+  ['r_apply', 'u_btn'].forEach((id) => {
+    const el = $(id);
+    if (el) { el.disabled = true; el.title = 'needs the groundtruth.admin.rollback permission'; }
+  });
+  if ($('r_msg')) $('r_msg').textContent = 'view-only (no rollback permission)';
+}
+
+// --- exports (CSV download; the code rides in the query since a download can't set headers) ------
+function exportUrl(params) {
+  return '/api/admin/export?' + new URLSearchParams(Object.assign({ code: CODE }, params)).toString();
+}
+$('ev_export').onclick = () => {
+  const since = Date.now() - parseInt($('f_minutes').value || '1440', 10) * 60000;
+  window.open(exportUrl({ type: 'events', since: String(since), limit: '50000',
+    actor: $('f_actor').value.trim(), action: $('f_action').value.trim() }), '_blank');
+};
+$('fl_export').onclick = () => {
+  window.open(exportUrl({ type: 'flow', world: $('c_world').value.trim(),
+    item: $('fl_item').value.trim(), min: $('fl_min').value }), '_blank');
+};
 $('p_run').onclick = () => loadPlayer().catch((e) => setMsg($('p_msg'), String(e.message || e), true));
 $('r_preview').onclick = () => previewRollback().catch((e) => setMsg($('r_msg'), String(e.message || e), true));
 $('r_apply').onclick = () => applyRollback().catch((e) => setMsg($('r_msg'), String(e.message || e), true));

@@ -5,6 +5,7 @@ Read-only against the plugin's own sqlite db; never touches the world files
 or any other plugin's data. Serves a static canvas map + a JSON data API.
 """
 import base64
+import csv
 import hashlib
 import hmac
 import io
@@ -424,14 +425,14 @@ def _client_ip(handler):
     return handler.client_address[0]
 
 
-def admin_auth(handler, qs):
-    """(ok, reason) for an admin endpoint: the token must be valid AND carry the admin flag."""
+def admin_auth(handler, qs, need_rollback=False):
+    """(ok, reason) for an admin endpoint: valid token + admin flag (and the rollback flag if needed)."""
     ip = _client_ip(handler)
     if ip in _admin_banned:
         return False, "banned"
     code = handler.headers.get("X-GT-Code") or (qs.get("code", [""])[0])
     payload = verify_token(code)
-    if payload and payload.get("a") == 1:
+    if payload and payload.get("a") == 1 and (not need_rollback or payload.get("p") == 1):
         if _admin_fails.pop(ip, None) is not None:
             _save_admin_fails()
         return True, "ok"
@@ -514,8 +515,28 @@ def _actor_clause(actor, alias="pl", col="name"):
     return f" AND ({alias}.{col} LIKE ? OR p.uuid LIKE ?)", ["%" + actor + "%", "%" + actor + "%"]
 
 
-def admin_heatmap(world=None, actor=None, since_ms=0, until_ms=0, cell=16, cap=400000):
-    """Density of player position samples, bucketed into `cell`-sized squares (chunk-aligned by default)."""
+def admin_heatmap(world=None, actor=None, since_ms=0, until_ms=0, cell=16, cap=400000, source="raw"):
+    """Density of player position samples, bucketed into `cell`-sized squares (chunk-aligned by default).
+    source='heat' reads the pre-aggregated log_heat table (fast, chunk cells only)."""
+    if source == "heat" and cell == 16 and os.path.exists(LOG_DB_PATH):
+        conn = _log_conn()
+        try:
+            where, args = "WHERE 1=1", []
+            if world:
+                where += " AND h.world=?"; args.append(world)
+            if actor:
+                where += " AND (pl.name LIKE ? OR h.uuid LIKE ?)"; args += ["%" + actor + "%", "%" + actor + "%"]
+            if since_ms:
+                where += " AND h.day >= ?"; args.append(since_ms // 86400000)
+            if until_ms:
+                where += " AND h.day <= ?"; args.append(until_ms // 86400000)
+            rows = conn.execute(
+                f"SELECT h.gx,h.gz,SUM(h.n) FROM log_heat h LEFT JOIN log_players pl ON pl.uuid=h.uuid "
+                f"{where} GROUP BY 1,2", args).fetchall()
+            return {"enabled": True, "cell": 16, "source": "heat",
+                    "cells": [[r[0], r[1], r[2]] for r in rows]}
+        finally:
+            conn.close()
     if not os.path.exists(LOG_DB_PATH):
         return {"enabled": False, "cells": []}
     conn = _log_conn()
@@ -1058,7 +1079,7 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query)
 
         if parsed.path in ("/api/admin/rollback/apply", "/api/admin/rollback/undo"):
-            ok, why = admin_auth(self, qs)
+            ok, why = admin_auth(self, qs, need_rollback=True)
             if not ok:
                 body = json.dumps({"error": "Denied."}).encode()
                 self.send_response(429 if why == "banned" else 401)
@@ -1198,7 +1219,8 @@ class Handler(BaseHTTPRequestHandler):
             if not consume_once(payload):
                 self._send_json({"error": "That code has already been used."})
                 return
-            self._send_json({"name": payload.get("n"), "uuid": payload.get("u"), "admin": payload.get("a") == 1})
+            self._send_json({"name": payload.get("n"), "uuid": payload.get("u"),
+                             "admin": payload.get("a") == 1, "rollback": payload.get("p") == 1})
             return
 
         if parsed.path.startswith("/api/admin/"):
@@ -1227,7 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(admin_heatmap(
                         qs.get("world", [None])[0], qs.get("actor", [None])[0],
                         int(qs.get("since", ["0"])[0]), int(qs.get("until", ["0"])[0]),
-                        int(qs.get("cell", ["16"])[0])))
+                        int(qs.get("cell", ["16"])[0]), 400000, qs.get("source", ["raw"])[0]))
                 elif parsed.path == "/api/admin/track":
                     self._send_json(admin_track(
                         qs.get("world", [None])[0], qs.get("actor", [None])[0],
@@ -1249,6 +1271,46 @@ class Handler(BaseHTTPRequestHandler):
                 elif parsed.path == "/api/admin/container":
                     self._send_json(admin_container(qs.get("world", [""])[0],
                                                     int(qs["x"][0]), int(qs["y"][0]), int(qs["z"][0])))
+                elif parsed.path == "/api/admin/export":
+                    kind = qs.get("type", ["events"])[0]
+                    fmt = qs.get("format", ["csv"])[0]
+                    ex = int(qs["x"][0]) if "x" in qs else None
+                    ez = int(qs["z"][0]) if "z" in qs else None
+                    er = int(qs.get("r", ["0"])[0])
+                    esince = int(qs.get("since", ["0"])[0])
+                    elimit = int(qs.get("limit", ["5000"])[0])
+                    actor = qs.get("actor", [None])[0]
+                    world = qs.get("world", [None])[0]
+                    if kind == "flow":
+                        rows = admin_flow(world, ex, ez, er, qs.get("item", [None])[0]).get("rows", [])
+                        cols = ["world", "x", "y", "z", "item", "bucket", "n", "updated"]
+                    elif kind == "inventories":
+                        rows = admin_inventories(qs.get("uuid", [None])[0], elimit).get("rows", [])
+                        for row in rows:
+                            row["contents"] = json.dumps(row.get("contents"))
+                        cols = ["id", "uuid", "ts", "reason", "contents"]
+                    else:
+                        rows = log_query(world, ex, ez, er, esince, actor,
+                                         qs.get("action", [None])[0], elimit, 0).get("events", [])
+                        cols = ["ts", "world", "x", "y", "z", "action", "actorKind", "actorId", "actorName",
+                                "causeName", "target", "before", "after", "meta"]
+                    if fmt == "json":
+                        body = json.dumps(rows).encode()
+                        ctype = "application/json"
+                    else:
+                        buf = io.StringIO()
+                        w = csv.writer(buf)
+                        w.writerow(cols)
+                        for row in rows:
+                            w.writerow([row.get(c, "") for c in cols])
+                        body = buf.getvalue().encode()
+                        ctype = "text/csv"
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Disposition", f'attachment; filename="groundtruth-{kind}.{fmt}"')
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 elif parsed.path == "/api/admin/flow":
                     self._send_json(admin_flow(
                         qs.get("world", [None])[0],

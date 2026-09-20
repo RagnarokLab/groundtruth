@@ -51,6 +51,11 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             getServer().getPluginManager().registerEvents(new LogListener(logDb), this);
             startPositionSampler();
             startInventorySampler();
+            int heatSecs = getConfig().getInt("heat-aggregate-seconds", 600);
+            if (heatSecs > 0) {
+                getServer().getScheduler().runTaskTimerAsynchronously(this,
+                        () -> logDb.aggregateHeat(), 200L, heatSecs * 20L);
+            }
         }
         getCommand("groundtruth").setExecutor(this);
         getLogger().info("[GroundTruth] Ready. New chunks are indexed live; run /groundtruth dump <world> to backfill existing ones.");
@@ -516,10 +521,11 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         if (sender instanceof Player) {
             Player p = (Player) sender;
             boolean admin = p.hasPermission("groundtruth.admin") || p.isOp();
+            boolean rollback = p.hasPermission("groundtruth.admin.rollback") || p.isOp();
             long adminTtl = getConfig().getLong("admin-code-hours", 24) * 3600_000L;
             long ttl = admin ? adminTtl : 15L * 60 * 1000;
-            String token = auth.token(p.getUniqueId().toString(), p.getName(), admin, ttl);
-            sender.sendMessage("[GroundTruth] Your login code" + (admin ? " (admin)" : "") + ":");
+            String token = auth.token(p.getUniqueId().toString(), p.getName(), admin, rollback, ttl);
+            sender.sendMessage("[GroundTruth] Your login code" + (admin ? " (admin" + (rollback ? "+rollback" : "") + ")" : "") + ":");
             sender.sendMessage(token);
             sender.sendMessage("[GroundTruth] Paste it into the map login box. "
                     + (admin ? "Valid until it expires (default 24h), one use."
@@ -528,7 +534,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         }
         // Console / RCON: console access already means full control, so this is always an admin code.
         long ttl = getConfig().getLong("admin-code-hours", 24) * 3600_000L;
-        String token = auth.token("console", sender.getName(), true, ttl);
+        String token = auth.token("console", sender.getName(), true, true, ttl);
         sender.sendMessage("[GroundTruth] Admin login code (console):");
         sender.sendMessage(token);
         sender.sendMessage("[GroundTruth] One use. (It will appear in the server log.)");

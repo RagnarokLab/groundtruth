@@ -37,10 +37,11 @@ public final class Auth {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(b);
     }
 
-    /** @param ttlMs how long the code stays valid (players short, admins long). */
-    public String token(String uuid, String name, boolean admin, long ttlMs) {
+    /** @param ttlMs how long the code stays valid (players short, admins per config). */
+    public String token(String uuid, String name, boolean admin, boolean rollback, long ttlMs) {
         long exp = System.currentTimeMillis() + ttlMs;
         String payload = "{\"u\":\"" + esc(uuid) + "\",\"n\":\"" + esc(name) + "\",\"a\":" + (admin ? 1 : 0)
+                + ",\"p\":" + (rollback ? 1 : 0)
                 + ",\"e\":" + exp + ",\"j\":\"" + randomId() + "\"}";
         String p = b64(payload.getBytes(StandardCharsets.UTF_8));
         return p + "." + b64(hmac(p));

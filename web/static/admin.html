@@ -33,6 +33,19 @@
   .hide { display:none !important; }
   #loginBar { padding:8px 16px; background:#121b26; border-bottom:1px solid var(--line); }
   .err { color:#ff9a8a; }
+  @media (max-width: 720px) {
+    header h1 { font-size:14px; }
+    nav { overflow-x:auto; white-space:nowrap; }
+    nav button { padding:4px 10px; font-size:13px; }
+    main { padding:8px; }
+    .card { padding:10px; }
+    .row { gap:6px; }
+    .row label { font-size:13px; }
+    input, select, button { font-size:13px; padding:5px 6px; }
+    table { font-size:12px; }
+    canvas { max-width:100%; height:auto; }
+    .scroll { max-height:50vh; }
+  }
 </style>
 </head>
 <body>
@@ -78,6 +91,7 @@
       <label>Minutes <input id="f_minutes" type="number" value="1440" size="6" style="width:80px"></label>
       <label>Limit <input id="f_limit" type="number" value="200" size="6" style="width:80px"></label>
       <button class="primary" id="runBtn">Search</button>
+      <button id="ev_export">Export CSV</button>
       <span id="evMsg" class="muted"></span>
     </div>
     <div class="card">
@@ -97,6 +111,7 @@
       <label>Actor <input id="p_actor" placeholder="player / creeper" size="16"></label>
       <label>Hours <input id="p_hours" type="number" value="24" style="width:70px"></label>
       <label>Cell <input id="p_cell" type="number" value="16" style="width:70px"></label>
+      <label>source <select id="p_source"><option value="raw">raw</option><option value="heat">heat (fast)</option></select></label>
       <button class="primary" id="p_run">Load</button>
       <span id="p_msg" class="muted"></span>
     </div>
@@ -159,6 +174,7 @@
         <label>Item filter <input id="fl_item" placeholder="iron_ingot" size="16"></label>
         <label>Min count <input id="fl_min" type="number" value="1" style="width:70px"></label>
         <button id="fl_run">Load flow</button>
+        <button id="fl_export">Export CSV</button>
         <span id="fl_msg" class="muted"></span>
       </div>
       <div class="scroll" style="max-height:40vh">

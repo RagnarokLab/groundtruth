@@ -106,6 +106,14 @@ public class LogDb implements AutoCloseable {
                     "item TEXT NOT NULL, bucket INTEGER NOT NULL, n INTEGER NOT NULL, updated_ts INTEGER, " +
                     "PRIMARY KEY (world, x, y, z, item, bucket))");
             st.execute("CREATE INDEX IF NOT EXISTS idx_flow_pos ON log_container_flow(world, x, z, bucket)");
+            // Pre-aggregated heatmap: positions rolled into per-player/day/chunk cells so the map's heat
+            // overlay never has to scan raw log_positions. log_meta tracks the last aggregation point.
+            st.execute("CREATE TABLE IF NOT EXISTS log_heat (" +
+                    "uuid TEXT NOT NULL, day INTEGER NOT NULL, world TEXT NOT NULL, " +
+                    "gx INTEGER NOT NULL, gz INTEGER NOT NULL, n INTEGER NOT NULL, " +
+                    "PRIMARY KEY (uuid, day, world, gx, gz))");
+            st.execute("CREATE INDEX IF NOT EXISTS idx_heat_day ON log_heat(day, world)");
+            st.execute("CREATE TABLE IF NOT EXISTS log_meta (k TEXT PRIMARY KEY, v INTEGER)");
         }
     }
 
@@ -231,6 +239,45 @@ public class LogDb implements AutoCloseable {
             } catch (SQLException e) {
                 try { writeConn.rollback(); } catch (SQLException ignored) {}
                 log.warning("[GroundTruth] flow flush failed: " + e.getMessage());
+            } finally {
+                try { writeConn.setAutoCommit(true); } catch (SQLException ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Roll any new position samples into log_heat (per uuid/day/world/chunk cell). Idempotent: it only
+     * processes positions newer than the last run (tracked in log_meta), appending to the counters.
+     */
+    public void aggregateHeat() {
+        synchronized (this) {
+            try {
+                long last = 0;
+                try (PreparedStatement ps = writeConn.prepareStatement("SELECT v FROM log_meta WHERE k='heat_ts'");
+                     ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) last = rs.getLong(1);
+                }
+                long now = System.currentTimeMillis();
+                writeConn.setAutoCommit(false);
+                try (PreparedStatement ps = writeConn.prepareStatement(
+                        "INSERT INTO log_heat (uuid,day,world,gx,gz,n) " +
+                        "SELECT uuid, ts/86400000, world, " +
+                        "  (x - (((x % 16) + 16) % 16)) / 16, (z - (((z % 16) + 16) % 16)) / 16, COUNT(*) " +
+                        "FROM log_positions WHERE ts>? AND ts<=? GROUP BY 1,2,3,4,5 " +
+                        "ON CONFLICT(uuid,day,world,gx,gz) DO UPDATE SET n = n + excluded.n")) {
+                    ps.setLong(1, last);
+                    ps.setLong(2, now);
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = writeConn.prepareStatement(
+                        "INSERT INTO log_meta (k,v) VALUES ('heat_ts',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v")) {
+                    ps.setLong(1, now);
+                    ps.executeUpdate();
+                }
+                writeConn.commit();
+            } catch (SQLException e) {
+                try { writeConn.rollback(); } catch (SQLException ignored) {}
+                log.warning("[GroundTruth] heat aggregation failed: " + e.getMessage());
             } finally {
                 try { writeConn.setAutoCommit(true); } catch (SQLException ignored) {}
             }
