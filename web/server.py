@@ -270,12 +270,19 @@ def players():
 SKIN_CACHE = Path("/opt/groundtruth-web/skin-cache")
 TILES_DIR = Path("/opt/groundtruth-web/tiles")
 
+MAX_STRUCT_PER_TYPE = int(os.environ.get("GT_MAX_STRUCT_PER_TYPE", "20000"))
+
+
 def structures_only(world):
     conn = db_ro()
     try:
+        # Guard: a single very common structure type (e.g. a mod that spawns a structure start for
+        # every monster room) can produce >1M rows and a >100MB response, which breaks the client.
+        # Exclude any type with more than MAX_STRUCT_PER_TYPE instances - it's icon spam anyway.
         rows = conn.execute(
-            "SELECT type,min_x,min_y,min_z,max_x,max_y,max_z FROM structures WHERE world=?", (world,)
-        ).fetchall()
+            "SELECT type,min_x,min_y,min_z,max_x,max_y,max_z FROM structures WHERE world=? "
+            "AND type NOT IN (SELECT type FROM structures WHERE world=? GROUP BY type HAVING COUNT(*) > ?)",
+            (world, world, MAX_STRUCT_PER_TYPE)).fetchall()
         out = [{"type": r[0], "minX": r[1], "minY": r[2], "minZ": r[3],
                 "maxX": r[4], "maxY": r[5], "maxZ": r[6],
                 "x": (r[1] + r[4]) // 2, "y": (r[2] + r[5]) // 2, "z": (r[3] + r[6]) // 2}
@@ -328,6 +335,40 @@ def nbt_near(world, x, z, radius=48, limit=200):
         return {"world": world, "count": len(rows),
                 "items": [{"kind": r[0], "id": r[1], "x": r[2], "y": r[3], "z": r[4],
                            "nbt": _decode_nbt(r[5])} for r in rows]}
+    finally:
+        conn.close()
+
+
+LOG_DB_PATH = os.environ.get("GT_LOG_DB", "/opt/minecraft/plugins/GroundTruth/groundtruth-log.db")
+
+
+def log_query(world=None, x=None, z=None, radius=0, since_ms=0, player=None, action=None, limit=200):
+    """Read-only query over the M-Log event log (groundtruth-log.db), newest first."""
+    if not os.path.exists(LOG_DB_PATH):
+        return {"enabled": False, "count": 0, "events": []}
+    conn = sqlite3.connect(f"file:{LOG_DB_PATH}?mode=ro", uri=True)
+    try:
+        sql = ("SELECT ts,world,x,y,z,action,actor_kind,actor_id,actor_name,cause_kind,cause_id,"
+               "cause_name,target,before,after,meta FROM log_events WHERE 1=1")
+        args = []
+        if world:
+            sql += " AND world=?"; args.append(world)
+        if player:
+            sql += " AND (actor_name LIKE ? OR actor_id=?)"; args += ["%" + player + "%", player]
+        if x is not None and z is not None and radius:
+            sql += " AND x>=? AND x<=? AND z>=? AND z<=?"
+            args += [x - radius, x + radius, z - radius, z + radius]
+        if since_ms:
+            sql += " AND ts>=?"; args.append(since_ms)
+        if action:
+            sql += " AND action=?"; args.append(action)
+        sql += " ORDER BY ts DESC LIMIT ?"; args.append(max(1, min(limit, 5000)))
+        rows = conn.execute(sql, args).fetchall()
+        out = [{"ts": r[0], "world": r[1], "x": r[2], "y": r[3], "z": r[4], "action": r[5],
+                "actorKind": r[6], "actorId": r[7], "actorName": r[8],
+                "causeKind": r[9], "causeId": r[10], "causeName": r[11],
+                "target": r[12], "before": r[13], "after": r[14], "meta": r[15]} for r in rows]
+        return {"enabled": True, "count": len(out), "events": out}
     finally:
         conn.close()
 
@@ -707,6 +748,19 @@ class Handler(BaseHTTPRequestHandler):
                 else:          # everything within r blocks (XZ)
                     self._send_json(nbt_near(world, int(qs.get("x", ["0"])[0]), int(qs.get("z", ["0"])[0]),
                                              int(qs.get("r", ["48"])[0]), int(qs.get("limit", ["200"])[0])))
+            except ValueError:
+                self.send_response(400); self.end_headers(); return
+            return
+
+        if parsed.path == "/api/log":
+            try:
+                x = int(qs["x"][0]) if "x" in qs else None
+                z = int(qs["z"][0]) if "z" in qs else None
+                self._send_json(log_query(
+                    qs.get("world", [None])[0], x, z,
+                    int(qs.get("r", ["0"])[0]), int(qs.get("since", ["0"])[0]),
+                    qs.get("player", [None])[0], qs.get("action", [None])[0],
+                    int(qs.get("limit", ["200"])[0])))
             except ValueError:
                 self.send_response(400); self.end_headers(); return
             return

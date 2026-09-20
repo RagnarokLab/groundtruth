@@ -2,7 +2,9 @@ package club.footlickers.groundtruth;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
+import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -18,7 +20,9 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
 
     private Storage storage;
     private ChunkIndexer indexer;
+    private LogDb logDb;
     private final Map<String, DumpTask> dumpsInProgress = new HashMap<>();
+    private final Map<java.util.UUID, Location> lastSample = new HashMap<>();
 
     @Override
     public void onEnable() {
@@ -29,8 +33,17 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
+        try {
+            logDb = new LogDb(getDataFolder(), getLogger());
+        } catch (SQLException e) {
+            getLogger().warning("[GroundTruth] Failed to open groundtruth-log.db, logging disabled: " + e.getMessage());
+        }
         indexer = new ChunkIndexer(this, storage);
         getServer().getPluginManager().registerEvents(new ChunkListener(indexer), this);
+        if (logDb != null) {
+            getServer().getPluginManager().registerEvents(new LogListener(logDb), this);
+            startPositionSampler();
+        }
         getCommand("groundtruth").setExecutor(this);
         getLogger().info("[GroundTruth] Ready. New chunks are indexed live; run /groundtruth dump <world> to backfill existing ones.");
     }
@@ -38,12 +51,28 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     @Override
     public void onDisable() {
         if (storage != null) storage.close();
+        if (logDb != null) logDb.close();
+    }
+
+    /** Samples player positions for the heatmap: at most one row per player per ~8 blocks / 5s. */
+    private void startPositionSampler() {
+        getServer().getScheduler().runTaskTimer(this, () -> {
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                Location l = p.getLocation();
+                Location prev = lastSample.get(p.getUniqueId());
+                if (prev == null || prev.getWorld() != l.getWorld() || prev.distanceSquared(l) >= 64) {
+                    lastSample.put(p.getUniqueId(), l.clone());
+                    logDb.position(p.getUniqueId().toString(), l.getWorld().getName(),
+                            l.getBlockX(), l.getBlockY(), l.getBlockZ(), System.currentTimeMillis());
+                }
+            }
+        }, 100L, 100L);
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime> ...");
+            sender.sendMessage("Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|logstatus> ...");
             return true;
         }
         switch (args[0].toLowerCase()) {
@@ -65,8 +94,14 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
                 return handlePortal(sender, args);
             case "slime":
                 return handleSlime(sender, args);
+            case "lookup":
+                return handleLookup(sender, args);
+            case "rollback":
+                return handleRollback(sender, args);
+            case "logstatus":
+                return handleLogStatus(sender, args);
             default:
-                sender.sendMessage("Unknown subcommand. Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime> ...");
+                sender.sendMessage("Unknown subcommand. Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|logstatus> ...");
                 return true;
         }
     }
@@ -279,6 +314,100 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         }
         sender.sendMessage(sb.toString());
         return true;
+    }
+
+    /**
+     * /groundtruth lookup [player] [radius] [minutes] [action] - recent logged events, newest first.
+     * Radius is centred on the sender when they're a player, otherwise on 0,0.
+     */
+    private boolean handleLookup(CommandSender sender, String[] args) {
+        if (logDb == null) { sender.sendMessage("Logging isn't enabled on this server."); return true; }
+        String player = args.length > 1 && !args[1].equals("-") ? args[1] : null;
+        int radius = args.length > 2 ? parseInt(args[2], 0) : 0;
+        int minutes = args.length > 3 ? parseInt(args[3], 60) : 60;
+        String action = args.length > 4 ? args[4] : null;
+        World world = sender instanceof Player ? ((Player) sender).getWorld() : null;
+        int ox = 0, oz = 0;
+        if (sender instanceof Player) {
+            ox = ((Player) sender).getLocation().getBlockX();
+            oz = ((Player) sender).getLocation().getBlockZ();
+        }
+        long since = System.currentTimeMillis() - minutes * 60_000L;
+        List<LogDb.Hit> hits = logDb.lookup(world == null ? null : world.getName(), player, ox, oz, radius, since, action, 20);
+        if (hits.isEmpty()) { sender.sendMessage("[GroundTruth] No logged events match."); return true; }
+        sender.sendMessage("[GroundTruth] " + hits.size() + " recent event(s)"
+                + (world != null ? " in " + world.getName() : "") + ":");
+        for (LogDb.Hit h : hits) {
+            sender.sendMessage(String.format("  %s  %s  %s  @%d,%d,%d  %s",
+                    java.time.Instant.ofEpochMilli(h.ts).atZone(java.time.ZoneId.systemDefault()).toLocalTime().withNano(0),
+                    h.action, h.actorName != null ? h.actorName : (h.actorId != null ? h.actorId : "?"),
+                    h.x, h.y, h.z, h.target != null ? h.target : ""));
+        }
+        return true;
+    }
+
+    /**
+     * /groundtruth rollback <player> [minutes] [radius] - restore blocks that <player> placed or
+     * broke in the window (radius 0 = anywhere in the sender's world). Preview-free for now; L2 adds
+     * a confirm step and a tick budget for large rollbacks.
+     */
+    private boolean handleRollback(CommandSender sender, String[] args) {
+        if (logDb == null) { sender.sendMessage("Logging isn't enabled on this server."); return true; }
+        if (!sender.isOp()) { sender.sendMessage("Ops only."); return true; }
+        if (args.length < 2) {
+            sender.sendMessage("Usage: /groundtruth rollback <player> [minutes] [radius]");
+            return true;
+        }
+        String player = args[1];
+        int minutes = args.length > 2 ? parseInt(args[2], 15) : 15;
+        int radius = args.length > 3 ? parseInt(args[3], 0) : 0;
+        World world = sender instanceof Player ? ((Player) sender).getWorld() : null;
+        int ox = 0, oz = 0;
+        if (sender instanceof Player) {
+            ox = ((Player) sender).getLocation().getBlockX();
+            oz = ((Player) sender).getLocation().getBlockZ();
+        }
+        long since = System.currentTimeMillis() - minutes * 60_000L;
+        List<LogDb.Hit> hits = logDb.findRevertible(world == null ? null : world.getName(),
+                player, ox, oz, radius, since, 5000);
+        if (hits.isEmpty()) {
+            sender.sendMessage("[GroundTruth] Nothing to roll back for " + player + " in the last " + minutes + " min.");
+            return true;
+        }
+        List<Long> ids = new java.util.ArrayList<>();
+        int applied = 0, failed = 0;
+        for (LogDb.Hit h : hits) {
+            World w = h.world != null ? Bukkit.getWorld(h.world) : null;
+            if (w == null) { failed++; continue; }
+            Block b = w.getBlockAt(h.x, h.y, h.z);
+            try {
+                b.setBlockData(h.before != null ? Bukkit.createBlockData(h.before)
+                        : Material.AIR.createBlockData(), false);
+                ids.add(h.id);
+                applied++;
+            } catch (Exception e) {
+                failed++;
+            }
+        }
+        int marked = logDb.markReverted(ids,
+                sender instanceof Player ? ((Player) sender).getUniqueId().toString() : "console",
+                sender.getName(),
+                "{\"player\":" + LogListener.Json.str(player) + ",\"minutes\":" + minutes + ",\"radius\":" + radius + "}");
+        sender.sendMessage("[GroundTruth] Rolled back " + applied + " block(s) by " + player
+                + " (last " + minutes + " min" + (radius > 0 ? ", within " + radius + " blocks" : "") + ")"
+                + (failed > 0 ? ", " + failed + " failed" : "") + "; " + marked + " event(s) marked reverted.");
+        return true;
+    }
+
+    private boolean handleLogStatus(CommandSender sender, String[] args) {
+        if (logDb == null) { sender.sendMessage("Logging isn't enabled on this server."); return true; }
+        sender.sendMessage(String.format("[GroundTruth] log: %,d events stored, %,d written, %,d dropped, queue %d",
+                logDb.eventCount(), logDb.written(), logDb.dropped(), logDb.queueDepth()));
+        return true;
+    }
+
+    private static int parseInt(String s, int def) {
+        try { return Integer.parseInt(s); } catch (NumberFormatException e) { return def; }
     }
 
     private World resolveWorld(CommandSender sender, String[] args, int index) {

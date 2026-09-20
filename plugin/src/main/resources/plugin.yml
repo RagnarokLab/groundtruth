@@ -8,5 +8,5 @@ api-version: '1.21'
 commands:
   groundtruth:
     description: GroundTruth index commands
-    usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime> ...
+    usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|logstatus> ...
     aliases: [gt]

@@ -28,8 +28,9 @@ import java.util.logging.Logger;
  */
 public class Storage {
 
-    private final Connection conn;      // writes only
-    private final Connection readConn;  // reads only
+    private Connection conn;      // writes only
+    private Connection readConn;  // reads only
+    private final String url;
     private final Object readLock = new Object();
     private final Logger log;
 
@@ -39,7 +40,7 @@ public class Storage {
             dataFolder.mkdirs();
         }
         File dbFile = new File(dataFolder, "groundtruth.db");
-        String url = "jdbc:sqlite:" + dbFile.getAbsolutePath();
+        this.url = "jdbc:sqlite:" + dbFile.getAbsolutePath();
         this.conn = DriverManager.getConnection(url);
         this.readConn = DriverManager.getConnection(url);
         try (Statement st = conn.createStatement()) {
@@ -51,6 +52,38 @@ public class Storage {
             st.execute("PRAGMA busy_timeout=5000");
         }
         migrate();
+    }
+
+    /**
+     * Reopen both connections. A long-lived SQLite connection goes stale if another process (the
+     * offline dumper, or a sqlite3 CLI) checkpoints/deletes the -wal/-shm out from under it, after
+     * which every statement fails with SQLITE_CORRUPT even though the file itself is fine. Reopening
+     * recovers without a server restart.
+     */
+    private synchronized void reopen() {
+        log.warning("[GroundTruth] database connection went stale (likely an external dump/checkpoint) - reopening");
+        try { conn.close(); } catch (SQLException ignored) {}
+        try { readConn.close(); } catch (SQLException ignored) {}
+        try {
+            conn = DriverManager.getConnection(url);
+            readConn = DriverManager.getConnection(url);
+            try (Statement st = conn.createStatement()) {
+                st.execute("PRAGMA journal_mode=WAL");
+                st.execute("PRAGMA synchronous=NORMAL");
+                st.execute("PRAGMA busy_timeout=5000");
+            }
+            try (Statement st = readConn.createStatement()) {
+                st.execute("PRAGMA busy_timeout=5000");
+            }
+        } catch (SQLException e) {
+            log.severe("[GroundTruth] failed to reopen the database: " + e.getMessage());
+        }
+    }
+
+    private static boolean isStale(SQLException e) {
+        String m = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
+        return m.contains("malformed") || m.contains("corrupt") || m.contains("closed")
+                || m.contains("disk i/o") || m.contains("no such table");
     }
 
     private void migrate() throws SQLException {
@@ -97,18 +130,23 @@ public class Storage {
                 "inhabited_time=excluded.inhabited_time, indexed_at=excluded.indexed_at, " +
                 "surface_block=excluded.surface_block, surface_y=excluded.surface_y";
         synchronized (this) {
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setString(1, world);
-                ps.setInt(2, cx);
-                ps.setInt(3, cz);
-                ps.setString(4, biome);
-                ps.setLong(5, inhabitedTime);
-                ps.setLong(6, System.currentTimeMillis() / 1000L);
-                ps.setString(7, surfaceBlock);
-                if (surfaceY == null) ps.setNull(8, java.sql.Types.INTEGER); else ps.setInt(8, surfaceY);
-                ps.executeUpdate();
-            } catch (SQLException e) {
-                log.warning("[GroundTruth] chunk upsert failed for " + world + " " + cx + "," + cz + ": " + e.getMessage());
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    ps.setString(1, world);
+                    ps.setInt(2, cx);
+                    ps.setInt(3, cz);
+                    ps.setString(4, biome);
+                    ps.setLong(5, inhabitedTime);
+                    ps.setLong(6, System.currentTimeMillis() / 1000L);
+                    ps.setString(7, surfaceBlock);
+                    if (surfaceY == null) ps.setNull(8, java.sql.Types.INTEGER); else ps.setInt(8, surfaceY);
+                    ps.executeUpdate();
+                    return;
+                } catch (SQLException e) {
+                    if (attempt == 0 && isStale(e)) { reopen(); continue; }
+                    log.warning("[GroundTruth] chunk upsert failed for " + world + " " + cx + "," + cz + ": " + e.getMessage());
+                    return;
+                }
             }
         }
     }
@@ -153,19 +191,24 @@ public class Storage {
         String sql = "INSERT OR IGNORE INTO structures " +
                 "(world, type, min_x, min_y, min_z, max_x, max_y, max_z, first_seen) VALUES (?,?,?,?,?,?,?,?,?)";
         synchronized (this) {
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setString(1, world);
-                ps.setString(2, type);
-                ps.setInt(3, minX);
-                ps.setInt(4, minY);
-                ps.setInt(5, minZ);
-                ps.setInt(6, maxX);
-                ps.setInt(7, maxY);
-                ps.setInt(8, maxZ);
-                ps.setLong(9, System.currentTimeMillis() / 1000L);
-                ps.executeUpdate();
-            } catch (SQLException e) {
-                log.warning("[GroundTruth] structure insert failed for " + type + ": " + e.getMessage());
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    ps.setString(1, world);
+                    ps.setString(2, type);
+                    ps.setInt(3, minX);
+                    ps.setInt(4, minY);
+                    ps.setInt(5, minZ);
+                    ps.setInt(6, maxX);
+                    ps.setInt(7, maxY);
+                    ps.setInt(8, maxZ);
+                    ps.setLong(9, System.currentTimeMillis() / 1000L);
+                    ps.executeUpdate();
+                    return;
+                } catch (SQLException e) {
+                    if (attempt == 0 && isStale(e)) { reopen(); continue; }
+                    log.warning("[GroundTruth] structure insert failed for " + type + ": " + e.getMessage());
+                    return;
+                }
             }
         }
     }
