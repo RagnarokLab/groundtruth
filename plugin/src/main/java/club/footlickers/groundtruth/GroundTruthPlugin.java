@@ -487,18 +487,23 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
      * reusable code; everyone else gets a one-shot code that expires quickly.
      */
     private boolean handleLink(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player)) {
-            sender.sendMessage("Run /groundtruth link in-game (it's bound to your player).");
+        if (sender instanceof Player) {
+            Player p = (Player) sender;
+            boolean admin = p.hasPermission("groundtruth.admin") || p.isOp();
+            long ttl = admin ? 30L * 24 * 3600 * 1000 : 15L * 60 * 1000;
+            String token = auth.token(p.getUniqueId().toString(), p.getName(), admin, ttl);
+            sender.sendMessage("[GroundTruth] Your login code" + (admin ? " (admin)" : "") + ":");
+            sender.sendMessage(token);
+            sender.sendMessage("[GroundTruth] Paste it into the map login box. "
+                    + (admin ? "Valid 30 days, one use." : "One use, expires in 15 minutes."));
             return true;
         }
-        Player p = (Player) sender;
-        boolean admin = p.hasPermission("groundtruth.admin") || p.isOp();
-        long ttl = admin ? 30L * 24 * 3600 * 1000 : 15L * 60 * 1000;
-        String token = auth.token(p.getUniqueId().toString(), p.getName(), admin, ttl);
-        sender.sendMessage("[GroundTruth] Your login code" + (admin ? " (admin)" : "") + ":");
+        // Console / RCON: console access already means full control, so this is always an admin code.
+        long ttl = 30L * 24 * 3600 * 1000;
+        String token = auth.token("console", sender.getName(), true, ttl);
+        sender.sendMessage("[GroundTruth] Admin login code (console):");
         sender.sendMessage(token);
-        sender.sendMessage("[GroundTruth] Paste it into the map login box. "
-                + (admin ? "Valid 30 days, reusable." : "One use, expires in 15 minutes."));
+        sender.sendMessage("[GroundTruth] Valid 30 days, one use. (It will appear in the server log.)");
         return true;
     }
 
