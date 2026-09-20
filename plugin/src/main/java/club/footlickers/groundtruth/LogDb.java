@@ -270,8 +270,9 @@ public class LogDb implements AutoCloseable {
         List<Object> args = new ArrayList<>();
         if (world != null) { sql.append(" AND world=?"); args.add(world); }
         if (playerFilter != null) {
-            sql.append(" AND (actor_name LIKE ? OR actor_id=?)");
-            args.add("%" + playerFilter + "%"); args.add(playerFilter);
+            // matches a player name OR an entity id/name (creeper, enderman, tnt, ...)
+            sql.append(" AND (actor_name LIKE ? OR actor_id LIKE ?)");
+            args.add("%" + playerFilter + "%"); args.add("%" + playerFilter + "%");
         }
         if (radius > 0) {
             sql.append(" AND x>=? AND x<=? AND z>=? AND z<=?"); // radius is in blocks
@@ -304,16 +305,24 @@ public class LogDb implements AutoCloseable {
         return out;
     }
 
-    /** Block place/break events that a rollback could undo, newest first. */
-    public List<Hit> findRevertible(String world, String player, int cx, int cz, int radius,
+    /**
+     * Events a rollback could undo, newest first. The actor filter matches a player name OR an entity
+     * id/name as a substring, so `/groundtruth rollback creeper`, `enderman`, `tnt`, etc. all work
+     * the same way a player name does.
+     */
+    public List<Hit> findRevertible(String world, String actor, int cx, int cz, int radius,
                                     long sinceTs, int limit) {
         List<Hit> out = new ArrayList<>();
         StringBuilder sql = new StringBuilder(
-                "SELECT id,ts,world,x,y,z,action,actor_name,target,before,after FROM log_events " +
-                "WHERE reverted=0 AND action IN ('block-place','block-break')");
+                "SELECT id,ts,world,x,y,z,action,actor_kind,actor_id,actor_name,target,before,after " +
+                "FROM log_events WHERE reverted=0 AND action IN " +
+                "('block-place','block-break','entity-change-block','fluid-place','fluid-pickup')");
         List<Object> args = new ArrayList<>();
         if (world != null) { sql.append(" AND world=?"); args.add(world); }
-        if (player != null) { sql.append(" AND actor_name=?"); args.add(player); }
+        if (actor != null) {
+            sql.append(" AND (actor_name LIKE ? OR actor_id LIKE ?)");
+            args.add("%" + actor + "%"); args.add("%" + actor + "%");
+        }
         if (radius > 0) {
             sql.append(" AND x>=? AND x<=? AND z>=? AND z<=?");
             args.add(cx - radius); args.add(cx + radius); args.add(cz - radius); args.add(cz + radius);

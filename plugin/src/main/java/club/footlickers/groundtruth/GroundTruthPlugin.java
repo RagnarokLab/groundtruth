@@ -362,7 +362,8 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         if (logDb == null) { sender.sendMessage("Logging isn't enabled on this server."); return true; }
         if (!sender.isOp()) { sender.sendMessage("Ops only."); return true; }
         if (args.length < 2) {
-            sender.sendMessage("Usage: /groundtruth rollback <player> [minutes] [radius] | confirm | cancel | undo <id>");
+            sender.sendMessage("Usage: /groundtruth rollback <player|mob> [minutes] [radius] | confirm | cancel | undo <id>");
+            sender.sendMessage("  e.g. rollback creeper 120 64  /  rollback enderman 1440  /  rollback Steve 30");
             return true;
         }
         String sub = args[1].toLowerCase();
