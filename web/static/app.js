@@ -371,6 +371,7 @@ function draw() {
   drawDetail();   // block-resolution detail on top when zoomed in
   ensureDetail();
   drawOverlays(); // heat / track / rollback-preview overlays on the real map
+  drawWaypoints();
 
   // Per-chunk overlays: slime stripes (computed live from the seed, visible chunks only) and the
   // biome outline (coords fetched on demand from /api/biome_chunks when a biome is ticked).
@@ -1050,10 +1051,12 @@ function applyIdentity(id) {
   const row = document.getElementById('loginRow');
   const trail = document.getElementById('trailRow');
   const ov = document.getElementById('overlayRow');
-  if (!id) { loginStatus.textContent = ''; adminBtn.style.display = 'none'; if (row) row.style.display = ''; if (trail) trail.style.display = 'none'; if (ov) ov.style.display = 'none'; return; }
+  const wpBtn = document.getElementById('waypointBtn');
+  if (!id) { loginStatus.textContent = ''; adminBtn.style.display = 'none'; if (row) row.style.display = ''; if (trail) trail.style.display = 'none'; if (ov) ov.style.display = 'none'; if (wpBtn) wpBtn.style.display = 'none'; return; }
   loginStatus.textContent = 'logged in as ' + id.name + (id.admin ? ' (admin)' : '');
   adminBtn.style.display = id.admin ? '' : 'none';
   if (trail) trail.style.display = '';
+  if (wpBtn) wpBtn.style.display = '';
   if (ov) ov.style.display = id.admin ? '' : 'none';
   // admins keep the input box (they'll paste a fresh code next time); players' box goes away for good
   if (row) row.style.display = id.admin ? '' : 'none';
@@ -1089,6 +1092,9 @@ window.addEventListener('message', (e) => {
 });
 
 document.getElementById('trailToggle').addEventListener('change', (e) => toggleMyTrail(e.target.checked));
+document.getElementById('waypointBtn').addEventListener('click', () => addWaypointHere());
+loadWaypoints();
+setInterval(loadWaypoints, 60000);
 document.getElementById('trailClear').addEventListener('click', () => {
   myTrail = [];
   myTrailOn = false;
@@ -1173,6 +1179,51 @@ async function toggleMyTrail(on) {
     myTrail = d.points || [];
   } catch (e) { myTrail = []; }
   draw();
+}
+
+// --- waypoints (public = everyone, private = owner only) ---------------------------------------
+let waypoints = [];
+
+function drawWaypoints() {
+  for (const w of waypoints) {
+    if (w.world !== currentWorld) continue;
+    const [sx, sy] = worldToScreen(w.x / 16, w.z / 16);
+    if (sx < -30 || sy < -30 || sx > canvas.width + 30 || sy > canvas.height + 30) continue;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(sx, sy, 7, 0, Math.PI * 2);
+    ctx.fillStyle = w.public ? '#ffd25c' : '#3fd0c9';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#101820';
+    ctx.stroke();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(w.name, sx + 10, sy + 4);
+    ctx.restore();
+  }
+}
+
+async function loadWaypoints() {
+  try {
+    const code = localStorage.getItem('gt_code');
+    const d = await (await fetch('/api/waypoints' + (code ? '?code=' + encodeURIComponent(code) : ''))).json();
+    waypoints = d.waypoints || [];
+    draw();
+  } catch (e) { /* ignore */ }
+}
+
+async function addWaypointHere() {
+  const code = localStorage.getItem('gt_code');
+  if (!code) { alert('Log in first (your code from the server) to add waypoints.'); return; }
+  const name = prompt('Waypoint name:');
+  if (!name) return;
+  const pub = confirm('Public waypoint?\n\nOK = public (everyone sees it)\nCancel = private (only you)');
+  const bx = Math.round(panX * 16), bz = Math.round(panZ * 16);
+  const q = new URLSearchParams({ name, world: currentWorld, x: String(bx), y: '64', z: String(bz),
+                                  public: pub ? '1' : '0', code });
+  const d = await (await fetch('/api/waypoints?' + q.toString(), { method: 'POST' })).json();
+  if (d.ok) { await loadWaypoints(); } else { alert(d.error || 'could not save waypoint'); }
 }
 
 try { applyIdentity(JSON.parse(localStorage.getItem('gt_identity') || 'null')); } catch (e) {}

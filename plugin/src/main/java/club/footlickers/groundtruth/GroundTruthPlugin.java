@@ -152,6 +152,9 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             case "link":
             case "login":
                 return handleLink(sender, args);
+            case "waypoint":
+            case "wp":
+                return handleWaypoint(sender, args);
             case "logstatus":
                 return handleLogStatus(sender, args);
             default:
@@ -581,6 +584,56 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         sender.sendMessage("[GroundTruth] Admin login code (console):");
         sender.sendMessage(token);
         sender.sendMessage("[GroundTruth] One use. (It will appear in the server log.)");
+        return true;
+    }
+
+    /**
+     * /groundtruth waypoint add <name> [public|private] | remove <name> | list
+     * Waypoints are stored in the map DB and shown on the website (public ones to everyone, private
+     * ones only to their owner).
+     */
+    private boolean handleWaypoint(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player)) {
+            sender.sendMessage("Run /groundtruth waypoint in-game (it's tied to your player).");
+            return true;
+        }
+        Player p = (Player) sender;
+        String sub = args.length > 1 ? args[1].toLowerCase() : "list";
+        String uuid = p.getUniqueId().toString();
+        if (sub.equals("add") || sub.equals("set")) {
+            if (args.length < 3) {
+                sender.sendMessage("Usage: /groundtruth waypoint add <name> [public|private]");
+                return true;
+            }
+            String name = args[2];
+            boolean pub = args.length > 3 && args[3].equalsIgnoreCase("public");
+            Location l = p.getLocation();
+            storage.putWaypoint(uuid, name, l.getWorld().getName(),
+                    l.getBlockX(), l.getBlockY(), l.getBlockZ(), pub);
+            sender.sendMessage("[GroundTruth] Waypoint \"" + name + "\" saved (" + (pub ? "public" : "private")
+                    + ") at " + l.getBlockX() + "," + l.getBlockY() + "," + l.getBlockZ() + ".");
+            return true;
+        }
+        if (sub.equals("remove") || sub.equals("delete") || sub.equals("del")) {
+            if (args.length < 3) {
+                sender.sendMessage("Usage: /groundtruth waypoint remove <name>");
+                return true;
+            }
+            boolean ok = storage.removeWaypoint(uuid, args[2]);
+            sender.sendMessage("[GroundTruth] " + (ok ? "Removed waypoint \"" + args[2] + "\"."
+                    : "No waypoint named \"" + args[2] + "\"."));
+            return true;
+        }
+        List<Storage.Waypoint> wps = storage.listWaypoints(uuid);
+        if (wps.isEmpty()) {
+            sender.sendMessage("[GroundTruth] No waypoints yet. /groundtruth waypoint add <name> [public|private]");
+            return true;
+        }
+        sender.sendMessage("[GroundTruth] " + wps.size() + " waypoint(s):");
+        for (Storage.Waypoint w : wps) {
+            sender.sendMessage("  " + w.name + (w.isPublic ? " (public)" : "") + " - " + w.world + " "
+                    + w.x + "," + w.y + "," + w.z + (w.uuid.equals(uuid) ? "" : " [another player]"));
+        }
         return true;
     }
 

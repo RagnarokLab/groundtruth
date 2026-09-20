@@ -294,6 +294,75 @@ public class Storage {
         }
     }
 
+    public static class Waypoint {
+        public final String uuid, name, world;
+        public final int x, y, z;
+        public final boolean isPublic;
+        public Waypoint(String uuid, String name, String world, int x, int y, int z, boolean isPublic) {
+            this.uuid = uuid; this.name = name; this.world = world;
+            this.x = x; this.y = y; this.z = z; this.isPublic = isPublic;
+        }
+    }
+
+    /** Create or update a player's waypoint (name is unique per player). */
+    public void putWaypoint(String uuid, String name, String world, int x, int y, int z, boolean isPublic) {
+        String sql = "INSERT INTO waypoints (uuid,name,world,x,y,z,public,created_ts,updated_ts) VALUES (?,?,?,?,?,?,?,?,?) " +
+                "ON CONFLICT(uuid,name) DO UPDATE SET world=excluded.world, x=excluded.x, y=excluded.y, z=excluded.z, " +
+                "public=excluded.public, updated_ts=excluded.updated_ts";
+        long now = System.currentTimeMillis() / 1000L;
+        synchronized (this) {
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    ps.setString(1, uuid);
+                    ps.setString(2, name);
+                    ps.setString(3, world);
+                    ps.setInt(4, x); ps.setInt(5, y); ps.setInt(6, z);
+                    ps.setInt(7, isPublic ? 1 : 0);
+                    ps.setLong(8, now); ps.setLong(9, now);
+                    ps.executeUpdate();
+                    return;
+                } catch (SQLException e) {
+                    if (attempt == 0 && isStale(e)) { reopen(); continue; }
+                    log.warning("[GroundTruth] waypoint save failed: " + e.getMessage());
+                    return;
+                }
+            }
+        }
+    }
+
+    public boolean removeWaypoint(String uuid, String name) {
+        synchronized (this) {
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM waypoints WHERE uuid=? AND name=?")) {
+                ps.setString(1, uuid);
+                ps.setString(2, name);
+                return ps.executeUpdate() > 0;
+            } catch (SQLException e) {
+                log.warning("[GroundTruth] waypoint delete failed: " + e.getMessage());
+                return false;
+            }
+        }
+    }
+
+    /** Public waypoints plus the given player's own private ones. */
+    public List<Waypoint> listWaypoints(String uuid) {
+        List<Waypoint> out = new ArrayList<>();
+        synchronized (readLock) {
+            try (PreparedStatement ps = readConn.prepareStatement(
+                    "SELECT uuid,name,world,x,y,z,public FROM waypoints WHERE public=1 OR uuid=?")) {
+                ps.setString(1, uuid == null ? "" : uuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        out.add(new Waypoint(rs.getString(1), rs.getString(2), rs.getString(3),
+                                rs.getInt(4), rs.getInt(5), rs.getInt(6), rs.getInt(7) == 1));
+                    }
+                }
+            } catch (SQLException e) {
+                log.warning("[GroundTruth] waypoint list failed: " + e.getMessage());
+            }
+        }
+        return out;
+    }
+
     public long countChunks(String world) {        return count("SELECT COUNT(*) FROM chunks WHERE world=?", world);
     }
 

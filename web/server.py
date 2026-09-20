@@ -508,6 +508,61 @@ def _log_conn():
     return sqlite3.connect(f"file:{LOG_DB_PATH}?mode=ro", uri=True)
 
 
+def db_rw():
+    """Writable connection to the map DB (waypoints are the only thing the web writes)."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
+
+
+def waypoints_list(uuid):
+    conn = db_ro()
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT uuid,name,world,x,y,z,public FROM waypoints WHERE public=1 OR uuid=?",
+                (uuid or "",)).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [{"uuid": r[0], "name": r[1], "world": r[2], "x": r[3], "y": r[4], "z": r[5],
+                 "public": r[6] == 1} for r in rows]
+    finally:
+        conn.close()
+
+
+def waypoint_put(uuid, name, world, x, y, z, is_public):
+    now = int(time.time())
+    conn = db_rw()
+    try:
+        conn.execute(
+            "INSERT INTO waypoints (uuid,name,world,x,y,z,public,created_ts,updated_ts) VALUES (?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(uuid,name) DO UPDATE SET world=excluded.world, x=excluded.x, y=excluded.y, z=excluded.z, "
+            "public=excluded.public, updated_ts=excluded.updated_ts",
+            (uuid, name, world, x, y, z, 1 if is_public else 0, now, now))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def waypoint_delete(uuid, name):
+    conn = db_rw()
+    try:
+        cur = conn.execute("DELETE FROM waypoints WHERE uuid=? AND name=?", (uuid, name))
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+
+    return sqlite3.connect(f"file:{LOG_DB_PATH}?mode=ro", uri=True)
+
+
 REVERTIBLE_ACTIONS = "('block-place','block-break','entity-change-block','fluid-place','fluid-pickup')"
 
 
@@ -1078,6 +1133,28 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
+        if parsed.path in ("/api/waypoints", "/api/waypoints/delete"):
+            payload = verify_token(self.headers.get("X-GT-Code") or (qs.get("code", [""])[0]))
+            if not payload:
+                self._send_json({"error": "login required"})
+                return
+            uuid = payload.get("u")
+            try:
+                if parsed.path.endswith("/delete"):
+                    self._send_json({"ok": waypoint_delete(uuid, qs.get("name", [""])[0])})
+                else:
+                    name = qs.get("name", [""])[0].strip()
+                    if not name or len(name) > 40:
+                        self._send_json({"error": "name required (max 40 chars)"})
+                        return
+                    self._send_json({"ok": waypoint_put(
+                        uuid, name, qs.get("world", ["world"])[0],
+                        int(qs["x"][0]), int(qs.get("y", ["64"])[0]), int(qs["z"][0]),
+                        qs.get("public", ["0"])[0] in ("1", "true", "yes"))})
+            except (ValueError, KeyError):
+                self.send_response(400); self.end_headers()
+            return
+
         if parsed.path in ("/api/admin/rollback/apply", "/api/admin/rollback/undo"):
             ok, why = admin_auth(self, qs, need_rollback=True)
             if not ok:
@@ -1206,6 +1283,12 @@ class Handler(BaseHTTPRequestHandler):
             hours = int(qs.get("hours", ["12"])[0])
             since = int(time.time() * 1000) - hours * 3600000
             self._send_json(admin_track(qs.get("world", [None])[0], payload.get("u"), since, 0))
+            return
+
+        if parsed.path == "/api/waypoints":
+            # public waypoints are visible to anyone; a login also returns the caller's private ones
+            payload = verify_token(qs.get("code", [""])[0])
+            self._send_json({"waypoints": waypoints_list(payload.get("u") if payload else None)})
             return
 
         if parsed.path == "/api/auth":
