@@ -174,7 +174,7 @@ public class Storage {
         }
     }
 
-    /** All indexed (cx,cz) for a world packed as (cx<<32)|(cz & 0xffffffff) - lets DumpTask
+    /** All indexed (cx,cz) for a world packed as (cx<<32)|(cz & 0xffffffff) - lets the offline dumper
         skip already-indexed chunks in memory instead of a synchronous DB read per candidate. */
     public Set<Long> chunkKeys(String world) {
         Set<Long> out = new HashSet<>();
