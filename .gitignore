@@ -1,0 +1,51 @@
+# Build output
+build/
+target/
+out/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Python
+__pycache__/
+*.py[cod]
+
+# ---------------------------------------------------------------------------
+# Generated assets — NEVER commit these. They are derived from Mojang's client
+# jar on the operator's own machine and must not be redistributed.
+# ---------------------------------------------------------------------------
+atlas.png
+atlas.json
+anim.png
+entity.png
+blockcolors.json
+biome_tints.json
+blockmodels.json
+tiles/
+*.mca
+*.mcr
+level.dat*
+
+# Databases / world data
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets & local config
+.env
+*.env
+secrets/
+secrets*
+*.pem
+*.key
+credentials*
+server.properties
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>GroundTruth - footlickers map (v1, minimal)</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #111; color: #eee; font-family: sans-serif; overflow: hidden; }
+  #canvas { display: block; cursor: grab; touch-action: none; }
+  #canvas.dragging { cursor: grabbing; }
+  .panel {
+    position: absolute; background: rgba(0,0,0,0.72); padding: 8px 12px; border-radius: 6px;
+    font-size: 13px;
+  }
+  .panel-header {
+    display: flex; justify-content: space-between; align-items: center;
+    cursor: pointer; font-weight: bold; user-select: none;
+  }
+  .panel-collapse-btn {
+    background: none; border: 1px solid #666; color: #eee; border-radius: 3px;
+    width: 20px; height: 20px; line-height: 16px; text-align: center; cursor: pointer;
+    margin-left: 8px; flex-shrink: 0; font-size: 13px;
+  }
+  .panel.collapsed .panel-body { display: none !important; }
+  .panel.collapsed { padding: 8px 10px; width: auto !important; max-height: none !important; height: auto !important; }
+
+  #hud { top: 8px; left: 8px; max-width: 320px; }
+  #hud input[type=text] { width: 200px; }
+  #results { margin-top: 6px; max-height: 160px; overflow-y: auto; font-size: 12px; }
+  #results div { padding: 2px 0; cursor: pointer; }
+  #results div:hover { color: #6cf; }
+
+  #rightStack {
+    position: absolute; top: 8px; right: 8px; display: flex; flex-direction: column; gap: 8px;
+    align-items: flex-end;
+  }
+  #rightStack .panel { position: static; } /* stacked by flex, not individually positioned */
+
+  #coords { font-family: monospace; min-width: 180px; }
+  #coords .panel-header { font-family: sans-serif; }
+  #coords div { padding: 1px 0; }
+  #coords label { display: block; margin-top: 4px; font-family: sans-serif; }
+
+  #selection { font-family: monospace; min-width: 180px; }
+  #selection .panel-header { font-family: sans-serif; }
+  #selection div { padding: 1px 0; }
+  #selection button { margin-top: 4px; font-size: 11px; font-family: sans-serif; }
+
+  #typesPanel { bottom: 8px; right: 8px; width: 260px; max-height: 50vh; display: flex; flex-direction: column; }
+  #typesPanel .panel-body { display: flex; flex-direction: column; overflow: hidden; flex: 1; }
+  #typesPanel input[type=text] { width: 100%; box-sizing: border-box; margin: 4px 0; }
+  #typesPanel .list { overflow-y: auto; flex: 1; font-size: 12px; }
+  #typesPanel .list label { display: block; padding: 1px 0; cursor: pointer; }
+  #typesPanel .listButtons { margin-top: 4px; }
+  #typesPanel .listButtons button { font-size: 11px; margin-right: 4px; }
+  #tabButtons { display: flex; gap: 4px; }
+  #tabButtons button { flex: 1; font-size: 12px; padding: 3px 0; background: #222; color: #aaa; border: 1px solid #444; border-radius: 3px; cursor: pointer; }
+  #tabButtons button.active { background: #444; color: #fff; }
+  .tabPage { display: none; flex-direction: column; overflow: hidden; flex: 1; }
+  .tabPage.active { display: flex; }
+
+  #tooltip {
+    position: absolute; background: #000; color: #fff; padding: 4px 8px; border-radius: 4px;
+    font-size: 12px; pointer-events: none; display: none; white-space: nowrap;
+  }
+  a.link { color: #6cf; }
+
+  #hud .panel-header { justify-content: flex-start; }
+  #hud .panel-collapse-btn { margin-left: 0; margin-right: 8px; }
+  #hud hr { border: none; border-top: 1px solid #444; margin: 8px 0; }
+  #hud .settingsRow { display: flex; justify-content: space-between; align-items: center; margin: 4px 0; font-weight: normal; }
+  #hud .settingsRow input[type=color] { width: 32px; }
+
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="hud" class="panel">
+  <div class="panel-header"><button class="panel-collapse-btn">&minus;</button><span>GroundTruth</span></div>
+  <div class="panel-body">
+    <div style="font-weight:normal">real generated data only, not seed prediction</div>
+    <div id="counts">loading...</div>
+    <label style="display:block;margin-top:6px">dimension <select id="worldSelect"></select></label>
+    <button id="view3dBtn" style="margin-top:6px">3D view</button>
+    <input id="search" type="text" placeholder="jump to structure (e.g. village)">
+    <div id="results"></div>
+    <div style="margin-top:6px">
+      <input id="jumpX" type="text" placeholder="x" style="width:60px">
+      <input id="jumpZ" type="text" placeholder="z" style="width:60px">
+      <button id="jumpGo">go</button>
+    </div>
+    <hr>
+    <div style="font-weight:normal">Slime clusters</div>
+    <div class="settingsRow">find a block of slime chunks
+      <span>
+        <select id="slimeSize">
+          <option value="2">2x2</option>
+          <option value="3">3x3</option>
+          <option value="4">4x4</option>
+          <option value="5">5x5</option>
+        </select>
+        <button id="findSlime">find</button>
+      </span>
+    </div>
+    <div id="slimeSummary" style="font-size:11px;color:#aaa"></div>
+    <div id="slimeResults" style="max-height:120px;overflow-y:auto;font-size:12px"></div>
+    <hr>
+    <div style="font-weight:normal">Display settings</div>
+    <div class="settingsRow">structure icon colour <input type="color" id="setIconColor"></div>
+    <div class="settingsRow">bounding box colour <input type="color" id="setBboxColor"></div>
+    <div class="settingsRow">selection colour <input type="color" id="setSelectionColor"></div>
+    <button id="settingsReset">reset to defaults</button>
+  </div>
+</div>
+
+<div id="rightStack">
+  <div id="coords" class="panel">
+    <div class="panel-header"><span>Coords</span><button class="panel-collapse-btn">&minus;</button></div>
+    <div class="panel-body">
+      <div id="ow-coords">overworld: -, -</div>
+      <div id="nether-coords" style="display:none">nether: -, -</div>
+      <div id="hover-biome">biome: -</div>
+      <label><input type="checkbox" id="toggleNether"> show nether coords</label>
+      <label><input type="checkbox" id="toggleBboxes"> show structure bounding boxes</label>
+      <label><input type="checkbox" id="toggleSlime"> show slime chunks</label>
+      <label><input type="checkbox" id="toggleBiomeOverlay"> show biome overlay</label>
+      <div style="margin-top:4px;font-size:11px;color:#aaa">tap a structure for info &middot; press &amp; hold to select area</div>
+    </div>
+  </div>
+
+  <div id="selection" class="panel">
+    <div class="panel-header"><span>Selection</span><button class="panel-collapse-btn">&minus;</button></div>
+    <div class="panel-body">
+      <div id="pos1-readout">pos1: -</div>
+      <div id="pos2-readout">pos2: -</div>
+      <div id="size-readout"></div>
+      <button id="clearSelection">clear</button>
+    </div>
+  </div>
+</div>
+
+<div id="typesPanel" class="panel">
+  <div class="panel-header"><span>Show on map</span><button class="panel-collapse-btn">&minus;</button></div>
+  <div class="panel-body">
+    <div id="tabButtons">
+      <button id="tabStructures" class="active">Structures</button>
+      <button id="tabBiomes">Biomes</button>
+    </div>
+
+    <div id="pageStructures" class="tabPage active">
+      <input type="text" id="typeFilter" placeholder="filter types...">
+      <div class="listButtons">
+        <button id="selAll">all</button><button id="selNone">none</button>
+      </div>
+      <div id="typesList" class="list">loading...</div>
+    </div>
+
+    <div id="pageBiomes" class="tabPage">
+      <input type="text" id="biomeFilter" placeholder="filter biomes...">
+      <div class="listButtons">
+        <button id="biomeSelAll">all</button><button id="biomeSelNone">none</button>
+      </div>
+      <div id="biomesList" class="list">loading...</div>
+    </div>
+  </div>
+</div>
+
+<div id="tooltip"></div>
+
+<div id="inspectCard" class="panel" style="display:none; left:8px; right:8px; bottom:8px; max-width:520px; margin:0 auto; z-index:50;">
+  <div class="panel-header" style="justify-content:flex-start;">
+    <span id="inspectTitle">structure</span>
+    <button id="inspectClose" aria-label="close" style="margin-left:auto; background:none; border:1px solid #666; color:#eee; border-radius:3px; width:28px; height:28px; cursor:pointer; font-size:15px;">&times;</button>
+  </div>
+  <div class="panel-body" style="font-weight:normal">
+    <div id="inspectInfo"></div>
+    <div id="inspectNav" style="display:none; align-items:center; gap:8px; margin-top:8px;">
+      <button id="inspectPrev" aria-label="previous" style="font-size:18px; min-width:56px; min-height:42px; cursor:pointer;">&#9664;</button>
+      <span id="inspectCount" style="flex:1; text-align:center; font-weight:bold;">-</span>
+      <button id="inspectNext" aria-label="next" style="font-size:18px; min-width:56px; min-height:42px; cursor:pointer;">&#9654;</button>
+    </div>
+  </div>
+</div>
+
+<script src="js/three.min.js?v=2"></script>
+<script src="js/OrbitControls.js?v=2"></script>
+<script src="app.js?v=8"></script>
+<script src="js/view3d.js?v=34"></script>
+</body>
+</html>

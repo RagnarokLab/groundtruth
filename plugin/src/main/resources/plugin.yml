@@ -1,0 +1,12 @@
+name: GroundTruth
+version: "0.1.0"
+main: club.footlickers.groundtruth.GroundTruthPlugin
+description: Ground-truth world index (real generated structures/biomes, not seed prediction) - backs the map project
+author: footlickers
+api-version: '1.21'
+
+commands:
+  groundtruth:
+    description: GroundTruth index commands
+    usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime> ...
+    aliases: [gt]
