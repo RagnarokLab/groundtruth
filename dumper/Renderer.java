@@ -70,6 +70,7 @@ public final class Renderer {
                 case "--colors": loadColors(args[++i]); break;
                 case "--biome-tints": Dumper.loadBiomeTints(args[++i]); break;
                 case "--only-visited": ONLY_VISITED = true; break;
+                case "--visited-radius": VISITED_RADIUS = Integer.parseInt(args[++i]); break;
                 default: System.out.println("unknown arg " + args[i]); return;
             }
         }
@@ -140,13 +141,24 @@ public final class Renderer {
                 String sql = "SELECT cx,cz,biome,surface_block,surface_y FROM chunks "
                         + "WHERE world=? AND cx>=? AND cx<? AND cz>=? AND cz<?";
                 if (ONLY_VISITED) {
-                    sql += " AND EXISTS (SELECT 1 FROM chunk_visits v WHERE v.world=chunks.world "
-                         + "AND v.cx=chunks.cx AND v.cz=chunks.cz)";
+                    if (VISITED_RADIUS > 0) {
+                        // a buffer of N chunks around anywhere a player has been (avoids a hard edge)
+                        sql += " AND EXISTS (SELECT 1 FROM chunk_visits v WHERE v.world=chunks.world "
+                             + "AND ABS(v.cx-chunks.cx)<=? AND ABS(v.cz-chunks.cz)<=?)";
+                    } else {
+                        sql += " AND EXISTS (SELECT 1 FROM chunk_visits v WHERE v.world=chunks.world "
+                             + "AND v.cx=chunks.cx AND v.cz=chunks.cz)";
+                    }
                 }
                 try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                    ps.setString(1, world);
-                    ps.setInt(2, cx0 - m); ps.setInt(3, cx0 + tile + m);
-                    ps.setInt(4, cz0 - m); ps.setInt(5, cz0 + tile + m);
+                    int pi = 1;
+                    ps.setString(pi++, world);
+                    ps.setInt(pi++, cx0 - m); ps.setInt(pi++, cx0 + tile + m);
+                    ps.setInt(pi++, cz0 - m); ps.setInt(pi++, cz0 + tile + m);
+                    if (ONLY_VISITED && VISITED_RADIUS > 0) {
+                        ps.setInt(pi++, VISITED_RADIUS);
+                        ps.setInt(pi++, VISITED_RADIUS);
+                    }
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
                             int px = rs.getInt(1) - cx0, py = rs.getInt(2) - cz0;
@@ -247,6 +259,8 @@ public final class Renderer {
 
     /** When true, only chunks a player has actually visited are drawn (others stay transparent). */
     static boolean ONLY_VISITED = false;
+    /** Chunk radius drawn around each visited chunk (0 = exactly the visited chunks). */
+    static int VISITED_RADIUS = 0;
 
     /** Terrain colour: the surface block's real colour, biome-tinted, then shaded by height. */
     static int terrainColor(String block, String biome, int y, int minY) {
