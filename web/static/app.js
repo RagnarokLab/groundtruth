@@ -74,6 +74,9 @@ let highlightedBiomes = new Set();
 let allTypes = [];
 let scale = 0.5;       // pixels per chunk (0.5 = 2 chunks/px, a map-scale default)
 let panX = 0, panZ = 0; // world chunk coords at screen center
+// overlay state must be declared BEFORE draw() is ever called (drawOverlays reads it)
+let overlay = { mode: null, cells: [], cell: 16, points: [], blocks: [] };
+let myTrailOn = false, myTrail = [];
 let dragging = false, dragStartX = 0, dragStartY = 0, dragPanX0 = 0, dragPanZ0 = 0, dragMoved = false;
 
 // Per-viewer display settings (colours) - accessibility/preference, not shared data,
@@ -1090,9 +1093,6 @@ document.getElementById('trailClear').addEventListener('click', () => {
 });
 
 // --- map overlays: heat / track / rollback-preview, drawn on the REAL map ----------------------
-let overlay = { mode: null, cells: [], cell: 16, points: [], blocks: [] };
-let myTrailOn = false, myTrail = [];
-
 function drawOverlays() {
   if (overlay.cells.length) {
     let maxN = 1;
