@@ -95,6 +95,50 @@
     return { pal, cols };
   }
 
+  /** Inflate a deflated byte payload (DecompressionStream, like the voxel path). */
+  async function inflateRaw(bytes) {
+    const ds = new DecompressionStream('deflate');
+    const ab = await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();
+    return new Uint8Array(ab);
+  }
+
+  /** Parse a prerendered .gtmesh tile (already inflated). Mirrors gt_tile.js's on-disk layout. */
+  function parseTile(buf) {
+    const d = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    let o = 4;                                            // "GTM1"
+    const hasWater = d.getUint8(o) === 1; o += 1;
+    const baseY = d.getInt32(o, true); o += 4;
+    const read = (withAanim) => {
+      const V = d.getUint32(o, true); o += 4;
+      const b = { pos: [], uv: [], col: [], nor: [], atile: [], aanim: withAanim ? [] : null };
+      for (let i = 0; i < V; i++) {
+        b.pos.push(d.getFloat32(o, true), d.getFloat32(o + 4, true), d.getFloat32(o + 8, true)); o += 12;
+        b.uv.push(d.getFloat32(o, true), d.getFloat32(o + 4, true)); o += 8;
+        b.col.push(d.getUint8(o) / 255, d.getUint8(o + 1) / 255, d.getUint8(o + 2) / 255); o += 3;
+        b.nor.push(d.getInt8(o) / 127, d.getInt8(o + 1) / 127, d.getInt8(o + 2) / 127); o += 3;
+        b.atile.push(d.getUint8(o) / 255, d.getUint8(o + 1) / 255,
+          d.getUint8(o + 2) / 255, d.getUint8(o + 3) / 255); o += 4;
+        if (withAanim) { b.aanim.push(d.getFloat32(o, true), d.getFloat32(o + 4, true), d.getFloat32(o + 8, true)); o += 12; }
+      }
+      return b;
+    };
+    const opaque = read(false);
+    const water = hasWater ? read(true) : { pos: [], uv: [], col: [], nor: [], atile: [], aanim: null };
+    return { opaque, water, baseY };
+  }
+
+  /** BufferGeometry from a mesher bucket - the same attributes the live mesher emits. */
+  function geoFromBucket(b) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(b.pos, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(b.uv, 2));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(b.col, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(b.nor, 3));
+    g.setAttribute('atile', new THREE.Float32BufferAttribute(b.atile, 4));
+    if (b.aanim) g.setAttribute('aanim', new THREE.Float32BufferAttribute(b.aanim, 3));
+    return g;
+  }
+
   // Resolve a block name to atlas info: exact, then "minecraft:<base>" (handles modded blocks whose
   // texture we don't have), then the base material of a slab/stairs/fence/etc.
   const SUFFIXES = ['_slab', '_stairs', '_fence_gate', '_fence', '_wall', '_door', '_trapdoor',
@@ -1120,6 +1164,13 @@
    */
   async function buildVoxelLevel(world, lod, vx0, vz0, vx1, vz1, bg) {
     const f = 1 << lod;
+    if (lod === 0) {
+      // Prerendered tiles sit on a fixed N_CHUNKS grid; snap the window onto it so we can fetch them.
+      vx0 = Math.floor(vx0 / N_CHUNKS) * N_CHUNKS;
+      vz0 = Math.floor(vz0 / N_CHUNKS) * N_CHUNKS;
+      vx1 = (Math.floor(vx1 / N_CHUNKS) + 1) * N_CHUNKS - 1;
+      vz1 = (Math.floor(vz1 / N_CHUNKS) + 1) * N_CHUNKS - 1;
+    }
     const group = new THREE.Group();
     scene.add(group);
     const tileList = [];
@@ -1140,6 +1191,34 @@
         const i = next++;
         if (i >= tileList.length) return;
         const tx = tileList[i][0], tz = tileList[i][1];
+        // lod 0 uses prerendered tiles when they exist (no client meshing); otherwise fall back to
+        // the live mesher so brand-new chunks still show immediately.
+        if (lod === 0) {
+          const gtx = tx / N_CHUNKS, gtz = tz / N_CHUNKS;
+          try {
+            const resp = await fetch(`/tiles/${encodeURIComponent(world)}/mesh/lod0/${gtx}_${gtz}.gtmesh`);
+            if (resp.ok) {
+              const bytes = await inflateRaw(new Uint8Array(await resp.arrayBuffer()));
+              const t = parseTile(bytes);
+              const geo = geoFromBucket(t.opaque);
+              const g = new THREE.Group();
+              g.add(new THREE.Mesh(geo, voxMat));
+              if (t.water.pos.length && voxWaterMat) g.add(new THREE.Mesh(geoFromBucket(t.water), voxWaterMat));
+              g.scale.setScalar(f);
+              g.position.set((tx + N_CHUNKS / 2) * 16 * f, t.baseY * f, (tz + N_CHUNKS / 2) * 16 * f);
+              g.userData.bbox = { x0: tx * 16 * f, z0: tz * 16 * f,
+                                  x1: (tx + N_CHUNKS) * 16 * f, z1: (tz + N_CHUNKS) * 16 * f };
+              group.add(g);
+              faces += geo.getAttribute('position').count / 6;
+              tiles++;
+              loaded.add(tx + ',' + tz);
+              if (bg) hideCoveredVoxTiles(bg, loaded, tileBlocks);
+              statusEl.textContent = `lod ${lod} (${f}m blocks) \u00b7 ${tiles}/${tileList.length} tiles \u00b7 `
+                + `${faces.toLocaleString()} faces`;
+              continue;
+            }
+          } catch (e) { /* fall back to the live mesher below */ }
+        }
         const tx1 = tx + N_CHUNKS - 1, tz1 = tz + N_CHUNKS - 1;
         let res = null;
         try {
