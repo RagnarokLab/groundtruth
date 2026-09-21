@@ -124,6 +124,9 @@ public class Storage {
             st.execute("CREATE TABLE IF NOT EXISTS chunk_voxels_lod (" +
                     "world TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL, lod INTEGER NOT NULL, " +
                     "data BLOB, indexed_at INTEGER, PRIMARY KEY (world, cx, cz, lod))");
+            // Same lookup-index the dumper creates: the map queries LOD blobs by (world, lod, cx, cz),
+            // which the primary key can't satisfy without a full scan.
+            st.execute("CREATE INDEX IF NOT EXISTS idx_voxels_lod_lookup ON chunk_voxels_lod (world, lod, cx, cz)");
         }
             // Terrain-layer columns (added 2026-09-20 for the map). Safe no-ops on a DB that already
             // has them; lets an older DB be upgraded in place. The offline dumper writes the same columns.

@@ -104,6 +104,9 @@ public class Db implements AutoCloseable {
             st.execute("CREATE TABLE IF NOT EXISTS chunk_voxels_lod (" +
                     "world TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL, lod INTEGER NOT NULL, " +
                     "data BLOB, indexed_at INTEGER, PRIMARY KEY (world, cx, cz, lod))");
+            // The map queries LOD blobs by (world, lod, cx range, cz range); without this index the
+            // primary key (world,cx,cz,lod) can't filter on lod and every request full-scanned the table.
+            st.execute("CREATE INDEX IF NOT EXISTS idx_voxels_lod_lookup ON chunk_voxels_lod (world, lod, cx, cz)");
             // Everything else a chunk carries that we might want later: block-entity and entity NBT,
             // serialised to JSON (see Nbt.toJson). `kind` is 'block_entity' or 'entity'. Positions are
             // floored to block coords (the exact doubles remain inside `nbt`).
