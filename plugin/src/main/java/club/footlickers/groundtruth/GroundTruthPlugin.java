@@ -23,7 +23,8 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     private ChunkIndexer indexer;
     private LogDb logDb;
     private WebServer web;
-    private org.bukkit.scheduler.BukkitTask playerSnapTask, heatTask, posTask, invTask;
+    private org.bukkit.scheduler.BukkitTask playerSnapTask, heatTask, posTask, invTask, reindexTask;
+    private BlockChangeListener blockChange;
     private MapColours colours;
     private Auth auth;
     private final Map<String, Process> externalDumps = new HashMap<>();
@@ -79,6 +80,12 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         indexer = new ChunkIndexer(this, storage, colours,
                 getConfig().getBoolean("detail-indexing", true), detailLodLevels());
         getServer().getPluginManager().registerEvents(new ChunkListener(indexer, this), this);
+        // Player builds and natural changes must update the map too, not just new-chunk generation.
+        blockChange = new BlockChangeListener(indexer, this);
+        getServer().getPluginManager().registerEvents(blockChange, this);
+        // Gentle drain: re-index a few dirty chunks a second so a big event (explosion) never
+        // freezes the tick. indexChunk runs on the main thread; its DB writes are already async.
+        reindexTask = getServer().getScheduler().runTaskTimer(this, () -> blockChange.drain(16), 40L, 20L);
         // ChunkListener only sees NEW chunks, so anything already loaded when we start (or that was
         // generated while we were reloading) would otherwise never be indexed.
         if (indexer != null) {
@@ -106,6 +113,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
 
     @Override
     public void onDisable() {
+        if (reindexTask != null) { reindexTask.cancel(); reindexTask = null; }
         if (web != null) { web.stop(); web = null; }
         if (storage != null) storage.close();
         if (logDb != null) logDb.close();

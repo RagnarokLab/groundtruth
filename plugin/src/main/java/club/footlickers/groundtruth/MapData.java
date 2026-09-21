@@ -346,6 +346,25 @@ public final class MapData {
         return out;
     }
 
+    /** Per-chunk biome for a rectangular chunk range, keyed by ((long)cx << 32) ^ (cz & 0xffffffffL). */
+    public java.util.Map<Long, String> biomes(String world, int cx0, int cz0, int cx1, int cz1)
+            throws Exception {
+        java.util.Map<Long, String> m = new java.util.HashMap<>();
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT cx,cz,biome FROM chunks WHERE world=? AND cx>=? AND cx<=? AND cz>=? AND cz<=?")) {
+                ps.setString(1, world);
+                ps.setInt(2, cx0); ps.setInt(3, cx1); ps.setInt(4, cz0); ps.setInt(5, cz1);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        m.put(((long) rs.getInt(1) << 32) ^ (rs.getInt(2) & 0xffffffffL), rs.getString(3));
+                    }
+                }
+            }
+        }
+        return m;
+    }
+
     /** Merge 2^lod x 2^lod stored LOD chunks into one 16x16-cell blob the mesher understands. */
     private byte[] assembleLod(String world, int lod, int vx, int vz) throws Exception {
         int k = 1 << lod;

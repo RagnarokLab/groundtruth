@@ -419,6 +419,11 @@ public final class WebServer {
         int[] vmeta = new int[5];
         List<Object[]> rows = map.voxels(world, intOf(q, "cx0", 0), intOf(q, "cz0", 0),
                 intOf(q, "cx1", 0), intOf(q, "cz1", 0), lod, vmeta);
+        // lod 0 hands back real chunks, so we can attach each one's biome (drives grass/foliage/water
+        // tinting in the 3D view). Higher levels are merged virtual chunks with no single biome.
+        java.util.Map<Long, String> biomes = (lod == 0)
+                ? map.biomes(world, intOf(q, "cx0", 0), intOf(q, "cz0", 0), intOf(q, "cx1", 0), intOf(q, "cz1", 0))
+                : null;
         StringBuilder sb = new StringBuilder(rows.size() * 400 + 128);
         sb.append("{\"world\":").append(LogListener.Json.str(world)).append(",\"lod\":").append(lod);
         if (lod > 0) sb.append(",\"k\":").append(vmeta[0]);
@@ -429,8 +434,12 @@ public final class WebServer {
         for (Object[] r : rows) {
             if (!first) sb.append(',');
             first = false;
+            String biome = (biomes != null)
+                    ? biomes.get(((long) (Integer) r[0] << 32) ^ ((Integer) r[1] & 0xffffffffL))
+                    : null;
             sb.append("{\"cx\":").append((Integer) r[0]).append(",\"cz\":").append((Integer) r[1])
-              .append(",\"biome\":null,\"data\":\"")
+              .append(",\"biome\":").append(biome == null ? "null" : LogListener.Json.str(biome))
+              .append(",\"data\":\"")
               .append(java.util.Base64.getEncoder().encodeToString((byte[]) r[2])).append("\"}");
         }
         return sb.append("]}").toString();
