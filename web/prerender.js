@@ -77,7 +77,7 @@ async function main() {
         const v = parseVoxel(buf);
         c._pal = v.pal; c._cols = v.cols;
       }
-      const built = mesher.buildGeometry(vox, atlas, biomeTints, minY, c0, z0, bmodels);
+      const built = mesher.buildGeometry(vox, atlas, biomeTints, minY, c0, z0, bmodels, true);
       const blob = encodeTile(built);
       const dir = path.join(out, world, 'mesh', 'lod0');
       fs.mkdirSync(dir, { recursive: true });

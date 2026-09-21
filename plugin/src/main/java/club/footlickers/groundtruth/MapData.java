@@ -29,6 +29,11 @@ public final class MapData {
     private final MapColours colours;
     private Connection ro;
     private final Object lock = new Object();
+    // cached "visited + radius" scope (rebuilt at most every 30s; every map request asks for it)
+    private volatile java.util.Set<Long> scopeCache;
+    private volatile long scopeCacheAt;
+    private volatile String scopeCacheWorld;
+    private volatile int scopeCacheRadius = -1;
 
     public MapData(File dataFolder, File tilesDir, MapColours colours) {
         this.dbFile = new File(dataFolder, "groundtruth.db");
@@ -363,6 +368,48 @@ public final class MapData {
             }
         }
         return m;
+    }
+
+    /**
+     * Chunk keys within {@code radius} (Chebyshev) of any visited chunk, for the "only show what we've
+     * actually seen" setting. Returns null when there is nothing to filter by (no visits recorded yet),
+     * so a fresh server is not blanked out. Cached ~30s because every map request asks for it.
+     */
+    public java.util.Set<Long> visitedScope(String world, int radius) {
+        if (radius < 0) return null;
+        long now = System.currentTimeMillis();
+        java.util.Set<Long> cached = scopeCache;
+        if (cached != null && world.equals(scopeCacheWorld) && radius == scopeCacheRadius
+                && now - scopeCacheAt < 30_000) {
+            return cached;
+        }
+        java.util.Set<Long> out = new java.util.HashSet<>();
+        int visited = 0;
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT DISTINCT cx,cz FROM chunk_visits WHERE world=?")) {
+                ps.setString(1, world);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        int cx = rs.getInt(1), cz = rs.getInt(2);
+                        visited++;
+                        for (int dx = -radius; dx <= radius; dx++) {
+                            for (int dz = -radius; dz <= radius; dz++) {
+                                out.add(((long) (cx + dx) << 32) ^ ((cz + dz) & 0xffffffffL));
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                return null;   // no chunk_visits table yet - don't filter
+            }
+        }
+        if (visited == 0) return null;   // nothing seen yet - show everything rather than a blank map
+        scopeCache = out;
+        scopeCacheAt = now;
+        scopeCacheWorld = world;
+        scopeCacheRadius = radius;
+        return out;
     }
 
     /** Merge 2^lod x 2^lod stored LOD chunks into one 16x16-cell blob the mesher understands. */

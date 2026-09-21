@@ -148,7 +148,7 @@
     // the "top solid" would otherwise be the roof and clip the view to just beneath it.
     const skipAbove = roofed ? 120 : Infinity;
     const baseY = includeUnderground ? minY
-      : (roofed ? minY : Math.max(minY, (minTop === Infinity ? minY : minTop) - 40));
+      : (roofed ? minY : (minTop === Infinity ? minY : minTop));
     if (roofed) top = Math.min(top, skipAbove);
     const AY = top - baseY + 1;
     const grid = new Uint16Array(AX * AY * AZ);   // 0 = air, else global palette id (1-based)

@@ -46,8 +46,11 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         }
         // write defaults into config.yml so the knobs are discoverable
         getConfig().addDefault("dumper-script", "/opt/groundtruth-dumper/live-dump.sh");
-        getConfig().addDefault("render-only-visited", false);
-        getConfig().addDefault("render-visited-radius", 0);
+        // "Only show what we've actually seen": one setting that scopes BOTH the 2D tiles and the 3D
+        // view to chunks a player has visited, plus an N-chunk buffer so the edges look representative.
+        // Off = render the whole world (fine for a small world, big for a large one).
+        getConfig().addDefault("render-only-visited", true);
+        getConfig().addDefault("render-visited-radius", 15);
         getConfig().addDefault("admin-code-hours", 24);
         // A player's login CODE is one-shot and short, but the session token the browser keeps should
         // last - otherwise a logged-in map loses live players and waypoint saving after 15 minutes.
@@ -715,6 +718,8 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
                         getConfig().getString("web-static", "/opt/groundtruth-web/static"),
                         getConfig().getString("tiles-dir", "/opt/groundtruth-web/tiles"),
                         getConfig().getString("proxy-to", "http://127.0.0.1:8095"),
+                        getConfig().getBoolean("render-only-visited", true),
+                        getConfig().getInt("render-visited-radius", 15),
                         getDataFolder(), colours);
                 web.start();
                 playerSnapTask = getServer().getScheduler().runTaskTimer(this, () -> {

@@ -29,7 +29,7 @@
   let markerPoints = null, popupEl = null, downXY = null;
   let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
-  let includeUnderground = false; // toggle: render all the way down (caves/ancient cities)
+  let includeUnderground = true;  // toggle: surface-only (false) vs all the way down to bedrock (true)
   let lastCenter = null;
   let worldView = false;          // world mode: coarse whole-map relief instead of full voxels
   let worldStep = 4;              // chunk decimation in world mode (4 -> 64-block cells)
@@ -276,7 +276,7 @@
     // the "top solid" would otherwise be the roof and clip the view to just beneath it.
     const skipAbove = roofed ? 120 : Infinity;
     const baseY = includeUnderground ? minY
-      : (roofed ? minY : Math.max(minY, (minTop === Infinity ? minY : minTop) - 40));
+      : (roofed ? minY : (minTop === Infinity ? minY : minTop));
     if (roofed) top = Math.min(top, skipAbove);
     const AY = top - baseY + 1;
     const grid = new Uint16Array(AX * AY * AZ);   // 0 = air, else global palette id (1-based)

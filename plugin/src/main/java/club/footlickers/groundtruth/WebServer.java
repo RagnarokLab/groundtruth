@@ -46,6 +46,8 @@ public final class WebServer {
     private final Path staticDir;
     private final Path tilesDir;
     private final String proxyTo;   // "" disables the fallback
+    private final boolean renderOnlyVisited;
+    private final int visitedRadius;
 
     private HttpServer server;
     /** Snapshot of online players, refreshed on the main thread (Bukkit state must not be read here). */
@@ -54,6 +56,7 @@ public final class WebServer {
     public WebServer(GroundTruthPlugin plugin, Storage storage, LogDb logDb, Auth auth,
                      String serviceKey, int port, int threads,
                      String staticDir, String tilesDir, String proxyTo,
+                     boolean renderOnlyVisited, int visitedRadius,
                      java.io.File dataFolder, MapColours colours) {
         this.plugin = plugin;
         this.storage = storage;
@@ -66,6 +69,8 @@ public final class WebServer {
         this.staticDir = Paths.get(staticDir).toAbsolutePath().normalize();
         this.tilesDir = Paths.get(tilesDir).toAbsolutePath().normalize();
         this.proxyTo = proxyTo == null ? "" : proxyTo.trim();
+        this.renderOnlyVisited = renderOnlyVisited;
+        this.visitedRadius = visitedRadius;
     }
 
     public void start() throws IOException {
@@ -424,6 +429,9 @@ public final class WebServer {
         java.util.Map<Long, String> biomes = (lod == 0)
                 ? map.biomes(world, intOf(q, "cx0", 0), intOf(q, "cz0", 0), intOf(q, "cx1", 0), intOf(q, "cz1", 0))
                 : null;
+        // "only show what we've seen": drop anything outside the visited+radius scope, using the same
+        // rule the 2D renderer uses so the whole map agrees. null scope = filtering off / nothing seen yet.
+        java.util.Set<Long> scope = renderOnlyVisited ? map.visitedScope(world, visitedRadius) : null;
         StringBuilder sb = new StringBuilder(rows.size() * 400 + 128);
         sb.append("{\"world\":").append(LogListener.Json.str(world)).append(",\"lod\":").append(lod);
         if (lod > 0) sb.append(",\"k\":").append(vmeta[0]);
@@ -432,6 +440,7 @@ public final class WebServer {
           .append(",\"chunks\":[");
         boolean first = true;
         for (Object[] r : rows) {
+            if (scope != null && !inScope(scope, lod, (Integer) r[0], (Integer) r[1])) continue;
             if (!first) sb.append(',');
             first = false;
             String biome = (biomes != null)
@@ -443,6 +452,23 @@ public final class WebServer {
               .append(java.util.Base64.getEncoder().encodeToString((byte[]) r[2])).append("\"}");
         }
         return sb.append("]}").toString();
+    }
+
+    /**
+     * True if a chunk (lod 0) or virtual chunk (lod &gt; 0, covering 2^lod real chunks each way) is
+     * inside the visited+radius scope.
+     */
+    private static boolean inScope(java.util.Set<Long> scope, int lod, int cx, int cz) {
+        if (lod == 0) {
+            return scope.contains(((long) cx << 32) ^ (cz & 0xffffffffL));
+        }
+        int k = 1 << lod;
+        for (int dx = 0; dx < k; dx++) {
+            for (int dz = 0; dz < k; dz++) {
+                if (scope.contains(((long) (cx * k + dx) << 32) ^ ((cz * k + dz) & 0xffffffffL))) return true;
+            }
+        }
+        return false;
     }
 
     private String chat(Map<String, String> q) {
