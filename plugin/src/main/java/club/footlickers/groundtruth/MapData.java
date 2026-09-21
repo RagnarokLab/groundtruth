@@ -474,6 +474,22 @@ public final class MapData {
         return m.find() ? Integer.parseInt(m.group(1)) : def;
     }
 
+    /** The recorded surface for one chunk: {biome, surface_block, surface_y} or null. */
+    public String[] chunkSurface(String world, int cx, int cz) throws Exception {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT biome,surface_block,surface_y FROM chunks WHERE world=? AND cx=? AND cz=?")) {
+                ps.setString(1, world); ps.setInt(2, cx); ps.setInt(3, cz);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return new String[] { rs.getString(1), rs.getString(2), String.valueOf(rs.getInt(3)) };
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     /** Merge 2^lod x 2^lod stored LOD chunks into one 16x16-cell blob the mesher understands. */
     private byte[] assembleLod(String world, int lod, int vx, int vz) throws Exception {
         int k = 1 << lod;

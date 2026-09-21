@@ -156,6 +156,69 @@ public class LogDb implements AutoCloseable {
         offer(new Object[] { "inventory", uuid, reason, contents, ts });
     }
 
+    /** The most recent inventory snapshot for a uuid: {ts, reason, contents} or null. */
+    public String[] latestInventory(String uuid) {
+        synchronized (readLock) {
+            try (PreparedStatement ps = readConn.prepareStatement(
+                    "SELECT ts,reason,contents FROM log_inventories WHERE uuid=? ORDER BY ts DESC LIMIT 1")) {
+                ps.setString(1, uuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return new String[] { String.valueOf(rs.getLong(1)), rs.getString(2), rs.getString(3) };
+                    }
+                }
+            } catch (SQLException e) { /* ignore */ }
+        }
+        return null;
+    }
+
+    /** Resolve a player name to their uuid (from the player table). */
+    public String uuidFor(String name) {
+        if (name == null || name.isEmpty()) return null;
+        synchronized (readLock) {
+            try (PreparedStatement ps = readConn.prepareStatement(
+                    "SELECT uuid FROM log_players WHERE ltrim(name,'.')=? LIMIT 1")) {
+                ps.setString(1, stripDot(name));
+                try (ResultSet rs = ps.executeQuery()) { if (rs.next()) return rs.getString(1); }
+            } catch (SQLException e) { /* ignore */ }
+        }
+        return null;
+    }
+
+    /** Last known position for a uuid: {world, x, y, z} or null. */
+    public String[] lastPosition(String uuid) {
+        synchronized (readLock) {
+            try (PreparedStatement ps = readConn.prepareStatement(
+                    "SELECT world,x,y,z FROM log_positions WHERE uuid=? ORDER BY ts DESC LIMIT 1")) {
+                ps.setString(1, uuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return new String[] { rs.getString(1), String.valueOf(rs.getInt(2)),
+                                String.valueOf(rs.getInt(3)), String.valueOf(rs.getInt(4)) };
+                    }
+                }
+            } catch (SQLException e) { /* ignore */ }
+        }
+        return null;
+    }
+
+    /** Last-known contents of a container at a position: {kind, contents, ts} or null. */
+    public String[] containerAt(String world, int x, int y, int z) {
+        synchronized (readLock) {
+            try (PreparedStatement ps = readConn.prepareStatement(
+                    "SELECT kind,contents,updated_ts FROM log_containers WHERE world=? AND x=? AND y=? AND z=?")) {
+                ps.setString(1, world);
+                ps.setInt(2, x); ps.setInt(3, y); ps.setInt(4, z);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return new String[] { rs.getString(1), rs.getString(2), String.valueOf(rs.getLong(3)) };
+                    }
+                }
+            } catch (SQLException e) { /* ignore */ }
+        }
+        return null;
+    }
+
     /**
      * Accumulate a container move (hopper/dropper) in memory. Flushed to log_container_flow as one row
      * per (container, item, hour) with a count - keeps "who drained this chest" readable without one

@@ -196,6 +196,18 @@ public final class WebServer {
                             intOf(q, "x", 0), intOf(q, "z", 0),
                             intOf(q, "zoom", 1), intOf(q, "w", 512), intOf(q, "h", 512)));
                     return;
+                case "/api/player/inventory":
+                    if (!authorised(ex, q)) { send(ex, 401, "{\"error\":\"login required\"}"); return; }
+                    send(ex, 200, inventory(q));
+                    return;
+                case "/api/container":
+                    if (!authorised(ex, q)) { send(ex, 401, "{\"error\":\"login required\"}"); return; }
+                    send(ex, 200, container(q));
+                    return;
+                case "/api/around":
+                    if (!authorised(ex, q)) { send(ex, 401, "{\"error\":\"login required\"}"); return; }
+                    send(ex, 200, around(q));
+                    return;
                 default:
                     // Not (yet) handled inside the plugin. Serve the web app / tiles from disk (GET
                     // only), and for anything still living on the old service proxy it through - POST
@@ -492,6 +504,187 @@ public final class WebServer {
             }
         }
         return false;
+    }
+
+    /** Latest inventory snapshot for a player (periodic/death/logout snapshots). */
+    private String inventory(Map<String, String> q) {
+        if (logDb == null) return "{\"error\":\"logging disabled\"}";
+        String name = strip(q.getOrDefault("player", ""));
+        if (name == null || name.isEmpty()) return "{\"error\":\"player required\"}";
+        String uuid = null;
+        boolean online = false;
+        String entry = playerEntry(name);
+        if (entry != null) { online = true; uuid = strField(entry, "uuid"); }
+        if (uuid == null) uuid = logDb.uuidFor(name);
+        if (uuid == null) return "{\"player\":" + LogListener.Json.str(name) + ",\"error\":\"unknown player\"}";
+        String[] inv = logDb.latestInventory(uuid);
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("{\"player\":").append(LogListener.Json.str(name))
+          .append(",\"uuid\":\"").append(uuid).append("\",\"online\":").append(online);
+        if (inv == null) {
+            sb.append(",\"items\":[],\"count\":0,\"note\":\"no snapshot recorded yet\"");
+        } else {
+            long ts = Long.parseLong(inv[0]);
+            String items = (inv[2] == null || inv[2].isEmpty()) ? "[]" : inv[2];
+            sb.append(",\"ts\":").append(ts).append(",\"ago\":").append(LogListener.Json.str(ago(ts)))
+              .append(",\"reason\":").append(LogListener.Json.str(inv[1]))
+              .append(",\"count\":").append(countOf(items, "\"id\":"))
+              .append(",\"items\":").append(items);
+        }
+        return sb.append('}').toString();
+    }
+
+    /** Last-known contents of a logged container (chest/barrel/shulker/...) at a position. */
+    private String container(Map<String, String> q) {
+        if (logDb == null) return "{\"error\":\"logging disabled\"}";
+        String world = q.getOrDefault("world", "world");
+        int x = intOf(q, "x", 0), y = intOf(q, "y", 0), z = intOf(q, "z", 0);
+        String[] c = logDb.containerAt(world, x, y, z);
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("{\"world\":").append(LogListener.Json.str(world))
+          .append(",\"x\":").append(x).append(",\"y\":").append(y).append(",\"z\":").append(z);
+        if (c == null) {
+            sb.append(",\"found\":false");
+        } else {
+            long ts = Long.parseLong(c[2]);
+            String items = (c[1] == null || c[1].isEmpty()) ? "[]" : c[1];
+            sb.append(",\"found\":true,\"kind\":").append(LogListener.Json.str(c[0]))
+              .append(",\"ts\":").append(ts).append(",\"ago\":").append(LogListener.Json.str(ago(ts)))
+              .append(",\"count\":").append(countOf(items, "\"id\":"))
+              .append(",\"items\":").append(items);
+        }
+        return sb.append('}').toString();
+    }
+
+    /** One call for "what's around me": position, biome, surface, nearby structures/players/events. */
+    private String around(Map<String, String> q) throws Exception {
+        String name = strip(q.getOrDefault("player", ""));
+        int radius = Math.max(1, Math.min(512, intOf(q, "radius", 64)));
+        int minutes = Math.max(1, intOf(q, "minutes", 10));
+        String world = q.get("world");
+        int x, y, z;
+        boolean online = false;
+        if (q.get("x") != null && q.get("z") != null) {
+            x = intOf(q, "x", 0); z = intOf(q, "z", 0); y = intOf(q, "y", 64);
+            if (world == null) world = "world";
+        } else {
+            if (name == null || name.isEmpty()) return "{\"error\":\"player or x/z required\"}";
+            String entry = playerEntry(name);
+            if (entry != null) {
+                online = true;
+                x = (int) numField(entry, "x"); y = (int) numField(entry, "y"); z = (int) numField(entry, "z");
+                String w = strField(entry, "world");
+                if (w != null) world = w;
+            } else {
+                if (logDb == null) return "{\"error\":\"logging disabled\"}";
+                String uuid = logDb.uuidFor(name);
+                String[] pos = uuid != null ? logDb.lastPosition(uuid) : null;
+                if (pos == null) return "{\"player\":" + LogListener.Json.str(name) + ",\"error\":\"unknown player\"}";
+                world = pos[0]; x = Integer.parseInt(pos[1]); y = Integer.parseInt(pos[2]); z = Integer.parseInt(pos[3]);
+            }
+        }
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("{\"world\":").append(LogListener.Json.str(world));
+        if (name != null && !name.isEmpty()) {
+            sb.append(",\"player\":").append(LogListener.Json.str(name)).append(",\"online\":").append(online);
+        }
+        sb.append(",\"x\":").append(x).append(",\"y\":").append(y).append(",\"z\":").append(z);
+        String[] surf = map.chunkSurface(world, x >> 4, z >> 4);
+        if (surf != null) {
+            sb.append(",\"biome\":").append(surf[0] == null ? "null" : LogListener.Json.str(surf[0]))
+              .append(",\"surface_block\":").append(surf[1] == null ? "null" : LogListener.Json.str(surf[1]))
+              .append(",\"surface_y\":").append(surf[2]);
+        }
+        sb.append(",\"nearby_structures\":[");
+        boolean f = true;
+        int shown = 0;
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (Storage.StructureHit h : storage.findNearest(world, null, x, z, 20)) {
+            if (shown >= 5) break;
+            if (!seen.add(h.type + "|" + h.x + "|" + h.z)) continue;   // one row per structure
+            if (!f) sb.append(',');
+            f = false;
+            shown++;
+            sb.append("{\"type\":").append(LogListener.Json.str(h.type))
+              .append(",\"x\":").append(h.x).append(",\"y\":").append(h.y).append(",\"z\":").append(h.z)
+              .append(",\"dist\":").append(round(Math.hypot(h.x - x, h.z - z))).append('}');
+        }
+        sb.append("],\"nearby_players\":").append(nearbyPlayers(x, z, radius, name));
+        if (logDb != null) {
+            long since = System.currentTimeMillis() - minutes * 60_000L;
+            sb.append(",\"recent\":[");
+            boolean f2 = true;
+            for (LogDb.Hit h : logDb.lookup(world, null, x, z, radius, since, null, 15)) {
+                if (!f2) sb.append(',');
+                f2 = false;
+                sb.append("{\"ago\":").append(LogListener.Json.str(ago(h.ts)))
+                  .append(",\"action\":").append(LogListener.Json.str(h.action))
+                  .append(",\"actor\":").append(LogListener.Json.str(h.actorName))
+                  .append(",\"x\":").append(h.x).append(",\"y\":").append(h.y).append(",\"z\":").append(h.z).append('}');
+            }
+            sb.append(']');
+        }
+        return sb.append('}').toString();
+    }
+
+    /** The JSON object for an online player from the snapshot, or null. */
+    private String playerEntry(String name) {
+        String j = playersJson;
+        int i = 0;
+        while ((i = j.indexOf("\"name\":", i)) >= 0) {
+            int qs = j.indexOf('"', i + 7), qe = j.indexOf('"', qs + 1);
+            if (qs < 0 || qe < 0) return null;
+            if (j.substring(qs + 1, qe).equals(name)) {
+                int start = j.lastIndexOf('{', i), end = j.indexOf('}', qe);
+                return (start >= 0 && end > start) ? j.substring(start, end + 1) : null;
+            }
+            i = qe;
+        }
+        return null;
+    }
+
+    private static String strField(String json, String key) {
+        int i = json.indexOf("\"" + key + "\":\"");
+        if (i < 0) return null;
+        int s = i + key.length() + 4, e = json.indexOf('"', s);
+        return e < 0 ? null : json.substring(s, e);
+    }
+
+    private static double numField(String json, String key) {
+        int i = json.indexOf("\"" + key + "\":");
+        if (i < 0) return 0;
+        int s = i + key.length() + 3, e = s;
+        while (e < json.length() && "-+.eE0123456789".indexOf(json.charAt(e)) >= 0) e++;
+        try { return Double.parseDouble(json.substring(s, e)); } catch (Exception ex) { return 0; }
+    }
+
+    private static int countOf(String hay, String needle) {
+        int n = 0, i = 0;
+        while ((i = hay.indexOf(needle, i)) >= 0) { n++; i += needle.length(); }
+        return n;
+    }
+
+    /** Online players within radius blocks of (x,z), as a JSON array. */
+    private String nearbyPlayers(int x, int z, int radius, String exclude) {
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        String j = playersJson;
+        int i = 0;
+        while ((i = j.indexOf("\"name\":", i)) >= 0) {
+            int qs = j.indexOf('"', i + 7), qe = j.indexOf('"', qs + 1);
+            if (qs < 0 || qe < 0) break;
+            String n = j.substring(qs + 1, qe);
+            int start = j.lastIndexOf('{', i), end = j.indexOf('}', qe);
+            String seg = (start >= 0 && end > start) ? j.substring(start, end + 1) : "";
+            double d = Math.hypot(numField(seg, "x") - x, numField(seg, "z") - z);
+            if (d <= radius && !n.equals(exclude)) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append("{\"name\":").append(LogListener.Json.str(n)).append(",\"dist\":").append(round(d)).append('}');
+            }
+            i = qe;
+        }
+        return sb.append(']').toString();
     }
 
     private String chat(Map<String, String> q) {
