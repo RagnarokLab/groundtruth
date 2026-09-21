@@ -1391,7 +1391,7 @@
     const same = worldLevel && worldLevel.key === tier.key;
     const covers = worldLevel && cx0 >= worldLevel.cx0 && cx1 <= worldLevel.cx1
       && cz0 >= worldLevel.cz0 && cz1 <= worldLevel.cz1;
-    if (same && covers) { refineWhy = 'uptodate'; return; }
+    if (same && covers) { refineWhy = 'uptodate'; window.GT3D_READY = true; return; }
     refineWhy = 'rebuild ' + tier.key;
 
     refineBusy = true;
@@ -1402,6 +1402,7 @@
     worldLoading = false;
     refineBusy = false;
     refineDone++;
+    window.GT3D_READY = true;
   }
 
   /** Structures + waypoints + live players, in absolute block coordinates (matches the world mesh). */
@@ -1546,6 +1547,21 @@
       camera.position.copy(controls.target).addScaledVector(dir, d);
       controls.update();
     },
+    // Aim the camera at a world point for automation/screenshots: {x,y,z,dist,yaw,pitch}
+    setView: (v) => {
+      if (!camera || !controls) return false;
+      const t = new THREE.Vector3(v.x || 0, v.y || 64, v.z || 0);
+      controls.target.copy(t);
+      const d = Math.max(1, v.dist || 300);
+      const yaw = ((v.yaw != null ? v.yaw : 45) * Math.PI) / 180;
+      const pitch = ((v.pitch != null ? v.pitch : 30) * Math.PI) / 180;
+      camera.position.copy(t).add(new THREE.Vector3(
+        Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)
+      ).multiplyScalar(d));
+      controls.update();
+      refineWorldNow();
+      return true;
+    },
     // run the LOD refine immediately (tuning/testing hook - normally it is debounced after a gesture)
     refine: () => refineWorldNow(),
     // lightweight introspection (used by the deploy smoke test and for tuning the LOD ladder)
@@ -1557,4 +1573,27 @@
       changes: refineChanges, group: !!worldGroup, vox: !!voxelGroup, err: refineLastErr,
     }),
   };
+
+  // URL-driven 3D view for automation/screenshots (point a browser here, then capture the canvas):
+  //   /?view3d=1&world=world&x=<blockX>&y=<blockY>&z=<blockZ>&dist=<blocks>&yaw=<deg>&pitch=<deg>
+  // window.GT3D_READY flips true once the LOD ladder has settled - poll it before screenshotting.
+  (function () {
+    const sp = new URLSearchParams(location.search);
+    if (!sp.get('view3d')) return;
+    const bx = parseFloat(sp.get('x') || '0'), bz = parseFloat(sp.get('z') || '0');
+    const view = {
+      x: bx, y: parseFloat(sp.get('y') || '70'), z: bz,
+      dist: parseFloat(sp.get('dist') || '300'),
+      yaw: parseFloat(sp.get('yaw') || '45'),
+      pitch: parseFloat(sp.get('pitch') || '30'),
+    };
+    const world = sp.get('world') || 'world';
+    window.GT3D_READY = false;
+    setTimeout(async () => {
+      try {
+        await GT3D.open(world, Math.floor(bx / 16), Math.floor(bz / 16));
+        GT3D.setView(view);
+      } catch (e) { /* leave the default view */ }
+    }, 400);
+  })();
 })();
