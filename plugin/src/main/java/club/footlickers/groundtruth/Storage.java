@@ -114,11 +114,29 @@ public class Storage {
                     "first_seen INTEGER, last_seen INTEGER, visits INTEGER NOT NULL DEFAULT 1, " +
                     "PRIMARY KEY (uuid, world, cx, cz))");
             st.execute("CREATE INDEX IF NOT EXISTS idx_visits_chunk ON chunk_visits(world, cx, cz)");
+            // Per-block layers, mirroring the offline dumper's schema exactly.
+            st.execute("CREATE TABLE IF NOT EXISTS chunk_pixels (" +
+                    "world TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL, " +
+                    "rgb BLOB, hgt BLOB, ground_hgt BLOB, PRIMARY KEY (world, cx, cz))");
+            st.execute("CREATE TABLE IF NOT EXISTS chunk_voxels (" +
+                    "world TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL, " +
+                    "data BLOB, indexed_at INTEGER, PRIMARY KEY (world, cx, cz))");
+            st.execute("CREATE TABLE IF NOT EXISTS chunk_voxels_lod (" +
+                    "world TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL, lod INTEGER NOT NULL, " +
+                    "data BLOB, indexed_at INTEGER, PRIMARY KEY (world, cx, cz, lod))");
         }
             // Terrain-layer columns (added 2026-09-20 for the map). Safe no-ops on a DB that already
             // has them; lets an older DB be upgraded in place. The offline dumper writes the same columns.
             addColumn("chunks", "surface_block", "TEXT");
             addColumn("chunks", "surface_y", "INTEGER");
+            // Terrain-only height (added 2026-09-21): median of the per-column ground heights, so a
+            // treetop or a sky island cannot spike the relief. surface_y stays the true high point.
+            // The offline dumper computes the same values block by block.
+            addColumn("chunks", "ground_y", "INTEGER");
+            addColumn("chunks", "ground_block", "TEXT");
+            // The plugin now writes the dumper's per-block layers too, so a server that only ever runs
+            // the plugin still gets per-block detail and 3D. Same schema as the dumper's Db.
+            addColumn("chunk_pixels", "ground_hgt", "BLOB");
         }
     }
 
@@ -137,12 +155,15 @@ public class Storage {
     }
 
     public void upsertChunk(String world, int cx, int cz, String biome, long inhabitedTime,
-                            String surfaceBlock, Integer surfaceY) {
-        String sql = "INSERT INTO chunks (world, cx, cz, biome, inhabited_time, indexed_at, surface_block, surface_y) " +
-                "VALUES (?,?,?,?,?,?,?,?) " +
+                            String surfaceBlock, Integer surfaceY,
+                            String groundBlock, Integer groundY) {
+        String sql = "INSERT INTO chunks (world, cx, cz, biome, inhabited_time, indexed_at, surface_block, "
+                + "surface_y, ground_block, ground_y) VALUES (?,?,?,?,?,?,?,?,?,?) " +
                 "ON CONFLICT(world, cx, cz) DO UPDATE SET biome=excluded.biome, " +
                 "inhabited_time=excluded.inhabited_time, indexed_at=excluded.indexed_at, " +
-                "surface_block=excluded.surface_block, surface_y=excluded.surface_y";
+                "surface_block=excluded.surface_block, surface_y=excluded.surface_y, " +
+                "ground_block=COALESCE(excluded.ground_block, chunks.ground_block), " +
+                "ground_y=COALESCE(excluded.ground_y, chunks.ground_y)";
         synchronized (this) {
             for (int attempt = 0; attempt < 2; attempt++) {
                 try (PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -154,11 +175,76 @@ public class Storage {
                     ps.setLong(6, System.currentTimeMillis() / 1000L);
                     ps.setString(7, surfaceBlock);
                     if (surfaceY == null) ps.setNull(8, java.sql.Types.INTEGER); else ps.setInt(8, surfaceY);
+                    ps.setString(9, groundBlock);
+                    if (groundY == null) ps.setNull(10, java.sql.Types.INTEGER); else ps.setInt(10, groundY);
                     ps.executeUpdate();
                     return;
                 } catch (SQLException e) {
                     if (attempt == 0 && isStale(e)) { reopen(); continue; }
                     log.warning("[GroundTruth] chunk upsert failed for " + world + " " + cx + "," + cz + ": " + e.getMessage());
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * Write the per-block layers for one chunk: the 16x16 pixel grid, the voxel blob and any LOD
+     * levels. Bytes are already in the dumper's formats, so this only compresses and stores.
+     */
+    public void upsertChunkDetail(String world, int cx, int cz, byte[] rgb, byte[] hgt, byte[] groundHgt,
+                                  byte[] voxels, java.util.Map<Integer, byte[]> lods) {
+        synchronized (this) {
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try {
+                    if (rgb != null) {
+                        try (PreparedStatement ps = conn.prepareStatement(
+                                "INSERT OR REPLACE INTO chunk_pixels (world,cx,cz,rgb,hgt,ground_hgt) "
+                                        + "VALUES (?,?,?,?,?,?)")) {
+                            ps.setString(1, world);
+                            ps.setInt(2, cx);
+                            ps.setInt(3, cz);
+                            ps.setBytes(4, club.footlickers.groundtruth.DetailBuilder.deflate(rgb));
+                            ps.setBytes(5, club.footlickers.groundtruth.DetailBuilder.deflate(hgt));
+                            ps.setBytes(6, groundHgt == null ? null
+                                    : club.footlickers.groundtruth.DetailBuilder.deflate(groundHgt));
+                            ps.executeUpdate();
+                        }
+                    }
+                    long now = System.currentTimeMillis() / 1000L;
+                    if (voxels != null) {
+                        try (PreparedStatement ps = conn.prepareStatement(
+                                "INSERT OR REPLACE INTO chunk_voxels (world,cx,cz,data,indexed_at) "
+                                        + "VALUES (?,?,?,?,?)")) {
+                            ps.setString(1, world);
+                            ps.setInt(2, cx);
+                            ps.setInt(3, cz);
+                            ps.setBytes(4, club.footlickers.groundtruth.DetailBuilder.deflate(voxels));
+                            ps.setLong(5, now);
+                            ps.executeUpdate();
+                        }
+                    }
+                    if (lods != null && !lods.isEmpty()) {
+                        try (PreparedStatement ps = conn.prepareStatement(
+                                "INSERT OR REPLACE INTO chunk_voxels_lod (world,cx,cz,lod,data,indexed_at) "
+                                        + "VALUES (?,?,?,?,?,?)")) {
+                            for (java.util.Map.Entry<Integer, byte[]> e : lods.entrySet()) {
+                                ps.setString(1, world);
+                                ps.setInt(2, cx);
+                                ps.setInt(3, cz);
+                                ps.setInt(4, e.getKey());
+                                ps.setBytes(5, club.footlickers.groundtruth.DetailBuilder.deflate(e.getValue()));
+                                ps.setLong(6, now);
+                                ps.addBatch();
+                            }
+                            ps.executeBatch();
+                        }
+                    }
+                    return;
+                } catch (SQLException e) {
+                    if (attempt == 0 && isStale(e)) { reopen(); continue; }
+                    log.warning("[GroundTruth] detail write failed for " + world + " " + cx + "," + cz
+                            + ": " + e.getMessage());
                     return;
                 }
             }
@@ -235,6 +321,35 @@ public class Storage {
             this.type = type; this.x = x; this.y = y; this.z = z;
             this.minX = minX; this.minY = minY; this.minZ = minZ; this.maxX = maxX; this.maxY = maxY; this.maxZ = maxZ;
         }
+    }
+
+    /** One world and its row counts, for the web API. */
+    public static final class WorldRow {
+        public String world;
+        public long chunks, structures;
+    }
+
+    /** Every indexed world with its chunk and structure counts. */
+    public List<WorldRow> worlds() {
+        List<WorldRow> out = new ArrayList<>();
+        synchronized (readLock) {
+            try (Statement st = readConn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT c.world, COUNT(*), "
+                       + "(SELECT COUNT(*) FROM structures s WHERE s.world=c.world) "
+                       + "FROM chunks c GROUP BY c.world ORDER BY 2 DESC")) {
+                while (rs.next()) {
+                    WorldRow w = new WorldRow();
+                    w.world = rs.getString(1);
+                    w.chunks = rs.getLong(2);
+                    w.structures = rs.getLong(3);
+                    out.add(w);
+                }
+            } catch (SQLException e) {
+                // report what we can rather than failing the request
+            }
+        }
+        return out;
     }
 
     /** Nearest matches to (originX, originZ) in a world, by center-of-bbox distance. */

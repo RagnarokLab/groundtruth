@@ -381,6 +381,57 @@ public class LogDb implements AutoCloseable {
         public int x, y, z;
     }
 
+    /** One log row, shaped for the web API (chat / spawns / damage all use this). */
+    public static class Event {
+        public long ts;
+        public String world, actorKind, actorName, causeId, target, meta;
+        public int x, y, z;
+    }
+
+    /**
+     * Recent rows for one action, newest first, optionally filtered to an actor and/or a target name.
+     * Actor and target are compared with a leading '.' stripped, because Bedrock players carry one
+     * in-game but not on the web.
+     */
+    public List<Event> recent(String action, String actorName, String targetName, long sinceTs, int limit) {
+        List<Event> out = new ArrayList<>();
+        StringBuilder sql = new StringBuilder("SELECT ts,world,x,y,z,actor_kind,actor_name,cause_id,target,meta "
+                + "FROM log_events WHERE action=? AND ts>=?");
+        List<Object> args = new ArrayList<>();
+        args.add(action);
+        args.add(sinceTs);
+        if (actorName != null) { sql.append(" AND ltrim(actor_name,'.')=?"); args.add(stripDot(actorName)); }
+        if (targetName != null) { sql.append(" AND ltrim(target,'.')=?"); args.add(stripDot(targetName)); }
+        sql.append(" ORDER BY ts DESC LIMIT ?");
+        args.add(Math.max(1, limit));
+        synchronized (readLock) {
+            try (PreparedStatement ps = readConn.prepareStatement(sql.toString())) {
+                for (int i = 0; i < args.size(); i++) ps.setObject(i + 1, args.get(i));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        Event e = new Event();
+                        e.ts = rs.getLong(1);
+                        e.world = rs.getString(2);
+                        e.x = rs.getInt(3); e.y = rs.getInt(4); e.z = rs.getInt(5);
+                        e.actorKind = rs.getString(6);
+                        e.actorName = rs.getString(7);
+                        e.causeId = rs.getString(8);
+                        e.target = rs.getString(9);
+                        e.meta = rs.getString(10);
+                        out.add(e);
+                    }
+                }
+            } catch (SQLException e) {
+                // a read failure must never take anything down - the API just reports what it has
+            }
+        }
+        return out;
+    }
+
+    private static String stripDot(String s) {
+        return s != null && s.startsWith(".") ? s.substring(1) : s;
+    }
+
     /** Recent events matching an optional player / radius / time window, newest first. */
     public List<Hit> lookup(String world, String playerFilter, int cx, int cz, int radius,
                             long sinceTs, String actionFilter, int limit) {

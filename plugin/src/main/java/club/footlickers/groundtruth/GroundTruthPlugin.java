@@ -22,6 +22,9 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     private Storage storage;
     private ChunkIndexer indexer;
     private LogDb logDb;
+    private WebServer web;
+    private org.bukkit.scheduler.BukkitTask playerSnapTask, heatTask, posTask, invTask;
+    private MapColours colours;
     private Auth auth;
     private final Map<String, Process> externalDumps = new HashMap<>();
     private final Map<java.util.UUID, Location> lastSample = new HashMap<>();
@@ -40,38 +43,70 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         } catch (SQLException e) {
             getLogger().warning("[GroundTruth] Failed to open groundtruth-log.db, logging disabled: " + e.getMessage());
         }
-        indexer = new ChunkIndexer(this, storage);
-        // one login code for everyone: the plugin mints signed tokens, the web verifies them
-        if (!getConfig().isString("auth-secret") || getConfig().getString("auth-secret", "").isEmpty()) {
-            getConfig().set("auth-secret", Auth.randomSecret());
-        }
-        auth = new Auth(getConfig().getString("auth-secret"));
         // write defaults into config.yml so the knobs are discoverable
         getConfig().addDefault("dumper-script", "/opt/groundtruth-dumper/live-dump.sh");
         getConfig().addDefault("render-only-visited", false);
         getConfig().addDefault("render-visited-radius", 0);
         getConfig().addDefault("admin-code-hours", 24);
+        // A player's login CODE is one-shot and short, but the session token the browser keeps should
+        // last - otherwise a logged-in map loses live players and waypoint saving after 15 minutes.
+        getConfig().addDefault("player-session-days", 30);
+        // --- the web API, served by the plugin itself (migration away from the Python service) ---
+        // 0 disables it. Ports must not clash with anything else on the box.
+        getConfig().addDefault("web-enabled", true);
+        getConfig().addDefault("web-port", 8096);
+        getConfig().addDefault("web-threads", 4);
+        // A shared key for local assistants (Sassy). Set it in config.yml - never in the source,
+        // this repo is public. Empty means key auth is off and only login codes work.
+        getConfig().addDefault("service-key", "");
+        // Where the map page/JS and the rendered tiles live, and the old service to fall back to
+        // while endpoints are still being ported into the plugin (empty disables the fallback).
+        getConfig().addDefault("web-static", "/opt/groundtruth-web/static");
+        getConfig().addDefault("tiles-dir", "/opt/groundtruth-web/tiles");
+        getConfig().addDefault("proxy-to", "http://127.0.0.1:8095");
+        // The plugin writes the same per-block layers the offline dumper does, so a server that only
+        // runs the plugin still gets full detail and 3D for new chunks. The dumper is then only for
+        // backfilling an existing world and for maintenance renders.
+        getConfig().addDefault("detail-indexing", true);
+        getConfig().addDefault("detail-lod-levels", "1,2,3,4");
+        getConfig().addDefault("debug-chunk-events", false);
         getConfig().addDefault("inventory-snapshot-seconds", 300);
         getConfig().addDefault("heat-aggregate-seconds", 600);
         getConfig().options().copyDefaults(true);
         saveConfig();
-        getServer().getPluginManager().registerEvents(new ChunkListener(indexer), this);
-        if (logDb != null) {
-            getServer().getPluginManager().registerEvents(new LogListener(logDb), this);
-            startPositionSampler();
-            startInventorySampler();
-            int heatSecs = getConfig().getInt("heat-aggregate-seconds", 600);
-            if (heatSecs > 0) {
-                getServer().getScheduler().runTaskTimerAsynchronously(this,
-                        () -> logDb.aggregateHeat(), 200L, heatSecs * 20L);
+        colours = new MapColours();
+        colours.load(new java.io.File(getConfig().getString("tiles-dir", "/opt/groundtruth-web/tiles")));
+        indexer = new ChunkIndexer(this, storage, colours,
+                getConfig().getBoolean("detail-indexing", true), detailLodLevels());
+        getServer().getPluginManager().registerEvents(new ChunkListener(indexer, this), this);
+        // ChunkListener only sees NEW chunks, so anything already loaded when we start (or that was
+        // generated while we were reloading) would otherwise never be indexed.
+        if (indexer != null) {
+            for (org.bukkit.World w : getServer().getWorlds()) {
+                for (org.bukkit.Chunk c : w.getLoadedChunks()) {
+                    if (!storage.isChunkIndexed(w.getName(), c.getX(), c.getZ())) {
+                        // a single bad chunk must never stop the plugin from enabling
+                        try {
+                            indexer.indexChunk(c);
+                        } catch (Exception e) {
+                            getLogger().warning("[GroundTruth] catch-up index failed for " + w.getName()
+                                    + " " + c.getX() + "," + c.getZ() + ": " + e.getMessage());
+                        }
+                    }
+                }
             }
         }
+        if (logDb != null) {
+            getServer().getPluginManager().registerEvents(new LogListener(logDb), this);
+        }
+        startComponents();
         getCommand("groundtruth").setExecutor(this);
         getLogger().info("[GroundTruth] Ready. New chunks are indexed live; run /groundtruth dump <world> to backfill existing ones.");
     }
 
     @Override
     public void onDisable() {
+        if (web != null) { web.stop(); web = null; }
         if (storage != null) storage.close();
         if (logDb != null) logDb.close();
     }
@@ -83,10 +118,10 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
      */
     private final Map<java.util.UUID, Integer> invHash = new HashMap<>();
 
-    private void startInventorySampler() {
+    private org.bukkit.scheduler.BukkitTask startInventorySampler() {
         int secs = getConfig().getInt("inventory-snapshot-seconds", 300);
-        if (secs <= 0) return;
-        getServer().getScheduler().runTaskTimer(this, () -> {
+        if (secs <= 0) return null;
+        return getServer().getScheduler().runTaskTimer(this, () -> {
             for (Player p : Bukkit.getOnlinePlayers()) {
                 int h = 1;
                 for (org.bukkit.inventory.ItemStack it : p.getInventory().getContents()) {
@@ -102,8 +137,8 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     }
 
     /** Samples player positions for the heatmap: at most one row per player per ~8 blocks / 5s. */
-    private void startPositionSampler() {
-        getServer().getScheduler().runTaskTimer(this, () -> {
+    private org.bukkit.scheduler.BukkitTask startPositionSampler() {
+        return getServer().getScheduler().runTaskTimer(this, () -> {
             for (Player p : Bukkit.getOnlinePlayers()) {
                 Location l = p.getLocation();
                 Location prev = lastSample.get(p.getUniqueId());
@@ -123,7 +158,8 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|link|logstatus> ...");
+            sender.sendMessage("Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|link|logstatus|reload> ..."
+                    + "  (reload re-reads config.yml; a new JAR needs a server restart)");
             return true;
         }
         switch (args[0].toLowerCase()) {
@@ -157,6 +193,8 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
                 return handleWaypoint(sender, args);
             case "logstatus":
                 return handleLogStatus(sender, args);
+            case "reload":
+                return handleReload(sender, args);
             default:
                 sender.sendMessage("Unknown subcommand. Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|link|logstatus> ...");
                 return true;
@@ -387,7 +425,11 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         return true;
     }
 
-    /** Machine-readable list of every online player: name, uuid, x, y, z, world. */
+    /**
+     * Machine-readable list of every online player: name, uuid, x, y, z, world, health, food.
+     * Health and food are here so a question like "what just attacked me" can be answered with how
+     * close to death the player actually is.
+     */
     private boolean handlePlayers(CommandSender sender, String[] args) {
         StringBuilder sb = new StringBuilder("GTPLAYERS|");
         for (Player p : Bukkit.getOnlinePlayers()) {
@@ -397,7 +439,9 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
               .append(String.format("%.1f", l.getX())).append(",")
               .append(String.format("%.1f", l.getY())).append(",")
               .append(String.format("%.1f", l.getZ())).append(",")
-              .append(p.getWorld().getName()).append(";");
+              .append(p.getWorld().getName()).append(",")
+              .append(String.format("%.1f", p.getHealth())).append(",")
+              .append(p.getFoodLevel()).append(";");
         }
         sender.sendMessage(sb.toString());
         return true;
@@ -569,7 +613,8 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             boolean admin = p.hasPermission("groundtruth.admin") || p.isOp();
             boolean rollback = p.hasPermission("groundtruth.admin.rollback") || p.isOp();
             long adminTtl = getConfig().getLong("admin-code-hours", 24) * 3600_000L;
-            long ttl = admin ? adminTtl : 15L * 60 * 1000;
+            long playerTtl = getConfig().getLong("player-session-days", 30) * 24L * 3600_000L;
+            long ttl = admin ? adminTtl : playerTtl;
             String token = auth.token(p.getUniqueId().toString(), p.getName(), admin, rollback, ttl);
             sender.sendMessage("[GroundTruth] Your login code" + (admin ? " (admin" + (rollback ? "+rollback" : "") + ")" : "") + ":");
             sender.sendMessage(token);
@@ -634,6 +679,96 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             sender.sendMessage("  " + w.name + (w.isPublic ? " (public)" : "") + " - " + w.world + " "
                     + w.x + "," + w.y + "," + w.z + (w.uuid.equals(uuid) ? "" : " [another player]"));
         }
+        return true;
+    }
+
+    /**
+     * Create (or re-create) everything that reads config or owns a resource: the auth secret, the
+     * colour tables, the web server and its player snapshot, and the samplers. Safe to call on a
+     * reload because stopComponents() tears all of it down first.
+     */
+    private void startComponents() {
+        colours = new MapColours();
+        colours.load(new java.io.File(getConfig().getString("tiles-dir", "/opt/groundtruth-web/tiles")));
+        if (indexer != null) indexer.applyConfig(colours, getConfig().getBoolean("detail-indexing", true), detailLodLevels());
+
+        if (!getConfig().isString("auth-secret") || getConfig().getString("auth-secret", "").isEmpty()) {
+            getConfig().set("auth-secret", Auth.randomSecret());
+            saveConfig();
+        }
+        auth = new Auth(getConfig().getString("auth-secret"));
+
+        if (getConfig().getBoolean("web-enabled", true)) {
+            try {
+                web = new WebServer(this, storage, logDb, auth,
+                        getConfig().getString("service-key", ""),
+                        getConfig().getInt("web-port", 8096),
+                        getConfig().getInt("web-threads", 4),
+                        getConfig().getString("web-static", "/opt/groundtruth-web/static"),
+                        getConfig().getString("tiles-dir", "/opt/groundtruth-web/tiles"),
+                        getConfig().getString("proxy-to", "http://127.0.0.1:8095"),
+                        getDataFolder(), colours);
+                web.start();
+                playerSnapTask = getServer().getScheduler().runTaskTimer(this, () -> {
+                    if (web != null) web.refreshPlayers();
+                }, 20L, 20L);
+            } catch (Exception e) {
+                getLogger().warning("[GroundTruth] web API failed to start on port "
+                        + getConfig().getInt("web-port", 8096) + ": " + e.getMessage());
+                web = null;
+            }
+        }
+        if (logDb != null) {
+            posTask = startPositionSampler();
+            invTask = startInventorySampler();
+            int heatSecs = getConfig().getInt("heat-aggregate-seconds", 600);
+            if (heatSecs > 0) {
+                heatTask = getServer().getScheduler().runTaskTimerAsynchronously(this,
+                        () -> logDb.aggregateHeat(), 200L, heatSecs * 20L);
+            }
+        }
+    }
+
+    /** Tear down everything startComponents() created, so it can be created again cleanly. */
+    private void stopComponents() {
+        if (playerSnapTask != null) { playerSnapTask.cancel(); playerSnapTask = null; }
+        if (heatTask != null) { heatTask.cancel(); heatTask = null; }
+        if (posTask != null) { posTask.cancel(); posTask = null; }
+        if (invTask != null) { invTask.cancel(); invTask = null; }
+        if (web != null) { web.stop(); web = null; }
+    }
+
+    /** detail-lod-levels as an int array. */
+    private int[] detailLodLevels() {
+        String csv = getConfig().getString("detail-lod-levels", "1,2,3,4");
+        if (csv == null || csv.isBlank()) return new int[0];
+        String[] parts = csv.split(",");
+        int[] out = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            try { out[i] = Integer.parseInt(parts[i].trim()); } catch (NumberFormatException ignored) { }
+        }
+        return out;
+    }
+
+    /**
+     * /groundtruth reload [config|full]
+     *
+     * A server restart is the wrong tool for a plugin change, so this is the first-class way to
+     * apply a configuration change. It re-reads config.yml, rebuilds the colour tables, restarts the
+     * web server and its player snapshot, and reschedules the samplers - everything that reads config
+     * or owns a resource. It deliberately does not touch the plugin's classes: a new JAR is applied by
+     * restarting the server, like any other plugin.
+     */
+    private boolean handleReload(CommandSender sender, String[] args) {
+        // Deliberately self-contained: it re-reads config.yml and restarts everything that owns a
+        // resource (web server, colour tables, samplers, indexer settings). No external reloader, no
+        // classloader games, nothing that can drop the plugin. Replacing the JAR is a different
+        // thing entirely and is done by restarting the server - as it is for any other plugin.
+        reloadConfig();
+        stopComponents();
+        startComponents();
+        sender.sendMessage("[GroundTruth] reloaded: config re-read; web server, colour tables and "
+                + "samplers restarted. (A new JAR needs a server restart, same as any plugin.)");
         return true;
     }
 

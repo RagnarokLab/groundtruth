@@ -3,6 +3,7 @@ package club.footlickers.groundtruth;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.Base64;
 
@@ -45,6 +46,71 @@ public final class Auth {
                 + ",\"e\":" + exp + ",\"j\":\"" + randomId() + "\"}";
         String p = b64(payload.getBytes(StandardCharsets.UTF_8));
         return p + "." + b64(hmac(p));
+    }
+
+    /** A verified caller. */
+    public static final class Id {
+        public final String uuid, name;
+        public final boolean admin, rollback;
+        Id(String uuid, String name, boolean admin, boolean rollback) {
+            this.uuid = uuid; this.name = name; this.admin = admin; this.rollback = rollback;
+        }
+    }
+
+    /**
+     * Verify a token that this server (or the web) minted. Returns the identity, or null when the
+     * signature, the shape or the expiry is wrong - never throws, callers just refuse.
+     */
+    public Id verify(String code) {
+        if (code == null) return null;
+        int dot = code.lastIndexOf('.');
+        if (dot <= 0) return null;
+        String payload = code.substring(0, dot);
+        String sig = code.substring(dot + 1);
+        String expect = b64(hmac(payload));
+        if (!MessageDigest.isEqual(sig.getBytes(StandardCharsets.UTF_8),
+                                   expect.getBytes(StandardCharsets.UTF_8))) return null;
+        try {
+            String json = new String(Base64.getUrlDecoder().decode(pad(payload)), StandardCharsets.UTF_8);
+            String uuid = field(json, "u"), name = field(json, "n");
+            boolean admin = "1".equals(field(json, "a"));
+            boolean rollback = "1".equals(field(json, "p"));
+            long exp = Long.parseLong(field(json, "e"));
+            if (exp < System.currentTimeMillis()) return null;
+            return new Id(uuid, name, admin, rollback);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String pad(String b64url) {
+        int pad = (4 - b64url.length() % 4) % 4;
+        return b64url + "=".repeat(pad);
+    }
+
+    /** Pull one flat field out of the payload we wrote ourselves. */
+    private static String field(String json, String key) {
+        String needle = "\"" + key + "\"";
+        int i = json.indexOf(needle);
+        if (i < 0) return null;
+        i = json.indexOf(':', i + needle.length());
+        if (i < 0) return null;
+        i++;
+        while (i < json.length() && json.charAt(i) == ' ') i++;
+        if (i >= json.length()) return null;
+        if (json.charAt(i) == '"') {
+            StringBuilder sb = new StringBuilder();
+            for (int k = i + 1; k < json.length(); k++) {
+                char c = json.charAt(k);
+                if (c == '\\' && k + 1 < json.length()) { sb.append(json.charAt(++k)); continue; }
+                if (c == '"') break;
+                sb.append(c);
+            }
+            return sb.toString();
+        }
+        int k = i;
+        while (k < json.length() && ",}".indexOf(json.charAt(k)) < 0) k++;
+        return json.substring(i, k).trim();
     }
 
     private byte[] hmac(String data) {

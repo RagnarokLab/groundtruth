@@ -24,6 +24,38 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 try:
+    import numpy as np
+except Exception:  # the pixel tier needs it; the rest of the server does not
+    np = None
+
+_decompress_pool = None
+
+
+def decompress_pool():
+    """ThreadPoolExecutor for chunk_pixels decompression. zlib releases the GIL, so decompressing
+    the 768/512-byte blobs in parallel is a real speedup on the cold path."""
+    global _decompress_pool
+    if _decompress_pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _decompress_pool = ThreadPoolExecutor(max_workers=6)
+    return _decompress_pool
+
+
+def unpack_chunk_pixels(row):
+    """One chunk_pixels row -> (cx, cz, hgt(16,16), ground(16,16), rgb(16,16,3)), or None."""
+    cx, cz, rgb_b, hgt_b, ghg_b = row
+    try:
+        hgt = np.frombuffer(zlib.decompress(hgt_b), dtype="<u2")
+        rgb = np.frombuffer(zlib.decompress(rgb_b), dtype=np.uint8)
+        ghg = np.frombuffer(zlib.decompress(ghg_b), dtype="<u2") if ghg_b else hgt
+    except Exception:
+        return None
+    if hgt.size < 256 or rgb.size < 768:
+        return None
+    return (cx, cz, hgt.reshape(16, 16).astype(np.int32), ghg.reshape(16, 16).astype(np.int32),
+            rgb.reshape(16, 16, 3))
+
+try:
     from PIL import Image  # optional; used to crop a face from a full skin texture
 except Exception:  # pragma: no cover
     Image = None
@@ -251,6 +283,273 @@ def _default_world():
     return ws[0]["world"] if ws else None
 
 
+def _ago(ms):
+    """Human 'time ago' from an epoch-milliseconds timestamp."""
+    if not ms:
+        return "unknown"
+    secs = max(0, int(time.time() - ms / 1000.0))
+    if secs < 60:
+        return "%ds ago" % secs
+    if secs < 3600:
+        return "%dm ago" % (secs // 60)
+    if secs < 86400:
+        return "%dh %dm ago" % (secs // 3600, (secs % 3600) // 60)
+    return "%dd ago" % (secs // 86400)
+
+
+def _log_rows(sql, args):
+    conn = _log_conn()
+    try:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def service_authorised(handler, qs):
+    """The service key (GT_UPLOAD_KEY) or an admin login code. Used by the player-activity queries,
+    which are about a real person's whereabouts and health and must not be world-readable."""
+    if UPLOAD_KEY and qs.get("key", [""])[0] == UPLOAD_KEY:
+        return True
+    payload = verify_token(handler.headers.get("X-GT-Code") or qs.get("code", [""])[0])
+    return bool(payload and payload.get("a"))
+
+
+def any_user_authorised(handler, qs):
+    """The service key, or any valid login code (player or admin). For player data the map shows to
+    logged-in users but that should never be world-readable - live positions, the event log, chest
+    contents. Gated by default; the public map stays public."""
+    if UPLOAD_KEY and qs.get("key", [""])[0] == UPLOAD_KEY:
+        return True
+    return bool(verify_token(handler.headers.get("X-GT-Code") or qs.get("code", [""])[0]))
+
+
+def chat_log(minutes=60, player=None, limit=100, q=None):
+    """Player chat transcript, newest first. Feeds "what did people say?" style questions."""
+    since = int((time.time() - minutes * 60) * 1000)
+    sql = ("SELECT ts,world,x,y,z,actor_name,meta FROM log_events WHERE action='chat' AND ts>=?")
+    args = [since]
+    if player:
+        sql += " AND ltrim(actor_name,'.')=?"
+        args.append(player.lstrip("."))
+    if q:
+        sql += " AND meta LIKE ?"
+        args.append("%" + q + "%")
+    sql += " ORDER BY ts DESC LIMIT ?"
+    args.append(max(1, min(1000, limit)))
+    rows = _log_rows(sql, tuple(args))
+    out = []
+    for r in rows:
+        try:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+        except Exception:
+            meta = {}
+        out.append({"ts": r["ts"], "ago": _ago(r["ts"]), "player": (r["actor_name"] or "").lstrip("."),
+                    "message": meta.get("message"), "world": r["world"],
+                    "x": r["x"], "y": r["y"], "z": r["z"]})
+    summaries = ["%s: %s" % (e["player"], e["message"]) for e in out[:5]]
+    summary = ("Nothing said in the last %d minutes." % minutes) if not out else \
+              ("Last %d message%s. Most recent - %s" % (len(out), "" if len(out) == 1 else "s",
+                                                        summaries[0]))
+    return {"window_minutes": minutes, "player": player, "query": q, "count": len(out),
+            "messages": out, "summary": summary}
+
+
+def mob_spawns(player=None, minutes=30, radius=128, limit=20):
+    """Recent hostile spawns, optionally only those near a player's current position.
+
+    Answers "where did that zombie spawn and why": reason (NATURAL / REINFORCEMENT / SPAWNER /
+    PATROL / STRUCTURE / RAID / SIEGE / COMMAND...), light levels, what block it spawned on, biome,
+    difficulty, and how far the nearest player was.
+    """
+    since = int((time.time() - minutes * 60) * 1000)
+    rows = _log_rows(
+        "SELECT ts,world,x,y,z,actor_name,cause_id,meta FROM log_events "
+        "WHERE action='mob-spawn' AND ts>=? ORDER BY ts DESC LIMIT ?",
+        (since, max(200, limit * 10)))
+    px = pz = pworld = None
+    if player:
+        for p in players().get("players", []):
+            if (p.get("name") or "").lstrip(".").lower() == player.lstrip(".").lower():
+                px, pz, pworld = p["x"], p["z"], p.get("world")
+                break
+    out = []
+    for r in rows:
+        if px is not None:
+            if r["world"] != pworld:
+                continue
+            dx, dz = r["x"] - px, r["z"] - pz
+            if dx * dx + dz * dz > radius * radius:
+                continue
+        try:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+        except Exception:
+            meta = {}
+        out.append({
+            "ts": r["ts"], "ago": _ago(r["ts"]), "mob": r["actor_name"], "reason": r["cause_id"],
+            "world": r["world"], "x": r["x"], "y": r["y"], "z": r["z"],
+            "light": meta.get("light"), "block_light": meta.get("blockLight"),
+            "sky_light": meta.get("skyLight"), "block_below": meta.get("blockBelow"),
+            "biome": meta.get("biome"), "difficulty": meta.get("difficulty"),
+            "nearest_player": meta.get("nearestPlayer"),
+            "nearest_player_dist": meta.get("nearestPlayerDist"),
+            "is_day": meta.get("isDay"),
+        })
+        if len(out) >= limit:
+            break
+    summary = "No hostile spawns logged in the last %d minutes%s." % (
+        minutes, " near %s" % player if player else "")
+    if out:
+        s0 = out[0]
+        why = {"NATURAL": "a natural dark spawn", "REINFORCEMENT": "a reinforcement call from a zombie you hit",
+               "SPAWNER": "a spawner", "PATROL": "a patrol", "STRUCTURE": "the structure it belongs to",
+               "RAID": "a raid", "SIEGE": "a siege", "COMMAND": "a command"}.get(s0["reason"], s0["reason"])
+        summary = ("%s spawned %s%s - %s, light %s, on %s at %d,%d,%d."
+                   % (s0["mob"], s0["ago"],
+                      " %.0f blocks from %s" % (s0["nearest_player_dist"], s0["nearest_player"])
+                      if s0.get("nearest_player_dist") is not None else "",
+                      why, s0.get("light"), s0.get("block_below"), s0["x"], s0["y"], s0["z"]))
+    return {"player": player, "window_minutes": minutes, "radius": radius, "count": len(out),
+            "spawns": out, "summary": summary}
+
+
+def player_attacks(name, minutes=30, limit=50):
+    """Everything that damaged this player recently, newest first, plus a plain-language summary."""
+    since = int((time.time() - minutes * 60) * 1000)
+    rows = _log_rows(
+        # Bedrock (Floodgate) names carry a leading dot in-game but not on the web, so compare
+        # with it stripped on both sides.
+        "SELECT ts,world,x,y,z,actor_kind,actor_id,actor_name,cause_kind,target,meta FROM log_events "
+        "WHERE action='damage' AND ltrim(target,'.')=? AND ts>=? ORDER BY ts DESC LIMIT ?",
+        (name, since, limit))
+    attacks, by_attacker, total = [], {}, 0.0
+    for r in rows:
+        try:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+        except Exception:
+            meta = {}
+        dmg = float(meta.get("amount") or 0)
+        total += dmg
+        key = r["actor_name"] or "unknown"
+        agg = by_attacker.setdefault(key, {"attacker": key, "kind": r["actor_kind"], "hits": 0, "damage": 0.0})
+        agg["hits"] += 1
+        agg["damage"] = round(agg["damage"] + dmg, 1)
+        attacks.append({
+            "ts": r["ts"], "ago": _ago(r["ts"]),
+            "attacker": r["actor_name"], "attacker_kind": r["actor_kind"],
+            "cause": r["cause_kind"], "weapon": meta.get("weapon"),
+            "damage": dmg, "health_after": meta.get("healthAfter"),
+            "world": r["world"], "x": r["x"], "y": r["y"], "z": r["z"],
+        })
+    worst = max(by_attacker.values(), key=lambda a: (a["damage"], a["hits"])) if by_attacker else None
+    if not attacks:
+        summary = "Nothing has damaged %s in the last %d minutes." % (name, minutes)
+    else:
+        summary = ("%s took %d hit%s (%.1f damage) in the last %d minutes, mostly from %s; "
+                   "most recent %s at %d,%d,%d." % (
+                       name, len(attacks), "" if len(attacks) == 1 else "s", total, minutes,
+                       worst["attacker"], attacks[0]["ago"],
+                       attacks[0]["x"], attacks[0]["y"], attacks[0]["z"]))
+    return {"player": name, "window_minutes": minutes, "count": len(attacks),
+            "total_damage": round(total, 1),
+            "by_attacker": sorted(by_attacker.values(), key=lambda a: -a["damage"]),
+            "attacks": attacks, "summary": summary}
+
+
+def player_timeline(name, minutes=60, limit=100):
+    """Recent notable activity for one player (either as actor or target), newest first."""
+    since = int((time.time() - minutes * 60) * 1000)
+    rows = _log_rows(
+        "SELECT ts,action,world,x,y,z,actor_kind,actor_name,cause_kind,target,meta FROM log_events "
+        "WHERE ts>=? AND (ltrim(actor_name,'.')=? OR ltrim(target,'.')=?) ORDER BY ts DESC LIMIT ?",
+        (since, name, name, limit))
+    out = []
+    for r in rows:
+        try:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+        except Exception:
+            meta = {}
+        a = r["action"]
+        if a == "damage":
+            what = "%s (%s) hit %s for %.1f" % (r["actor_name"], r["cause_kind"], r["target"],
+                                                float(meta.get("amount") or 0))
+        elif a == "player-death":
+            what = "%s died (%s)" % (r["actor_name"], meta.get("cause"))
+        elif a == "entity-kill":
+            what = "%s killed %s" % (r["actor_name"], r["target"])
+        elif a == "block-break":
+            what = "%s broke %s" % (r["actor_name"], r["target"])
+        elif a == "block-place":
+            what = "%s placed %s" % (r["actor_name"], r["target"])
+        elif a == "container-open":
+            what = "%s opened %s" % (r["actor_name"], r["target"])
+        elif a == "command":
+            what = "%s ran %s" % (r["actor_name"], meta.get("cmd"))
+        else:
+            what = "%s %s %s" % (r["actor_name"], a, r["target"] or "")
+        out.append({"ts": r["ts"], "ago": _ago(r["ts"]), "action": a, "what": what.strip(),
+                    "world": r["world"], "x": r["x"], "y": r["y"], "z": r["z"]})
+    return {"player": name, "window_minutes": minutes, "count": len(out), "events": out}
+
+
+def player_now(name):
+    """Live state for one online player, plus what last hit them."""
+    out = {"player": name, "online": False}
+    for p in players().get("players", []):
+        if (p.get("name") or "").lstrip(".").lower() == name.lstrip(".").lower():
+            out.update({"online": True, "uuid": p.get("uuid"), "world": p.get("world"),
+                        "dimension": p.get("env"), "x": int(p["x"]), "y": int(p["y"]),
+                        "z": int(p["z"]), "health": p.get("health"), "food": p.get("food")})
+            if p.get("health") is not None:
+                out["hearts"] = round(p["health"] / 2.0, 1)
+            break
+    last = _log_rows(
+        "SELECT ts,actor_kind,actor_name,cause_kind,target,meta FROM log_events "
+        "WHERE action='damage' AND ltrim(target,'.')=? ORDER BY ts DESC LIMIT 1", (name,))
+    if last:
+        r = last[0]
+        try:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+        except Exception:
+            meta = {}
+        out["last_damage"] = {"ago": _ago(r["ts"]), "ts": r["ts"], "attacker": r["actor_name"],
+                              "attacker_kind": r["actor_kind"], "cause": r["cause_kind"],
+                              "damage": meta.get("amount")}
+    return out
+
+
+def last_attack(minutes=10):
+    """The most recent damage taken by anyone currently online - answers "what just attacked me"
+    without the assistant needing to know which player is speaking."""
+    online = [ (p.get("name") or "").lstrip(".") for p in players().get("players", []) ]
+    since = int((time.time() - minutes * 60) * 1000)
+    rows = _log_rows(
+        "SELECT ts,world,x,y,z,actor_kind,actor_name,cause_kind,target,meta FROM log_events "
+        "WHERE action='damage' AND ts>=? ORDER BY ts DESC LIMIT 40", (since,))
+    for r in rows:
+        victim = (r["target"] or "").lstrip(".")
+        if victim in online:
+            try:
+                meta = json.loads(r["meta"]) if r["meta"] else {}
+            except Exception:
+                meta = {}
+            return {
+                "player": victim, "online": True, "ago": _ago(r["ts"]), "ts": r["ts"],
+                "attacker": r["actor_name"], "attacker_kind": r["actor_kind"],
+                "cause": r["cause_kind"], "weapon": meta.get("weapon"),
+                "damage": meta.get("amount"), "health_after": meta.get("healthAfter"),
+                "world": r["world"], "x": r["x"], "y": r["y"], "z": r["z"],
+                "summary": "%s hit %s for %s %s (%s) at %d,%d,%d."
+                           % (r["actor_name"], victim, meta.get("amount"), r["cause_kind"],
+                              _ago(r["ts"]), r["x"], r["y"], r["z"]),
+            }
+    return {"player": None, "online": bool(online), "attack": None,
+            "summary": "Nothing has hit %s in the last %d minutes."
+                       % (" or ".join(online) if online else "anyone", minutes)}
+
+
 def players():
     raw = rcon_cmd("groundtruth players")
     payload = raw.split("GTPLAYERS|", 1)[-1]
@@ -260,11 +559,18 @@ def players():
         seg = seg.strip()
         if seg.count(",") < 5:
             continue
-        name, uuid, x, y, z, world = seg.split(",", 5)
+        parts = seg.split(",")
+        name, uuid, x, y, z, world = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
         name = name.lstrip(".")  # Floodgate bedrock prefix
         try:
-            out.append({"name": name, "uuid": uuid, "x": float(x), "y": float(y),
-                        "z": float(z), "world": world, "env": envs.get(world)})
+            rec = {"name": name, "uuid": uuid, "x": float(x), "y": float(y),
+                   "z": float(z), "world": world, "env": envs.get(world)}
+            # added 2026-09-21: health/food so "what just attacked me" can say how close to death
+            if len(parts) > 6 and parts[6]:
+                rec["health"] = float(parts[6])
+            if len(parts) > 7 and parts[7]:
+                rec["food"] = int(parts[7])
+            out.append(rec)
         except ValueError:
             continue
     return {"players": out}
@@ -505,6 +811,319 @@ def admin_summary(world=None, since_ms=0):
 
 
 def _log_conn():
+    return sqlite3.connect(f"file:{LOG_DB_PATH}?mode=ro", uri=True)
+
+
+_blockcolors_cache = None
+
+
+def load_blockcolors():
+    """{block: (r,g,b)} from blockcolors.json (built by AtlasBuilder), cached."""
+    global _blockcolors_cache
+    if _blockcolors_cache is not None:
+        return _blockcolors_cache
+    out = {}
+    try:
+        raw = json.loads((TILES_DIR / "blockcolors.json").read_text())
+        for k, v in raw.items():
+            h = v.lstrip("#")
+            out[k] = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except Exception:
+        pass
+    _blockcolors_cache = out
+    return out
+
+
+_extent_cache = {}
+
+
+def db_world_extent(world, ttl=120):
+    """(minCx,maxCx,minCz,maxCz,chunks) for a world, cached - the underlying aggregate scans every
+    chunk in the world, so it must never run on a hot path."""
+    now = time.time()
+    hit = _extent_cache.get(world)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    conn = db_ro()
+    try:
+        r = conn.execute("SELECT MIN(cx),MAX(cx),MIN(cz),MAX(cz),COUNT(*) FROM chunks WHERE world=? "
+                         "AND surface_y IS NOT NULL", (world,)).fetchone()
+        ext = r if r and r[0] is not None else None
+    except Exception:
+        ext = None
+    finally:
+        conn.close()
+    _extent_cache[world] = (now, ext)
+    return ext
+
+
+# Short-lived cache of finished tile payloads: zooming in and back out (or dragging back over ground
+# you just looked at) then costs nothing at all. Keyed by the full request string; the terrain data
+# only changes when a dump runs, so a short TTL is plenty.
+_tile_cache = {}
+_tile_cache_order = []
+_TILE_CACHE_MAX = 120
+
+
+def tile_cache_get(key):
+    hit = _tile_cache.get(key)
+    if not hit:
+        return None
+    ts, body = hit
+    if time.time() - ts > 90:
+        _tile_cache.pop(key, None)
+        return None
+    return body
+
+
+def tile_cache_put(key, body):
+    if len(_tile_cache) >= _TILE_CACHE_MAX:
+        for k in _tile_cache_order[:60]:
+            _tile_cache.pop(k, None)
+        del _tile_cache_order[:60]
+    _tile_cache[key] = (time.time(), body)
+    _tile_cache_order.append(key)
+
+
+def db_world_bounds(world):
+    """(minCx, maxCx, minCz, maxCz) for a world, plus a 'core' range with a few far-flung chunks
+    trimmed off each end - framing on the raw extent lets a handful of outliers shrink the view to
+    a dot, which is exactly what a whole-world 3D view must not do."""
+    conn = db_ro()
+    try:
+        r = conn.execute("SELECT MIN(cx),MAX(cx),MIN(cz),MAX(cz) FROM chunks WHERE world=? "
+                         "AND surface_y IS NOT NULL", (world,)).fetchone()
+        if not r or r[0] is None:
+            return None
+        total = conn.execute("SELECT COUNT(*) FROM chunks WHERE world=? AND surface_y IS NOT NULL",
+                             (world,)).fetchone()[0]
+        trim = min(300, max(0, total // 20))
+
+        def edge(col, desc):
+            v = conn.execute(
+                f"SELECT {col} FROM chunks WHERE world=? AND surface_y IS NOT NULL ORDER BY {col} "
+                f"{'DESC' if desc else 'ASC'} LIMIT 1 OFFSET ?", (world, trim)).fetchone()
+            return v[0] if v and v[0] is not None else None
+
+        core = [edge("cx", False), edge("cx", True), edge("cz", False), edge("cz", True)]
+        return (r[0], r[1], r[2], r[3], *core)
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def world_min_y(world):
+    """The dimension's minimum Y (chunk_pixels heights are stored relative to it)."""
+    try:
+        m = json.loads((TILES_DIR / world / "meta.json").read_text())
+        return int(m.get("minY", -64))
+    except Exception:
+        return -64
+
+
+def pixels_grid(world, cx0, cz0, cx1, cz1, px, deflate=False, cell_cap=400000, chunk_cap=12000):
+    """Per-block surface height + colour for a region, decimated to `px` blocks per output cell.
+
+    Source is chunk_pixels (a 16x16 grid per chunk). Heights are the MEDIAN of each cell's blocks,
+    which is what keeps trees and lone peaks from spiking the terrain at fine resolutions; colours
+    are the mean over the valid blocks. Output is a dense grid so the client can mesh it directly:
+
+        i16 ox0, i16 oz0, i16 px, i32 cols, i32 rows
+        then cols*rows * (i16 y, u8 r, u8 g, u8 b)   (y = -32768 means "no data")
+    """
+    if np is None:
+        return {"error": "numpy unavailable on the server"}
+
+    px = max(1, int(px))
+    nx = cx1 - cx0 + 1
+    nz = cz1 - cz0 + 1
+    if nx * nz > chunk_cap:
+        return {"error": "area too large"}
+
+    min_y = world_min_y(world)
+    conn = db_ro()
+    try:
+        rows = conn.execute(
+            "SELECT cx,cz,rgb,hgt,ground_hgt FROM chunk_pixels WHERE world=? AND cx>=? AND cx<=? "
+            "AND cz>=? AND cz<=?", (world, cx0, cx1, cz0, cz1)).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return {"error": "no pixel data for this area"}
+
+    gh = np.full((nz * 16, nx * 16), -32768, np.int32)
+    gg = np.full((nz * 16, nx * 16), -32768, np.int32)
+    gc = np.zeros((nz * 16, nx * 16, 3), np.uint8)
+    for part in decompress_pool().map(unpack_chunk_pixels, rows):
+        if part is None:
+            continue
+        cx, cz, hgt, ghg, rgb = part
+        yy, xx = (cz - cz0) * 16, (cx - cx0) * 16
+        gh[yy:yy + 16, xx:xx + 16] = hgt + min_y
+        gg[yy:yy + 16, xx:xx + 16] = ghg + min_y
+        gc[yy:yy + 16, xx:xx + 16] = rgb
+
+    # pad up to a whole number of cells, then aggregate each px*px block
+    ph, pw = (-gh.shape[0]) % px, (-gh.shape[1]) % px
+    if ph or pw:
+        gh = np.pad(gh, ((0, ph), (0, pw)), constant_values=-32768)
+        gg = np.pad(gg, ((0, ph), (0, pw)), constant_values=-32768)
+        gc = np.pad(gc, ((0, ph), (0, pw), (0, 0)))
+    rowsn, cols = gh.shape[0] // px, gh.shape[1] // px
+    if cols * rowsn > cell_cap:
+        return {"error": "area too large"}
+
+    def aggregate(a):
+        blk = a.reshape(rowsn, px, cols, px).transpose(0, 2, 1, 3).reshape(rowsn, cols, px * px)
+        ok = blk != -32768
+        med = np.where(ok.any(axis=2), np.median(np.where(ok, blk, np.nan), axis=2), -32768)
+        return np.nan_to_num(med, nan=-32768).astype(np.int32), ok
+
+    med_surface, valid = aggregate(gh)
+    med_ground, _ = aggregate(gg)
+    # chunks the ground backfill has not reached yet show their surface
+    med_ground = np.where(med_ground == -32768, med_surface, med_ground)
+
+    cb = gc.reshape(rowsn, px, cols, px, 3).transpose(0, 2, 1, 3, 4).reshape(rowsn, cols, px * px, 3)
+    v3 = valid[..., None]
+    cnt = np.maximum(v3.sum(axis=2), 1)
+    col = ((cb.astype(np.int32) * v3).sum(axis=2) // cnt).astype(np.uint8).reshape(rowsn, cols, 3)
+
+    ox0 = (cx0 * 16) // px
+    oz0 = (cz0 * 16) // px
+    count = cols * rowsn
+    rec = np.empty((count, 7), np.uint8)
+    rec[:, 0:2] = med_surface.reshape(-1).astype(">i2").view(np.uint8).reshape(-1, 2)
+    rec[:, 2:4] = med_ground.reshape(-1).astype(">i2").view(np.uint8).reshape(-1, 2)
+    rec[:, 4:7] = col.reshape(-1, 3).astype(np.uint8)
+    raw = struct.pack(">hhhii", ox0, oz0, px, cols, rowsn) + rec.tobytes()
+    res = {"world": world, "ox0": ox0, "oz0": oz0, "px": px, "cols": cols, "rows": rowsn,
+           "cells": int(valid.any(axis=2).sum())}
+    if deflate:
+        res["deflated"] = True
+        res["data"] = base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
+    else:
+        res["data"] = base64.b64encode(raw).decode("ascii")
+    return res
+
+
+_biome_tints_cache = None
+_DEFAULT_TINT = {"grass": (0x91, 0xBD, 0x59), "foliage": (0x77, 0xAB, 0x2F),
+                 "dry_foliage": (0x77, 0xAB, 0x2F), "water": (0x3F, 0x76, 0xE4)}
+
+
+def load_biome_tints():
+    """Per-biome tints from biome_tints.json (built by AtlasBuilder), cached."""
+    global _biome_tints_cache
+    if _biome_tints_cache is not None:
+        return _biome_tints_cache
+    try:
+        _biome_tints_cache = json.loads((TILES_DIR / "biome_tints.json").read_text())
+    except Exception:
+        _biome_tints_cache = {}
+    return _biome_tints_cache
+
+
+def color_channel(name):
+    """Which tint channel a block uses. Mirror of the dumper's Dumper.colorChannel so the coarse
+    chunk colour matches what the offline dump put in the per-block detail layer."""
+    b = name.split(":", 1)[1] if ":" in name else name
+    if "water" in b or b == "bubble_column" or "seagrass" in b or "kelp" in b or b == "lily_pad":
+        return "water"
+    if "dry_grass" in b or "leaf_litter" in b or "dry_foliage" in b:
+        return "dry_foliage"
+    if b.endswith("_leaves") and not any(x in b for x in ("spruce", "birch", "azalea", "cherry", "pale_oak")):
+        return "foliage"
+    if "vine" in b:
+        return "foliage"
+    if b in ("grass_block", "grass", "short_grass", "tall_grass", "fern", "large_fern") \
+            or "sugar_cane" in b or "potted_fern" in b:
+        return "grass"
+    return "none"
+
+
+def biome_tinted(biome, block, rgb):
+    """Apply the biome's tint to a block colour (grass/foliage/water), leaving the rest alone."""
+    if not biome or not block:
+        return rgb
+    ch = color_channel(block)
+    if ch == "none":
+        return rgb
+    entry = load_biome_tints().get(biome)
+    if not entry:
+        return rgb
+    hexv = entry.get(ch)
+    if not hexv:
+        return rgb
+    h = hexv.lstrip("#")
+    br, bg, bb = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    dr, dg, db = _DEFAULT_TINT[ch]
+    return (min(255, rgb[0] * br // max(1, dr)),
+            min(255, rgb[1] * bg // max(1, dg)),
+            min(255, rgb[2] * bb // max(1, db)))
+
+
+def terrain_chunks(world, cx0, cz0, cx1, cz1, cap=450000, step=1, deflate=False, want_bounds=False):
+    """Sparse per-chunk terrain for a large area - the data behind the 3D world view.
+
+    Per chunk we return BOTH layers, because they answer different questions:
+      surface_y - the true highest block (trees, plants, builds). Used for the fine tiers and to spot
+                  sky islands, which sit far above the local ground.
+      ground_y  - the terrain surface (vegetation and floating masses skipped). Used for the relief,
+                  so a treetop cannot spike the map. Falls back to surface_y for chunks the ground
+                  backfill has not reached yet.
+
+    Binary: i16 minCx, i16 minCz, i32 count, then per chunk
+            i16 dx, i16 dz, i16 surface_y, i16 ground_y, u8 r, u8 g, u8 b (surface colour).
+    """
+    step = max(1, int(step))
+    conn = db_ro()
+    try:
+        sql = ("SELECT cx,cz,surface_y,ground_y,surface_block,biome FROM chunks WHERE world=? AND cx>=? "
+               "AND cx<=? AND cz>=? AND cz<=? AND surface_y IS NOT NULL")
+        args = [world, cx0, cx1, cz0, cz1]
+        if step > 1:
+            sql += " AND (cx % ?)=0 AND (cz % ?)=0"
+            args += [step, step]
+        sql += " LIMIT ?"
+        args.append(cap)
+        rows = conn.execute(sql, args).fetchall()
+        # The bounds aggregate scans every chunk in the world. It is only needed by the one cheap
+        # probe request the 3D view makes on open - computing it per tile request was costing ~0.5s
+        # per tile, which is exactly why zooming felt like it took forever.
+        ext = db_world_extent(world) if want_bounds else None
+    finally:
+        conn.close()
+    bc = load_blockcolors()
+    n = len(rows)
+    rec = np.empty((n, 11), np.uint8)   # dx,dz,surface_y,ground_y (i16 each) + r,g,b
+    if n:
+        dx = np.fromiter((r[0] - cx0 for r in rows), dtype=">i2", count=n)
+        dz = np.fromiter((r[1] - cz0 for r in rows), dtype=">i2", count=n)
+        sy = np.fromiter((r[2] for r in rows), dtype=">i2", count=n)
+        gy = np.fromiter(((r[2] if r[3] is None else r[3]) for r in rows), dtype=">i2", count=n)
+        cols_rgb = np.fromiter(
+            (c for r in rows for c in biome_tinted(r[5], r[4], bc.get(r[4], (120, 120, 120)))),
+            dtype=np.uint8, count=n * 3)
+        rec[:, 0:2] = dx.view(np.uint8).reshape(-1, 2)
+        rec[:, 2:4] = dz.view(np.uint8).reshape(-1, 2)
+        rec[:, 4:6] = sy.view(np.uint8).reshape(-1, 2)
+        rec[:, 6:8] = gy.view(np.uint8).reshape(-1, 2)
+        rec[:, 8:11] = cols_rgb.reshape(-1, 3)
+    raw = struct.pack(">hhi", cx0, cz0, n) + rec.tobytes()
+    out = {"world": world, "cx0": cx0, "cz0": cz0, "count": len(rows), "step": step,
+           "bounds": {"minCx": ext[0], "maxCx": ext[1], "minCz": ext[2], "maxCz": ext[3],
+                      "chunks": ext[4]} if ext and ext[4] else None}
+    if deflate:
+        out["deflated"] = True
+        out["data"] = base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
+    else:
+        out["data"] = base64.b64encode(raw).decode("ascii")
+    return out
+
+
+
     return sqlite3.connect(f"file:{LOG_DB_PATH}?mode=ro", uri=True)
 
 
@@ -1073,14 +1692,16 @@ def _region_dir(world):
     return None, None
 
 
-def _run_dumper_voxels(world, cx0, cz0, cx1, cz1):
+def _run_dumper_voxels(world, cx0, cz0, cx1, cz1, lod=0):
     regions, miny = _region_dir(world)
     if not regions:
         return False
     cmd = ["runuser", "-u", DUMPER_USER, "--", "java", "-jar", DUMPER_JAR,
            "--regions", regions, "--world", world, "--min-y", str(miny),
-           "--db", DB_PATH, "--skip-structures", "--voxels",
+           "--db", DB_PATH, "--skip-structures",
            "--cx0", str(cx0), "--cz0", str(cz0), "--cx1", str(cx1), "--cz1", str(cz1)]
+    # lod 0 is the real 1m blocks; higher levels are the decimated ones the renderer scales up
+    cmd += ["--voxels"] if lod == 0 else ["--voxel-lods", str(lod)]
     try:
         subprocess.run(cmd, timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
@@ -1088,33 +1709,123 @@ def _run_dumper_voxels(world, cx0, cz0, cx1, cz1):
         return False
 
 
-def voxels(world, cx0, cz0, cx1, cz1):
+def assemble_lod_virtual(world, lod, vx, vz):
+    """Build one 16x16-cell "virtual chunk" out of the stored per-chunk LOD data.
+
+    A LOD level's stored chunk covers 16/2^lod cells per side, so 2^lod real chunks tile exactly into
+    one 16x16 cell block - the shape the existing mesher already understands. Doing the assembly here
+    means the renderer needs no LOD awareness at all: it meshes the result as a normal chunk and just
+    scales the group by 2^lod.
+    """
+    k = 1 << lod
+    n = 16 >> lod
+    rows = db_ro().execute(
+        "SELECT cx,cz,data FROM chunk_voxels_lod WHERE world=? AND lod=? AND cx BETWEEN ? AND ? "
+        "AND cz BETWEEN ? AND ?", (world, lod, vx * k, vx * k + k - 1, vz * k, vz * k + k - 1)).fetchall()
+    if not rows:
+        return None
+    pal = []
+    pal_index = {}
+    cols = [[] for _ in range(256)]
+    for cx, cz, blob in rows:
+        try:
+            d = zlib.decompress(blob)
+        except Exception:
+            continue
+        if len(d) < 4 or d[0] != 2:
+            continue
+        off = 2
+        pal_len = struct.unpack_from(">H", d, off)[0]
+        off += 2
+        src = []
+        for _ in range(pal_len):
+            ln = struct.unpack_from(">H", d, off)[0]
+            off += 2
+            src.append(d[off:off + ln].decode("utf-8", "replace"))
+            off += ln
+        ox = (cx - vx * k) * n
+        oz = (cz - vz * k) * n
+        for zi in range(n):
+            for xi in range(n):
+                run_count = struct.unpack_from(">H", d, off)[0]
+                off += 2
+                target = cols[(oz + zi) * 16 + (ox + xi)]
+                for _ in range(run_count):
+                    y0, ln, pi = struct.unpack_from(">hhh", d, off)
+                    off += 6
+                    if pi < 1 or pi > len(src):
+                        continue
+                    name = src[pi - 1]
+                    idx = pal_index.get(name)
+                    if idx is None:
+                        pal.append(name)
+                        idx = len(pal)
+                        pal_index[name] = idx
+                    target.append((y0, ln, idx))
+    if not pal:
+        return None
+    out = bytearray()
+    out += struct.pack(">BH", 1, len(pal))
+    for name in pal:
+        nb = name.encode("utf-8")
+        out += struct.pack(">H", len(nb)) + nb
+    for i in range(256):
+        runs = cols[i]
+        out += struct.pack(">H", len(runs))
+        for (y0, ln, idx) in runs:
+            out += struct.pack(">hhh", y0, ln, idx)
+    return zlib.compress(bytes(out), 6)
+
+
+def voxels(world, cx0, cz0, cx1, cz1, lod=0):
     if cx1 < cx0:
         cx0, cx1 = cx1, cx0
     if cz1 < cz0:
         cz0, cz1 = cz1, cz0
     cx1 = min(cx1, cx0 + VOXEL_MAX_SPAN)
     cz1 = min(cz1, cz0 + VOXEL_MAX_SPAN)
-    sql = ("SELECT cx,cz,data FROM chunk_voxels WHERE world=? AND cx BETWEEN ? AND ? AND cz BETWEEN ? AND ?")
+    if lod > 0:
+        # The bbox is in VIRTUAL chunk coordinates: one virtual chunk is 2^lod real chunks, which is
+        # exactly the 16x16 cells the mesher expects. Generate the underlying real chunks on demand
+        # first if this level has not been dumped for the area.
+        k = 1 << lod
+        vx0, vz0, vx1, vz1 = cx0, cz0, cx1, cz1
+        need = db_ro().execute(
+            "SELECT COUNT(*) FROM chunk_voxels_lod WHERE world=? AND lod=? AND cx BETWEEN ? AND ? "
+            "AND cz BETWEEN ? AND ?",
+            (world, lod, vx0 * k, (vx1 + 1) * k - 1, vz0 * k, (vz1 + 1) * k - 1)).fetchone()[0]
+        if need < (vx1 - vx0 + 1) * k * (vz1 - vz0 + 1) * k:
+            _run_dumper_voxels(world, vx0 * k, vz0 * k, (vx1 + 1) * k - 1, (vz1 + 1) * k - 1, lod)
+        out2 = []
+        for vx in range(vx0, vx1 + 1):
+            for vz in range(vz0, vz1 + 1):
+                blob = assemble_lod_virtual(world, lod, vx, vz)
+                if blob:
+                    out2.append({"cx": vx, "cz": vz, "biome": None,
+                                 "data": base64.b64encode(blob).decode("ascii")})
+        return {"world": world, "lod": lod, "k": k, "vx0": vx0, "vz0": vz0,
+                "cx0": vx0, "cz0": vz0, "cx1": vx1, "cz1": vz1, "chunks": out2}
+    sql = ("SELECT cx,cz,data FROM chunk_voxels WHERE world=? "
+           "AND cx BETWEEN ? AND ? AND cz BETWEEN ? AND ?")
     args = (world, cx0, cx1, cz0, cz1)
     try:
         have = db_ro().execute(sql, args).fetchall()
     except sqlite3.OperationalError:
         have = []  # table not created yet - the dumper will make it
     if len(have) < (cx1 - cx0 + 1) * (cz1 - cz0 + 1):
-        _run_dumper_voxels(world, cx0, cz0, cx1, cz1)
+        _run_dumper_voxels(world, cx0, cz0, cx1, cz1, 0)
         have = db_ro().execute(sql, args).fetchall()
     bconn = db_ro()
     biome_map = {(r[0], r[1]): r[2] for r in bconn.execute(
         "SELECT cx,cz,biome FROM chunks WHERE world=? AND cx BETWEEN ? AND ? AND cz BETWEEN ? AND ?",
-        args).fetchall()}
+        (world, cx0, cx1, cz0, cz1)).fetchall()}
     out = []
     for cx, cz, data in have:
         if data is None:
             continue
         out.append({"cx": cx, "cz": cz, "biome": biome_map.get((cx, cz)),
                     "data": base64.b64encode(data).decode("ascii")})
-    return {"world": world, "cx0": cx0, "cz0": cz0, "cx1": cx1, "cz1": cz1, "chunks": out}
+    return {"world": world, "lod": lod, "cx0": cx0, "cz0": cz0, "cx1": cx1, "cz1": cz1, "chunks": out}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1242,7 +1953,71 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(str(e).encode("utf-8"))
             return
 
+        if parsed.path == "/api/chat":
+            if not any_user_authorised(self, qs):
+                self._send_json({"error": "login required"})
+                return
+            try:
+                minutes = max(1, int(qs.get("minutes", ["60"])[0]))
+                limit = min(1000, max(1, int(qs.get("limit", ["100"])[0])))
+            except ValueError:
+                self._send_json({"error": "bad minutes/limit"})
+                return
+            self._send_json(chat_log(minutes, qs.get("player", [None])[0], limit, qs.get("q", [None])[0]))
+            return
+
+        if parsed.path == "/api/spawns":
+            if not any_user_authorised(self, qs):
+                self._send_json({"error": "login required"})
+                return
+            try:
+                minutes = max(1, int(qs.get("minutes", ["30"])[0]))
+                radius = max(1, int(qs.get("radius", ["128"])[0]))
+                limit = min(200, max(1, int(qs.get("limit", ["20"])[0])))
+            except ValueError:
+                self._send_json({"error": "bad minutes/radius/limit"})
+                return
+            self._send_json(mob_spawns(qs.get("player", [None])[0], minutes, radius, limit))
+            return
+
+        if parsed.path == "/api/last-attack":
+            if not service_authorised(self, qs):
+                self._send_json({"error": "service key or admin code required"})
+                return
+            try:
+                minutes = max(1, int(qs.get("minutes", ["10"])[0]))
+            except ValueError:
+                minutes = 10
+            self._send_json(last_attack(minutes))
+            return
+
+        if parsed.path in ("/api/player/now", "/api/player/attacks", "/api/player/timeline"):
+            if not service_authorised(self, qs):
+                self._send_json({"error": "service key or admin code required"})
+                return
+            name = qs.get("player", [""])[0]
+            if not name:
+                self._send_json({"error": "player required"})
+                return
+            try:
+                limit = min(500, int(qs.get("limit", ["50"])[0]))
+                minutes = max(1, int(qs.get("minutes", ["30"])[0]))
+            except ValueError:
+                self._send_json({"error": "bad minutes/limit"})
+                return
+            if parsed.path == "/api/player/now":
+                self._send_json(player_now(name))
+            elif parsed.path == "/api/player/attacks":
+                self._send_json(player_attacks(name, minutes, limit))
+            else:
+                self._send_json(player_timeline(name, minutes, limit))
+            return
+
         if parsed.path == "/api/players":
+            # live player positions: logged-in viewers only
+            if not any_user_authorised(self, qs):
+                self._send_json({"players": [], "error": "login required"})
+                return
             try:
                 self._send_json(players())
             except Exception as e:
@@ -1261,6 +2036,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/nbt":
+            # block-entity NBT includes container contents
+            if not any_user_authorised(self, qs):
+                self._send_json({"error": "login required"})
+                return
             world = qs.get("world", [None])[0] or _default_world()
             if not world:
                 self.send_response(400); self.end_headers(); return
@@ -1283,6 +2062,69 @@ class Handler(BaseHTTPRequestHandler):
             hours = int(qs.get("hours", ["12"])[0])
             since = int(time.time() * 1000) - hours * 3600000
             self._send_json(admin_track(qs.get("world", [None])[0], payload.get("u"), since, 0))
+            return
+
+        if parsed.path == "/api/pixels":
+            try:
+                world = qs.get("world", ["world"])[0]
+                cx0 = int(qs.get("cx0", ["0"])[0]); cz0 = int(qs.get("cz0", ["0"])[0])
+                cx1 = int(qs.get("cx1", ["0"])[0]); cz1 = int(qs.get("cz1", ["0"])[0])
+                px = int(qs.get("px", ["1"])[0])
+            except (ValueError, KeyError):
+                self._send_json({"error": "bad bbox"})
+                return
+            if cx1 < cx0: cx0, cx1 = cx1, cx0
+            if cz1 < cz0: cz0, cz1 = cz1, cz0
+            ck = "pixels|" + self.path
+            cached = tile_cache_get(ck)
+            if cached is not None:
+                self._send_json(cached)
+                return
+            out = pixels_grid(world, cx0, cz0, cx1, cz1, px,
+                              deflate=qs.get("deflate", ["0"])[0] in ("1", "true"))
+            if not out.get("error") and len(out.get("data", "")) < 500000:
+                tile_cache_put(ck, out)
+            self._send_json(out)
+            return
+
+        if parsed.path == "/api/terrain":
+            core = None
+            try:
+                world = qs.get("world", ["world"])[0]
+                cx0 = int(qs.get("cx0", ["0"])[0]); cz0 = int(qs.get("cz0", ["0"])[0])
+                cx1 = int(qs.get("cx1", ["0"])[0]); cz1 = int(qs.get("cz1", ["0"])[0])
+                want_bounds = any(k in qs for k in ("all", "world_view"))
+                if want_bounds:
+                    b = db_world_bounds(world)
+                    if b:
+                        cx0, cx1, cz0, cz1 = b[0], b[1], b[2], b[3]
+                        core = {"coreCx0": b[4], "coreCx1": b[5], "coreCz0": b[6], "coreCz1": b[7]}
+                step = int(qs.get("step", ["1"])[0])
+            except (ValueError, KeyError):
+                self._send_json({"error": "bad bbox"})
+                return
+            if cx1 < cx0: cx0, cx1 = cx1, cx0
+            if cz1 < cz0: cz0, cz1 = cz1, cz0
+            if step < 1:
+                step = 1
+            # bound the shape (the row LIMIT in terrain_chunks is the real work cap); a bbox far
+            # bigger than any world is simply nonsense
+            if (cx1 - cx0 + 1) > 60000 or (cz1 - cz0 + 1) > 60000:
+                self._send_json({"error": "area too large"})
+                return
+            ck = "terrain|" + self.path
+            cached = tile_cache_get(ck)
+            if cached is not None:
+                self._send_json(cached)
+                return
+            out = terrain_chunks(world, cx0, cz0, cx1, cz1, step=step,
+                                 deflate=qs.get("deflate", ["0"])[0] in ("1", "true"),
+                                 want_bounds=want_bounds)
+            if core and out.get("bounds"):
+                out["bounds"].update(core)
+            if not out.get("error") and len(out.get("data", "")) < 500000:
+                tile_cache_put(ck, out)
+            self._send_json(out)
             return
 
         if parsed.path == "/api/waypoints":
@@ -1425,6 +2267,10 @@ class Handler(BaseHTTPRequestHandler):
             self.path = "/admin.html"
 
         if parsed.path == "/api/log":
+            # the raw event feed is player activity: positions, containers, commands
+            if not any_user_authorised(self, qs):
+                self._send_json({"error": "login required"})
+                return
             try:
                 x = int(qs["x"][0]) if "x" in qs else None
                 z = int(qs["z"][0]) if "z" in qs else None
@@ -1462,7 +2308,11 @@ class Handler(BaseHTTPRequestHandler):
             if not world:
                 self.send_response(400); self.end_headers(); return
             try:
-                self._send_json(voxels(world, cx0, cz0, cx1, cz1))
+                lod = int(qs.get("lod", ["0"])[0])
+            except ValueError:
+                lod = 0
+            try:
+                self._send_json(voxels(world, cx0, cz0, cx1, cz1, max(0, min(6, lod))))
             except Exception as e:
                 self.send_response(500); self.end_headers(); self.wfile.write(str(e).encode())
             return
@@ -1549,6 +2399,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             try:
+                if not any_user_authorised(self, qs):
+                    self._send_json({"error": "login required"})
+                    return
                 if parsed.path == "/api/nearby":
                     self._send_json(nearby(world, x, z, radius, limit))
                 elif parsed.path == "/api/find":

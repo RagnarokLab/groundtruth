@@ -111,6 +111,8 @@ let highlightedCluster = null;
 
 // --- live players (from the plugin via /api/players), refreshed periodically
 let players = [];
+// waypoint markers (public ones from everyone + this player's private ones)
+let waypoints = [];
 const skinCache = new Map();
 const SKIN_V = Date.now(); // skins update on join (live Bedrock capture); don't let caches mask them
 function skinImg(uuid) {
@@ -126,7 +128,10 @@ function skinImg(uuid) {
 }
 async function loadPlayers() {
   try {
-    const res = await fetch('/api/players');
+    // live positions are gated: only ask when logged in, and pass the code so it is allowed
+    const code = localStorage.getItem('gt_code');
+    if (!code) { players = []; draw(); return; }  // markers need a login (see applyIdentity)
+    const res = await fetch('/api/players?code=' + encodeURIComponent(code));
     players = (await res.json()).players || [];
     draw();
   } catch (e) { /* keep last known */ }
@@ -266,15 +271,34 @@ function inflateB64(b64) {
     .arrayBuffer();
 }
 
-function makeDetailCanvas(rgb) {
+/**
+ * One chunk's 16x16 block colours as a canvas. The stored colour is the TRUE block colour (no
+ * shading baked in), so a gentle darken-only relief shade is applied here from the height layer -
+ * hillshading must never brighten, or high ground washes out (a badlands mesa went pink at 1.15x).
+ */
+function makeDetailCanvas(rgb, hgt) {
   const cv = document.createElement('canvas');
   cv.width = 16; cv.height = 16;
   const c2 = cv.getContext('2d');
   const img = c2.createImageData(16, 16);
+  let minY = 0, maxY = 0;
+  if (hgt) {
+    for (let i = 0; i < 256; i++) {
+      const v = hgt[i * 2] | (hgt[i * 2 + 1] << 8);
+      if (i === 0 || v < minY) minY = v;
+      if (i === 0 || v > maxY) maxY = v;
+    }
+  }
+  const span = Math.max(8, maxY - minY);
   for (let i = 0; i < 256; i++) {
-    img.data[i * 4] = rgb[i * 3];
-    img.data[i * 4 + 1] = rgb[i * 3 + 1];
-    img.data[i * 4 + 2] = rgb[i * 3 + 2];
+    let sh = 1;
+    if (hgt) {
+      const v = hgt[i * 2] | (hgt[i * 2 + 1] << 8);
+      sh = 0.78 + 0.22 * Math.max(0, Math.min(1, (v - minY) / span));
+    }
+    img.data[i * 4] = Math.min(255, rgb[i * 3] * sh);
+    img.data[i * 4 + 1] = Math.min(255, rgb[i * 3 + 1] * sh);
+    img.data[i * 4 + 2] = Math.min(255, rgb[i * 3 + 2] * sh);
     img.data[i * 4 + 3] = 255;
   }
   c2.putImageData(img, 0, 0);
@@ -298,8 +322,8 @@ function ensureDetail() {
         for (const c of d.chunks || []) {
           const ck = c.cx + ',' + c.cz;
           if (detailCache.has(ck)) continue;
-          const [rgbBuf] = await Promise.all([inflateB64(c.rgb), inflateB64(c.hgt)]);
-          detailCache.set(ck, makeDetailCanvas(new Uint8Array(rgbBuf)));
+          const [rgbBuf, hgtBuf] = await Promise.all([inflateB64(c.rgb), inflateB64(c.hgt)]);
+          detailCache.set(ck, makeDetailCanvas(new Uint8Array(rgbBuf), new Uint8Array(hgtBuf)));
         }
         draw();
       })
@@ -362,6 +386,10 @@ function biomeFor(cx, cz) {
 }
 
 function draw() {
+  // The 3D view covers the screen; repainting the 2D canvas behind it is pure waste and shows up
+  // as a periodic hitch in the 3D render (it is redrawn on a timer). The 3D view calls
+  // window.GT.on3DClose() so we repaint once when it closes.
+  if (window.GT3D && window.GT3D.isOpen()) return;
   ctx.fillStyle = '#111';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -1034,7 +1062,10 @@ setInterval(loadPlayers, 10000); // live player markers
 window.GT = {
   getWorld: () => currentWorld,
   getStructures: () => structures,
+  getPlayers: () => players,
+  getWaypoints: () => waypoints,
   getCenter: () => ({ cx: panX, cz: panZ }),
+  on3DClose: () => draw(),
 };
 document.getElementById('view3dBtn').addEventListener('click', () => {
   if (window.GT3D) window.GT3D.open(currentWorld, panX, panZ);
@@ -1052,7 +1083,7 @@ function applyIdentity(id) {
   const trail = document.getElementById('trailRow');
   const ov = document.getElementById('overlayRow');
   const wpBtn = document.getElementById('waypointBtn');
-  if (!id) { loginStatus.textContent = ''; adminBtn.style.display = 'none'; if (row) row.style.display = ''; if (trail) trail.style.display = 'none'; if (ov) ov.style.display = 'none'; if (wpBtn) wpBtn.style.display = 'none'; return; }
+  if (!id) { loginStatus.textContent = 'log in to see live players and save waypoints'; adminBtn.style.display = 'none'; if (row) row.style.display = ''; if (trail) trail.style.display = 'none'; if (ov) ov.style.display = 'none'; if (wpBtn) wpBtn.style.display = 'none'; return; }
   loginStatus.textContent = 'logged in as ' + id.name + (id.admin ? ' (admin)' : '');
   adminBtn.style.display = id.admin ? '' : 'none';
   if (trail) trail.style.display = '';
@@ -1182,7 +1213,8 @@ async function toggleMyTrail(on) {
 }
 
 // --- waypoints (public = everyone, private = owner only) ---------------------------------------
-let waypoints = [];
+// (`waypoints` is declared near the top with the other map state - loadWaypoints() is wired up
+//  above this point, so a `let` binding here would be a TDZ crash.)
 
 function drawWaypoints() {
   for (const w of waypoints) {

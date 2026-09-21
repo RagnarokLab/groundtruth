@@ -63,6 +63,7 @@ public final class Dumper {
         int minY = -64, limit = Integer.MAX_VALUE;
         int cx0 = Integer.MIN_VALUE, cz0 = Integer.MIN_VALUE, cx1 = Integer.MAX_VALUE, cz1 = Integer.MAX_VALUE;
         boolean skipStructures = false, dry = false, detail = false, voxels = false, wantNbt = false;
+        int[] voxelLods = null;
         String colorsPath = null, biomesPath = null;
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -78,6 +79,12 @@ public final class Dumper {
                 case "--skip-structures": skipStructures = true; break;
                 case "--detail": detail = true; break;
                 case "--voxels": voxels = true; break;
+                case "--voxel-lods": {
+                    String[] parts = args[++i].split(",");
+                    voxelLods = new int[parts.length];
+                    for (int k = 0; k < parts.length; k++) voxelLods[k] = Integer.parseInt(parts[k].trim());
+                    break;
+                }
                 case "--nbt": wantNbt = true; break;
                 case "--colors": colorsPath = args[++i]; break;
                 case "--biome-tints": biomesPath = args[++i]; break;
@@ -85,6 +92,7 @@ public final class Dumper {
                 default: System.out.println("unknown arg " + args[i]); return;
             }
         }
+        if (voxelLods != null) System.out.println("voxel LOD levels: " + java.util.Arrays.toString(voxelLods));
         if (world == null || regions == null || (!dry && db == null)) {
             System.out.println("usage: GroundTruthDumper --regions <dir> --world <name> --db <db> [--min-y -64] [--skip-structures] [--limit N] [--dry]");
             return;
@@ -100,7 +108,8 @@ public final class Dumper {
         Db out = dry ? null : new Db(db);
         byte[] rgbBuf = new byte[16 * 16 * 3];
         byte[] hBuf = new byte[16 * 16 * 2];
-        long chunks = 0, indexed = 0, structs = 0, failed = 0, t0 = System.currentTimeMillis();
+        byte[] gBuf = new byte[16 * 16 * 2];
+        long chunks = 0, indexed = 0, structs = 0, failed = 0, lodRows = 0, t0 = System.currentTimeMillis();
         try {
             for (File f : files) {
                 if (chunks >= limit) break;
@@ -134,6 +143,7 @@ public final class Dumper {
                             failed++; continue;
                         }
                         ChunkData cd = extract(nbt, minY);
+        Grid grid = new Grid();
                         chunks++;
                         if (dry) {
                             if (chunks <= 8) System.out.printf("  %d,%d biome=%s surface=%s y=%d structs=%d be=%d ent=%d keys=%s%n",
@@ -145,13 +155,27 @@ public final class Dumper {
                             // matches the plugin's isChunkGenerated() filtering so the index count
                             // stays consistent and empty region-header slots don't pollute the map.
                             if (cd.biome != null) {
-                                out.upsertChunk(world, cx, cz, cd.biome, cd.inhabited, cd.surfaceBlock, cd.surfaceY);
                                 if (detail) {
-                                    buildGrid(nbt, minY, rgbBuf, hBuf);
-                                    out.upsertPixels(world, cx, cz, rgbBuf, hBuf);
+                                    // the grid build is authoritative for the terrain layers, so
+                                    // take the chunk's high point and median ground from it
+                                    buildGrid(nbt, minY, rgbBuf, hBuf, gBuf, grid);
+                                    out.upsertPixels(world, cx, cz, rgbBuf, hBuf, gBuf);
+                                    out.upsertChunk(world, cx, cz, cd.biome, cd.inhabited,
+                                            grid.surfaceBlock, grid.surfaceY,
+                                            grid.groundBlock, grid.groundY);
+                                } else {
+                                    out.upsertChunk(world, cx, cz, cd.biome, cd.inhabited,
+                                            cd.surfaceBlock, cd.surfaceY, null, null);
                                 }
                                 if (voxels) {
                                     out.upsertVoxels(world, cx, cz, buildVoxels(nbt, minY));
+                                }
+                                if (voxelLods != null) {
+                                    for (int lod : voxelLods) {
+                                        if (lod < 1 || lod > 4) continue; // 2m..16m blocks
+                                        out.upsertVoxelsLod(world, cx, cz, lod, buildVoxelsLod(nbt, minY, lod));
+                                        lodRows++;
+                                    }
                                 }
                                 if (wantNbt) {
                                     out.clearChunkNbt(world, cx, cz);
@@ -194,6 +218,7 @@ public final class Dumper {
             if (out != null) out.close();
         }
         long ms = System.currentTimeMillis() - t0;
+        System.out.printf("lodRows=%d%n", lodRows);
         System.out.printf("DONE: %,d chunks scanned, %,d indexed, %,d structures, %d failed in %.1fs%n",
                 chunks, indexed, structs, failed, ms / 1000.0);
     }
@@ -381,14 +406,77 @@ public final class Dumper {
         return true;
     }
 
+    /** Per-chunk aggregates of a grid build: the true high point and the median terrain height. */
+    static final class Grid {
+        int surfaceY = Integer.MIN_VALUE, groundY = Integer.MIN_VALUE;
+        String surfaceBlock, groundBlock;
+    }
+
+    /** A mass at least this thick reads as terrain; thinner crusts with air under them are floating. */
+    private static final int MIN_MASS = 16;
+    /** An air run this long beneath a thin mass means it is floating (a sky island), not the ground. */
+    private static final int FLOAT_GAP = 8;
+
     /**
-     * Build a chunk's block-resolution detail: a 16x16 grid of surface colours (rgbOut, 3 bytes per
-     * cell) and heights (hgtOut, 1 byte per cell, relative to minY). This is what lets the map show
-     * builds instead of one flat colour per chunk. Uses the same floor logic as {@link #floorScan}
-     * but resolves all 256 columns in one top-down section sweep (unpacking each section once).
+     * True for blocks that are not terrain - leaves, logs, plants, crops and friends. Used so a
+     * treetop does not read as the ground. Deliberately conservative: anything not clearly a plant
+     * counts as terrain, so unusual blocks still show up as the surface.
+     */
+    static boolean isVegetation(String b) {
+        if (b == null) return false;
+        String n = b.startsWith("minecraft:") ? b.substring(10) : b;
+        // these have plant-ish names but are ground in their own right
+        if (n.equals("grass_block") || n.equals("snow") || n.equals("snow_block") || n.equals("moss_block")
+                || n.equals("moss_carpet") || n.equals("mycelium") || n.equals("crimson_nylium")
+                || n.equals("warped_nylium") || n.equals("shroomlight") || n.equals("cactus_flower")) {
+            return false;
+        }
+        if (n.equals("grass") || n.equals("tall_grass") || n.equals("short_grass") || n.equals("fern")
+                || n.equals("large_fern") || n.equals("dead_bush") || n.equals("sugar_cane")) {
+            return true;
+        }
+        return n.contains("leaves") || n.contains("_log") || n.contains("_wood") || n.contains("sapling")
+                || n.contains("flower") || n.contains("petal") || n.contains("tulip") || n.contains("orchid")
+                || n.contains("allium") || n.contains("bluet") || n.contains("daisy") || n.contains("dandelion")
+                || n.contains("lily") || n.contains("mushroom") || n.contains("fungus") || n.contains("roots")
+                || n.contains("sprouts") || n.contains("bush") || n.contains("vine") || n.contains("kelp")
+                || n.contains("seagrass") || n.contains("cactus") || n.contains("bamboo") || n.contains("cane")
+                || n.contains("wheat") || n.contains("carrot") || n.contains("potato") || n.contains("beetroot")
+                || n.contains("berry") || n.contains("azalea") || n.contains("dripleaf") || n.contains("cocoa")
+                || n.contains("stem") || n.contains("torchflower") || n.contains("pitcher")
+                || n.contains("spore_blossom") || n.contains("frogspawn");
+    }
+
+    /** Block name at (x,z,wy) using cached unpacked sections - cheaper than re-reading NBT. */
+    @SuppressWarnings("unchecked")
+    private static String nameAt(Map<Integer, int[]> blocks, Map<Integer, List<Object>> pals,
+                                 int x, int z, int wy) {
+        int secY = wy >> 4, ly = wy & 15;
+        List<Object> pal = pals.get(secY);
+        if (pal == null || pal.isEmpty()) return null;
+        int[] arr = blocks.get(secY);
+        int pi = (arr == null) ? 0 : arr[ly * 256 + (z & 15) * 16 + (x & 15)];
+        if (pi < 0 || pi >= pal.size()) return null;
+        return (String) ((Map<String, Object>) pal.get(pi)).get("Name");
+    }
+
+    /**
+     * Build a chunk's block-resolution terrain layers in one top-down section sweep:
+     *
+     * <ul>
+     *   <li>{@code hgtOut} - topmost non-air block per column (trees, plants and builds included).
+     *       What the fine 3D tier draws and what a canopy-coloured map wants.</li>
+     *   <li>{@code groundOut} - the terrain surface per column: the topmost block that is neither
+     *       vegetation nor part of a floating mass, so a treetop or a sky island cannot spike the
+     *       relief. This is what coarse zoom levels use.</li>
+     *   <li>{@code rgbOut} - the surface block's biome-tinted colour for the 2D detail layer.</li>
+     * </ul>
+     *
+     * Heights are little-endian u16 relative to minY; both arrays are 256 cells, z-major.
      */
     @SuppressWarnings("unchecked")
-    static void buildGrid(Map<String, Object> nbt, int minY, byte[] rgbOut, byte[] hgtOut) {
+    static void buildGrid(Map<String, Object> nbt, int minY, byte[] rgbOut, byte[] hgtOut,
+                          byte[] groundOut, Grid agg) {
         Map<Integer, Map<String, Object>> sections = new HashMap<>();
         Object secObj = nbt.get("sections");
         if (secObj instanceof List) {
@@ -400,59 +488,300 @@ public final class Dumper {
         }
         int maxSecY = Integer.MIN_VALUE;
         for (int k : sections.keySet()) maxSecY = Math.max(maxSecY, k);
-
-        boolean[] resolved = new boolean[256];
-        int[] airRun = new int[256];
-        int[] sy = new int[256];
-        String[] sb = new String[256];
-        String[] sbio = new String[256];
-        for (int i = 0; i < 256; i++) sy[i] = Integer.MIN_VALUE;
+        if (maxSecY == Integer.MIN_VALUE) {
+            agg.surfaceY = agg.groundY = minY;
+            return;
+        }
+        int top = maxSecY * 16 + 16;
+        int levels = Math.max(1, top - minY);
+        // 0 = air, 1 = vegetation, 2 = terrain, 3 = bedrock (solid, but never a surface itself)
+        byte[] types = new byte[levels * 256];
+        Map<Integer, int[]> secBlocks = new HashMap<>();
+        Map<Integer, List<Object>> secPals = new HashMap<>();
 
         for (int secY = maxSecY; secY >= (minY >> 4) - 1; secY--) {
             Map<String, Object> sec = sections.get(secY);
-            if (sec == null || isAirOnly(sec)) {
-                for (int i = 0; i < 256; i++) if (!resolved[i]) airRun[i] += 16;
-                continue;
-            }
+            if (sec == null || isAirOnly(sec)) continue;
             List<Object> pal = paletteNames(sec);
             int[] blocks = sectionBlocks(sec, pal.size()); // unpacked once per section
+            secBlocks.put(secY, blocks);
+            secPals.put(secY, pal);
             for (int ly = 15; ly >= 0; ly--) {
                 int wy = secY * 16 + ly;
-                if (wy < minY) break;
+                if (wy < minY || wy >= top) continue;
                 int rowBase = ly * 256;
+                int layer = (wy - minY) * 256;
                 for (int zi = 0; zi < 16; zi++) {
                     for (int xi = 0; xi < 16; xi++) {
                         int idx = zi * 16 + xi;
-                        if (resolved[idx]) continue;
                         int pi = blocks == null ? 0 : blocks[rowBase + zi * 16 + xi];
                         String b = (pi >= 0 && pi < pal.size())
                                 ? (String) ((Map<String, Object>) pal.get(pi)).get("Name") : null;
-                        if (b == null || b.endsWith(":air")) { airRun[idx]++; continue; }
-                        if (b.equals("minecraft:bedrock")) { airRun[idx] = 0; continue; }
-                        String bio = biomeInSection(sec, ly, xi, zi);
-                        if (sy[idx] == Integer.MIN_VALUE) { sy[idx] = wy; sb[idx] = b; sbio[idx] = bio; }
-                        if (airRun[idx] >= 1) { resolved[idx] = true; sy[idx] = wy; sb[idx] = b; sbio[idx] = bio; }
-                        else airRun[idx] = 0;
+                        if (b == null || b.endsWith(":air")) continue;
+                        types[layer + idx] = b.equals("minecraft:bedrock") ? (byte) 3
+                                : (isVegetation(b) ? (byte) 1 : (byte) 2);
                     }
                 }
             }
         }
+
+        int[] sy = new int[256], gy = new int[256];
+        String[] sb = new String[256], sbio = new String[256];
+        for (int i = 0; i < 256; i++) {
+            sy[i] = Integer.MIN_VALUE;
+            gy[i] = Integer.MIN_VALUE;
+        }
+
+        for (int zi = 0; zi < 16; zi++) {
+            for (int xi = 0; xi < 16; xi++) {
+                int idx = zi * 16 + xi;
+                // surface: the topmost non-air, non-bedrock block (sealed columns keep it as the
+                // fallback, matching the old behaviour for roofed dimensions)
+                for (int y = top - 1; y >= minY; y--) {
+                    byte t = types[(y - minY) * 256 + idx];
+                    if (t == 1 || t == 2) {
+                        sy[idx] = y;
+                        sb[idx] = nameAt(secBlocks, secPals, xi, zi, y);
+                        sbio[idx] = biomeInSection(sections.get(y >> 4), y & 15, xi, zi);
+                        break;
+                    }
+                }
+                // ground: the topmost terrain block that is not a floating mass. A thin crust with a
+                // long air run under it is a sky island, so the search resumes below that gap; real
+                // terrain is thick, so it wins immediately and a cave beneath never matters.
+                int y2 = sy[idx];
+                while (y2 >= minY) {
+                    if (types[(y2 - minY) * 256 + idx] != 2) { y2--; continue; }
+                    int thick = 0, air = 0, y3 = y2;
+                    while (y3 >= minY && thick < MIN_MASS && air < FLOAT_GAP) {
+                        byte t3 = types[(y3 - minY) * 256 + idx];
+                        if (t3 == 0) air++;
+                        else { air = 0; if (t3 != 1) thick++; }
+                        y3--;
+                    }
+                    if (thick >= MIN_MASS || air < FLOAT_GAP) { gy[idx] = y2; break; }
+                    y2 = y3; // floating mass - keep looking below the gap
+                }
+            }
+        }
+
+        int surfMax = Integer.MIN_VALUE;
         for (int i = 0; i < 256; i++) {
             int y = sy[i];
             String b = sb[i];
             int col = (b == null) ? 0x202020 : Renderer.blockColor(b);
             if (b != null && sbio[i] != null) col = tintColor(sbio[i], b, col); // biome-tinted leaves/grass/water
-            float t = (y == Integer.MIN_VALUE) ? 0f : Math.max(0f, Math.min(1f, (y - minY) / 200f));
-            float sh = 0.65f + 0.5f * t;
-            int r = Math.min(255, (int) (((col >> 16) & 255) * sh));
-            int g = Math.min(255, (int) (((col >> 8) & 255) * sh));
-            int bl = Math.min(255, (int) ((col & 255) * sh));
-            rgbOut[i * 3] = (byte) r; rgbOut[i * 3 + 1] = (byte) g; rgbOut[i * 3 + 2] = (byte) bl;
-            // height as a little-endian 16-bit value (a byte capped at 255 and squashed tall terrain)
+            // TRUE colour - what the block actually looks like, biome tint included and nothing else.
+            // Relief shading is a presentation choice, so it is applied when drawing (2D detail layer,
+            // 3D lighting) and never baked into the stored data.
+            rgbOut[i * 3] = (byte) ((col >> 16) & 255);
+            rgbOut[i * 3 + 1] = (byte) ((col >> 8) & 255);
+            rgbOut[i * 3 + 2] = (byte) (col & 255);
             int hv = Math.max(0, (y == Integer.MIN_VALUE ? minY : y) - minY);
             hgtOut[i * 2] = (byte) (hv & 255);
             hgtOut[i * 2 + 1] = (byte) ((hv >> 8) & 255);
+            int gv = Math.max(0, (gy[i] == Integer.MIN_VALUE ? minY : gy[i]) - minY);
+            groundOut[i * 2] = (byte) (gv & 255);
+            groundOut[i * 2 + 1] = (byte) ((gv >> 8) & 255);
+            if (y != Integer.MIN_VALUE && y > surfMax) { surfMax = y; agg.surfaceBlock = b; }
         }
+        agg.surfaceY = (surfMax == Integer.MIN_VALUE) ? minY : surfMax;
+
+        // median terrain height across the chunk (ignoring columns with no terrain at all)
+        int[] gys = new int[256];
+        int n = 0;
+        for (int i = 0; i < 256; i++) if (gy[i] != Integer.MIN_VALUE) gys[n++] = gy[i];
+        if (n == 0) {
+            agg.groundY = agg.surfaceY;
+            agg.groundBlock = agg.surfaceBlock;
+        } else {
+            java.util.Arrays.sort(gys, 0, n);
+            agg.groundY = gys[n / 2];
+            int best = Integer.MAX_VALUE;
+            for (int i = 0; i < 256; i++) {
+                if (gy[i] == Integer.MIN_VALUE) continue;
+                int d = Math.abs(gy[i] - agg.groundY);
+                if (d < best) {
+                    best = d;
+                    agg.groundBlock = nameAt(secBlocks, secPals, i & 15, i >> 4, gy[i]);
+                }
+            }
+        }
+    }
+
+    /**
+     * True for blocks that are thin decorations (cross-shaped plants, rails, torches). At LOD levels a
+     * cell is a whole cube of source blocks, and a scaled-up grass tuft or rail reads as a giant
+     * plant, so these are only used when a cell has nothing else in it.
+     */
+    static boolean isThinDecoration(String n) {
+        if (n == null) return false;
+        String b = n.startsWith("minecraft:") ? n.substring(10) : n;
+        if (b.startsWith("potted_")) return true;
+        if (b.equals("grass") || b.equals("tall_grass") || b.equals("short_grass") || b.equals("fern")
+                || b.equals("large_fern") || b.equals("dead_bush")) return true;
+        return b.contains("sapling") || b.contains("flower") || b.contains("tulip") || b.contains("orchid")
+                || b.contains("allium") || b.contains("bluet") || b.contains("daisy")
+                || b.contains("dandelion") || b.contains("lily_of") || b.equals("mushroom")
+                || b.endsWith("_mushroom") || b.contains("torch") || b.contains("rail")
+                || b.contains("wheat") || b.contains("carrot") || b.contains("potato")
+                || b.contains("beetroot") || b.contains("sugar_cane") || b.contains("sweet_berry")
+                || b.contains("kelp") || b.contains("seagrass") || b.contains("vine")
+                || b.contains("sprouts") || b.contains("roots") || b.contains("petal")
+                || b.contains("coral_fan") || b.contains("spore_blossom");
+    }
+
+    /**
+     * Decimated voxel data for one LOD level: the chunk's real blocks halved {@code lod} times. Each
+     * output cell is a 2^lod cube of source blocks and takes the most common block in that cube
+     * (preferring solid blocks over thin decorations), so the result still looks like Minecraft - just
+     * with bigger blocks. The renderer scales the mesh by the same factor, so nothing here needs to
+     * know about world units.
+     *
+     * <p>Layout: {@code u8 version=2, u8 lod, u16 paletteLen, names..., then N*N columns (z-major) of
+     * u16 runCount followed by runs of i16 y0, u16 len, u16 palIdx}. Y is in LOD-cell units, i.e.
+     * worldY / 2^lod, which is exact for every minY this server uses.
+     */
+    @SuppressWarnings("unchecked")
+    static byte[] buildVoxelsLod(Map<String, Object> nbt, int minY, int lod) throws IOException {
+        Map<Integer, Map<String, Object>> sections = new HashMap<>();
+        Object secObj = nbt.get("sections");
+        if (secObj instanceof List) {
+            for (Object o : (List<Object>) secObj) {
+                Map<String, Object> s = (Map<String, Object>) o;
+                Object y = s.get("Y");
+                if (y instanceof Byte) sections.put((int) (Byte) y, s);
+            }
+        }
+        int maxSecY = Integer.MIN_VALUE;
+        for (int k : sections.keySet()) maxSecY = Math.max(maxSecY, k);
+        int top = Math.max(minY + 16, maxSecY * 16 + 16);
+        int height = top - minY;
+
+        int[] grid = new int[256 * height]; // index+1 per cell, 0 = air
+        LinkedHashMap<String, Integer> pal = new LinkedHashMap<>();
+        boolean[] thin = new boolean[4096];
+        for (int secY = maxSecY; secY >= (minY >> 4); secY--) {
+            Map<String, Object> sec = sections.get(secY);
+            if (sec == null || isAirOnly(sec)) continue;
+            List<Object> names = paletteNames(sec);
+            int[] blocks = sectionBlocks(sec, names.size());
+            for (int ly = 0; ly < 16; ly++) {
+                int wy = secY * 16 + ly;
+                if (wy < minY || wy >= top) continue;
+                int rowBase = ly * 256;
+                for (int zi = 0; zi < 16; zi++) {
+                    for (int xi = 0; xi < 16; xi++) {
+                        int pi = blocks == null ? 0 : blocks[rowBase + zi * 16 + xi];
+                        if (pi < 0 || pi >= names.size()) continue;
+                        Map<String, Object> pe = (Map<String, Object>) names.get(pi);
+                        String b = (String) pe.get("Name");
+                        if (b == null || b.endsWith(":air") || b.equals("minecraft:cave_air")
+                                || b.equals("minecraft:void_air")) continue;
+                        b = withProperties(b, pe.get("Properties"));
+                        Integer idx = pal.get(b);
+                        if (idx == null) { idx = pal.size() + 1; pal.put(b, idx); }
+                        if (idx < thin.length) thin[idx] = isThinDecoration(b);
+                        grid[(zi * 16 + xi) * height + (wy - minY)] = idx;
+                    }
+                }
+            }
+        }
+
+        // Merge: one output cell per f^3 cube of source blocks.
+        int lodShift = lod;
+        int f = 1 << lodShift;
+        int n = 16 >> lodShift;
+        int hLod = Math.max(1, (height + f - 1) / f);
+        int[] out = new int[n * n * hLod];
+        int[] counts = new int[pal.size() + 1];
+        for (int zi = 0; zi < n; zi++) {
+            for (int xi = 0; xi < n; xi++) {
+                for (int yl = 0; yl < hLod; yl++) {
+                    int bestSolid = 0, bestSolidN = 0, bestAny = 0, bestAnyN = 0;
+                    for (int dz = 0; dz < f; dz++) {
+                        for (int dx = 0; dx < f; dx++) {
+                            int src = ((zi * f + dz) * 16 + (xi * f + dx)) * height;
+                            for (int dy = 0; dy < f; dy++) {
+                                int y = yl * f + dy;
+                                if (y >= height) break;
+                                int v = grid[src + y];
+                                if (v == 0) continue;
+                                if (v <= bestAny) { /* keep counts below */ }
+                                counts[v]++;
+                                int c = counts[v];
+                                if (c > bestAnyN) { bestAnyN = c; bestAny = v; }
+                                if ((v >= thin.length || !thin[v]) && c > bestSolidN) { bestSolidN = c; bestSolid = v; }
+                            }
+                        }
+                    }
+                    // solid blocks win; a cell of nothing but decoration falls back to that decoration
+                    out[(zi * n + xi) * hLod + yl] = bestSolid != 0 ? bestSolid : bestAny;
+                }
+            }
+        }
+
+        // Drop everything deep underground: at LOD distances only the surface is ever on screen, and
+        // keeping the full column is what made the coarse levels big. KEEP cells below the top cell of
+        // each column is plenty for cliffs to read as solid.
+        final int KEEP = 10;
+        for (int zi = 0; zi < n; zi++) {
+            for (int xi = 0; xi < n; xi++) {
+                int base = (zi * n + xi) * hLod;
+                int topCell = -1;
+                for (int y = hLod - 1; y >= 0; y--) if (out[base + y] != 0) { topCell = y; break; }
+                if (topCell < 0) continue;
+                for (int y = 0; y < topCell - KEEP + 1; y++) out[base + y] = 0;
+            }
+        }
+
+        // Prune the palette to the blocks this level actually uses. A chunk's full palette is ~70
+        // names, which would dominate a 2x2 or 8x8 cell grid; the merged level needs a handful.
+        int[] remap = new int[pal.size() + 1];
+        List<String> usedNames = new ArrayList<>();
+        for (int v : out) {
+            if (v != 0 && remap[v] == 0) { remap[v] = usedNames.size() + 1; usedNames.add(null); }
+        }
+        int u = 0;
+        for (String name : pal.keySet()) {
+            u++;
+            if (remap[u] != 0) usedNames.set(remap[u] - 1, name);
+        }
+        for (int i = 0; i < out.length; i++) if (out[i] != 0) out[i] = remap[out[i]];
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(256 + usedNames.size() * 24);
+        DataOutputStream d = new DataOutputStream(bos);
+        d.writeByte(2);
+        d.writeByte(lodShift);
+        d.writeShort(usedNames.size());
+        for (String name : usedNames) {
+            byte[] nb = name.getBytes(StandardCharsets.UTF_8);
+            d.writeShort(nb.length);
+            d.write(nb);
+        }
+        int minYCell = minY >> lodShift; // exact: minY is a multiple of 16
+        for (int zi = 0; zi < n; zi++) {
+            for (int xi = 0; xi < n; xi++) {
+                int base = (zi * n + xi) * hLod;
+                List<int[]> runs = new ArrayList<>();
+                int y = 0;
+                while (y < hLod) {
+                    int v = out[base + y];
+                    if (v == 0) { y++; continue; }
+                    int s0 = y;
+                    while (y < hLod && out[base + y] == v) y++;
+                    runs.add(new int[] { minYCell + s0, y - s0, v });
+                }
+                d.writeShort(runs.size());
+                for (int[] r : runs) {
+                    d.writeShort(r[0]);
+                    d.writeShort(r[1]);
+                    d.writeShort(r[2]);
+                }
+            }
+        }
+        d.flush();
+        return bos.toByteArray();
     }
 
     /**
@@ -527,7 +856,10 @@ public final class Dumper {
                     if (v == 0) { y++; continue; }
                     int s0 = y;
                     while (y < height && grid[base + y] == v) y++;
-                    runs.add(new int[] { s0, y - s0, v - 1 });
+                    // 1-based, matching the LOD blobs, the assembler and the viewer: index i is
+                    // palette entry i-1. Writing v-1 here made every lod-0 block resolve to the
+                    // wrong palette entry, which wrecked face culling in the 3D view.
+                    runs.add(new int[] { s0, y - s0, v });
                 }
                 d.writeShort(runs.size());
                 for (int[] r : runs) {

@@ -40,6 +40,7 @@ public class Db implements AutoCloseable {
     private final PreparedStatement structPs;
     private final PreparedStatement pixelPs;
     private final PreparedStatement voxelPs;
+    private final PreparedStatement voxelLodPs;
     private final PreparedStatement nbtClearPs;
     private final PreparedStatement nbtPs;
     private int pending = 0;
@@ -53,17 +54,22 @@ public class Db implements AutoCloseable {
         }
         migrate();
         chunkPs = conn.prepareStatement(
-                "INSERT INTO chunks (world,cx,cz,biome,inhabited_time,indexed_at,surface_block,surface_y) " +
-                "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(world,cx,cz) DO UPDATE SET biome=excluded.biome, " +
-                "inhabited_time=excluded.inhabited_time, indexed_at=excluded.indexed_at, " +
-                "surface_block=excluded.surface_block, surface_y=excluded.surface_y");
+                "INSERT INTO chunks (world,cx,cz,biome,inhabited_time,indexed_at,surface_block,surface_y," +
+                "ground_block,ground_y) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(world,cx,cz) DO UPDATE SET " +
+                "biome=excluded.biome, inhabited_time=excluded.inhabited_time, indexed_at=excluded.indexed_at, " +
+                "surface_block=excluded.surface_block, surface_y=excluded.surface_y, " +
+                "ground_block=COALESCE(excluded.ground_block, chunks.ground_block), " +
+                "ground_y=COALESCE(excluded.ground_y, chunks.ground_y)");
         structPs = conn.prepareStatement(
                 "INSERT OR IGNORE INTO structures (world,type,min_x,min_y,min_z,max_x,max_y,max_z,first_seen) " +
                 "VALUES (?,?,?,?,?,?,?,?,?)");
         pixelPs = conn.prepareStatement(
-                "INSERT OR REPLACE INTO chunk_pixels (world,cx,cz,rgb,hgt) VALUES (?,?,?,?,?)");
+                "INSERT OR REPLACE INTO chunk_pixels (world,cx,cz,rgb,hgt,ground_hgt) VALUES (?,?,?,?,?,?)");
         voxelPs = conn.prepareStatement(
                 "INSERT OR REPLACE INTO chunk_voxels (world,cx,cz,data,indexed_at) VALUES (?,?,?,?,?)");
+        voxelLodPs = conn.prepareStatement(
+                "INSERT OR REPLACE INTO chunk_voxels_lod (world,cx,cz,lod,data,indexed_at) "
+                + "VALUES (?,?,?,?,?,?)");
         nbtClearPs = conn.prepareStatement(
                 "DELETE FROM chunk_nbt WHERE world=? AND x>=? AND x<? AND z>=? AND z<?");
         nbtPs = conn.prepareStatement(
@@ -93,6 +99,11 @@ public class Db implements AutoCloseable {
             st.execute("CREATE TABLE IF NOT EXISTS chunk_voxels (" +
                     "world TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL, " +
                     "data BLOB, indexed_at INTEGER, PRIMARY KEY (world, cx, cz))");
+            // Decimated copies of the same blocks (each cell is a 2^lod cube). These are what make a
+            // Minecraft-looking zoom-out possible: level 1 is 1/8 the size, level 2 is 1/64, and so on.
+            st.execute("CREATE TABLE IF NOT EXISTS chunk_voxels_lod (" +
+                    "world TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL, lod INTEGER NOT NULL, " +
+                    "data BLOB, indexed_at INTEGER, PRIMARY KEY (world, cx, cz, lod))");
             // Everything else a chunk carries that we might want later: block-entity and entity NBT,
             // serialised to JSON (see Nbt.toJson). `kind` is 'block_entity' or 'entity'. Positions are
             // floored to block coords (the exact doubles remain inside `nbt`).
@@ -103,6 +114,11 @@ public class Db implements AutoCloseable {
         }
         addColumn("chunks", "surface_block", "TEXT");
         addColumn("chunks", "surface_y", "INTEGER");
+        // Terrain-only height for the same chunk: median of the per-column ground heights, so a
+        // treetop or a sky island cannot spike the relief. surface_y stays the true high point.
+        addColumn("chunks", "ground_y", "INTEGER");
+        addColumn("chunks", "ground_block", "TEXT");
+        addColumn("chunk_pixels", "ground_hgt", "BLOB");
     }
 
     private void addColumn(String table, String col, String type) {
@@ -120,7 +136,8 @@ public class Db implements AutoCloseable {
     }
 
     public void upsertChunk(String world, int cx, int cz, String biome, long inhabited,
-                            String surfaceBlock, Integer surfaceY) throws SQLException {
+                            String surfaceBlock, Integer surfaceY,
+                            String groundBlock, Integer groundY) throws SQLException {
         chunkPs.setString(1, world);
         chunkPs.setInt(2, cx);
         chunkPs.setInt(3, cz);
@@ -129,6 +146,8 @@ public class Db implements AutoCloseable {
         chunkPs.setLong(6, System.currentTimeMillis() / 1000L);
         chunkPs.setString(7, surfaceBlock);
         if (surfaceY == null) chunkPs.setNull(8, Types.INTEGER); else chunkPs.setInt(8, surfaceY);
+        chunkPs.setString(9, groundBlock);
+        if (groundY == null) chunkPs.setNull(10, Types.INTEGER); else chunkPs.setInt(10, groundY);
         chunkPs.addBatch();
         tick();
     }
@@ -145,13 +164,27 @@ public class Db implements AutoCloseable {
     }
 
     /** Store one chunk's 16x16 surface colour + height grid (compressed with zlib). */
-    public void upsertPixels(String world, int cx, int cz, byte[] rgb, byte[] hgt) throws SQLException {
+    public void upsertPixels(String world, int cx, int cz, byte[] rgb, byte[] hgt, byte[] groundHgt)
+            throws SQLException {
         pixelPs.setString(1, world);
         pixelPs.setInt(2, cx);
         pixelPs.setInt(3, cz);
         pixelPs.setBytes(4, deflate(rgb));
         pixelPs.setBytes(5, deflate(hgt));
+        pixelPs.setBytes(6, groundHgt == null ? null : deflate(groundHgt));
         pixelPs.addBatch();
+        tick();
+    }
+
+    /** Store one chunk's decimated voxel data for a LOD level (compressed with zlib). */
+    public void upsertVoxelsLod(String world, int cx, int cz, int lod, byte[] data) throws SQLException {
+        voxelLodPs.setString(1, world);
+        voxelLodPs.setInt(2, cx);
+        voxelLodPs.setInt(3, cz);
+        voxelLodPs.setInt(4, lod);
+        voxelLodPs.setBytes(5, deflate(data));
+        voxelLodPs.setLong(6, System.currentTimeMillis() / 1000L);
+        voxelLodPs.addBatch();
         tick();
     }
 
@@ -213,6 +246,7 @@ public class Db implements AutoCloseable {
         structPs.executeBatch();
         pixelPs.executeBatch();
         voxelPs.executeBatch();
+        voxelLodPs.executeBatch();
         nbtPs.executeBatch();
         conn.commit();
         pending = 0;

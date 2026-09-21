@@ -267,7 +267,9 @@ public final class Renderer {
         int base = blockColor(block);
         if (biome != null) base = Dumper.tintColor(biome, block, base); // grass/foliage/water per biome
         float t = Math.max(0f, Math.min(1f, (y - minY) / 200f)); // 0 low .. 1 high
-        float shade = 0.65f + 0.5f * t;
+        // Darken-only relief shading: hillshading must never BRIGHTEN a colour, or high ground turns
+        // pale (the badlands went pink at 1.15x). True colour is the ceiling.
+        float shade = 0.78f + 0.22f * t;
         return scale(base, shade);
     }
 

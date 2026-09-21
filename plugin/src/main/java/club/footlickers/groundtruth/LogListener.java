@@ -1,13 +1,19 @@
 package club.footlickers.groundtruth;
 
+import io.papermc.paper.event.player.AsyncChatEvent;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.World;
+import org.bukkit.block.BlockFace;
 import org.bukkit.Material;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockState;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.Monster;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.Projectile;
 import org.bukkit.entity.TNTPrimed;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -17,6 +23,9 @@ import org.bukkit.event.block.BlockExplodeEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.block.BlockMultiPlaceEvent;
 import org.bukkit.event.entity.EntityChangeBlockEvent;
+import org.bukkit.event.entity.CreatureSpawnEvent;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityPickupItemEvent;
@@ -264,6 +273,130 @@ public class LogListener implements Listener {
                 "entity-kill", "player", killer.getUniqueId().toString(), killer.getName(),
                 null, null, null, v.getType().getKey().toString(), null, null,
                 "{\"drops\":" + e.getDrops().size() + "}", 0);
+    }
+
+    // --- combat ---------------------------------------------------------------------------------
+
+    /**
+     * Damage involving a player, either as the victim ("what just attacked me") or as the attacker
+     * (PvP). Mob-on-mob damage is noise and is skipped. Attribution is the point here too: the actor
+     * is the real attacker even when the blow came from a projectile, and a player's held item is
+     * recorded as the weapon.
+     */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onDamage(EntityDamageEvent e) {
+        Entity victim = e.getEntity();
+        Entity attacker = null;
+        String weapon = null;
+        if (e instanceof EntityDamageByEntityEvent) {
+            Entity damager = ((EntityDamageByEntityEvent) e).getDamager();
+            if (damager instanceof Projectile && ((Projectile) damager).getShooter() instanceof Entity) {
+                weapon = damager.getType().getKey().toString();
+                attacker = (Entity) ((Projectile) damager).getShooter();
+            } else {
+                attacker = damager;
+            }
+            if (attacker instanceof Player) {
+                Material held = ((Player) attacker).getInventory().getItemInMainHand().getType();
+                if (held != null && held != Material.AIR) weapon = held.getKey().toString();
+            }
+        }
+        boolean victimIsPlayer = victim instanceof Player;
+        if (!victimIsPlayer && !(attacker instanceof Player)) return;
+
+        double healthAfter = victim instanceof LivingEntity
+                ? Math.max(0.0, ((LivingEntity) victim).getHealth() - e.getFinalDamage()) : 0.0;
+        String cause = e.getCause().name();
+        String victimName = victimIsPlayer ? victim.getName() : victim.getType().getKey().toString();
+        String meta = "{\"amount\":" + fmt1(e.getFinalDamage())
+                + ",\"cause\":" + Json.str(cause)
+                + ",\"healthAfter\":" + fmt1(healthAfter)
+                + (weapon != null ? ",\"weapon\":" + Json.str(weapon) : "")
+                + ",\"victimKind\":" + Json.str(victimIsPlayer ? "player" : "mob") + "}";
+
+        String actorKind, actorId, actorName;
+        if (attacker != null) {
+            actorKind = attacker instanceof Player ? "player" : "mob";
+            actorId = attacker.getUniqueId().toString();
+            actorName = attacker instanceof Player ? attacker.getName()
+                    : (attacker.getCustomName() != null ? attacker.getCustomName()
+                    : attacker.getType().getKey().toString());
+        } else {
+            actorKind = "environment";
+            actorId = null;
+            actorName = cause;
+        }
+        Location l = victim.getLocation();
+        log.logEvent(now(), l.getWorld().getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ(),
+                "damage", actorKind, actorId, actorName, cause, null, null,
+                victimName, null, null, meta, 0);
+    }
+
+    /** One decimal place, locale-independent (JSON must not get a comma decimal separator). */
+    private static String fmt1(double v) {
+        return String.format(java.util.Locale.ROOT, "%.1f", v);
+    }
+
+    // --- chat transcript ------------------------------------------------------------------------
+
+    /**
+     * Player chat. Recorded so a transcript can be queried later ("what did people say?"). Uses
+     * Paper's async chat event, so the message arrives as an Adventure Component and is flattened to
+     * plain text here. Async is fine: LogDb only enqueues, it never touches the DB on this thread.
+     */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onChat(AsyncChatEvent e) {
+        Player p = e.getPlayer();
+        String msg = PlainTextComponentSerializer.plainText().serialize(e.message());
+        if (msg == null || msg.isBlank()) return;
+        Location l = p.getLocation();
+        log.logEvent(now(), l.getWorld().getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ(),
+                "chat", "player", p.getUniqueId().toString(), p.getName(),
+                null, null, null, null, null, null,
+                "{\"message\":" + Json.str(msg) + "}", 0);
+    }
+
+    // --- mob spawns: "where did that zombie spawn and why?" ---------------------------------------
+
+    private static final double SPAWN_LOG_RADIUS = 128.0; // only log spawns this close to a player
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onCreatureSpawn(CreatureSpawnEvent e) {
+        if (!(e.getEntity() instanceof Monster)) return;   // hostile mobs only - keeps volume sane
+        Location l = e.getLocation();
+        World w = l.getWorld();
+        if (w == null) return;
+
+        // Only spawns near a player matter ("it spawned in my base"). Nearest player within radius.
+        Player nearest = null;
+        double best = SPAWN_LOG_RADIUS;
+        for (Player p : w.getPlayers()) {
+            double d = p.getLocation().distance(l);
+            if (d <= best) { best = d; nearest = p; }
+        }
+        if (nearest == null) return;
+
+        Block b = l.getBlock();
+        Block below = b.getRelative(BlockFace.DOWN);
+        String reason = e.getSpawnReason().name();
+        String meta = "{"
+                + "\"reason\":" + Json.str(reason)
+                + ",\"light\":" + b.getLightLevel()
+                + ",\"blockLight\":" + b.getLightFromBlocks()
+                + ",\"skyLight\":" + b.getLightFromSky()
+                + ",\"blockBelow\":" + Json.str(below.getBlockData().getAsString())
+                + ",\"biome\":" + Json.str(b.getBiome().getKey().toString())
+                + ",\"difficulty\":" + Json.str(w.getDifficulty().name())
+                + ",\"nearestPlayer\":" + Json.str(nearest.getName())
+                + ",\"nearestPlayerDist\":" + fmt1(best)
+                + ",\"time\":" + w.getTime()
+                + ",\"isDay\":" + (w.getTime() % 24000L < 12000L)
+                + "}";
+        log.logEvent(now(), w.getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ(),
+                "mob-spawn", "mob", e.getEntity().getUniqueId().toString(),
+                e.getEntityType().getKey().toString(),
+                "spawn", reason, reason,
+                e.getEntityType().getKey().toString(), null, null, meta, 0);
     }
 
     // --- players --------------------------------------------------------------------------------

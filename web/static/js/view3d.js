@@ -27,11 +27,38 @@
   let renderer = null, scene = null, camera = null, controls = null;
   let raf = null, canvas = null, closeBtn = null, statusEl = null;
   let markerPoints = null, popupEl = null, downXY = null;
-  let atlasTex = null, animTex = null, depthBtn = null;
+  let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
   let includeUnderground = false; // toggle: render all the way down (caves/ancient cities)
   let lastCenter = null;
+  let worldView = false;          // world mode: coarse whole-map relief instead of full voxels
+  let worldStep = 4;              // chunk decimation in world mode (4 -> 64-block cells)
+  const WORLD_YSCALE = 1;         // TRUE proportions - GroundTruth shows the world as it actually is
+  let worldIslands = true;        // draw sky islands as real floating geometry
+  const VOXEL_MAX_VCHUNKS = 70;   // cap on the window, in virtual chunks (7x7 tiles of 10)
+  const VOXEL_MAX_REAL_CHUNKS = 256; // cap on the window in real chunks (4096 blocks across)
+  const VOXEL_CHUNKS = 12;        // chunks per side of the real-block window
+  const TILE_CELLS = 256;         // cells per tile side (~65k cells, still only a few ms to mesh).
+                                  // Bigger tiles mean far fewer requests, which matters much more than
+                                  // mesh time on a slow link.
+  let worldGroup = null;          // THREE.Group holding the terrain tiles for the active level
+  let backdropGroup = null;      // at most ONE previous level, kept behind the active one
+  let worldLevel = null;          // { key, cell, cx0, cz0, cx1, cz1 } that group covers
+  let worldBounds = null;         // world chunk bounds (from a cheap probe request)
+  let worldMat = null;
+  let worldLoading = false;
+  let voxelGroup = null;          // the real-block mesh that takes over once you are close enough
+  let voxAtlas = null, voxTints = null, voxModels = null, voxMat = null, voxWaterMat = null;
+  let voxMatBg = null, voxWaterMatBg = null;   // pushed-back copies for the level that is now backdrop
+  let worldMinY = -64;
+  let initialWin = 30;      // window (in chunks) the 3D view opens at; the detail setting drives this
+  let refineBusy = false, refineTimer = null, refineChanges = 0, refineLastErr = '';
+  let refineTries = 0, refineDone = 0, refineWhy = 'none';
+  const ISLAND_GAP = 20;         // blocks the surface must sit above the ground to be a sky island
+  const SLAB = 10;                // plate thickness drawn for a floating island (data carries heights, not thickness)
+  const WORLD_TINT = 0x0b1622;
 
+  /** Decode an /api/terrain payload (base64, optionally deflated) into bytes. */
   function inflated(b64) {
     const bin = atob(b64);
     const bytes = new Uint8Array(bin.length);
@@ -57,7 +84,10 @@
       const rc = d.getUint16(o); o += 2;
       const runs = new Array(rc);
       for (let r = 0; r < rc; r++) {
-        runs[r] = [d.getInt16(o), d.getUint16(o + 2), d.getUint16(o + 4)];
+        // palette indices in the stored format are 1-based (0 means air); the mesher indexes a JS
+        // array with them, so convert once here. Without this every block rendered as the NEXT
+        // palette entry, which is why surfaces looked subtly wrong and LOD palettes blew up.
+        runs[r] = [d.getInt16(o), d.getUint16(o + 2), Math.max(0, d.getUint16(o + 4) - 1)];
         o += 6;
       }
       cols[c] = runs;
@@ -701,7 +731,12 @@
     return { geo: makeGeo(opaque), waterGeo: makeGeo(water), baseY };
   }
 
-  async function open(world, centerCx, centerCz) {
+  /**
+   * World mode mesh: one flat quad per decimated chunk (its real surface height + block colour)
+   * plus skirts down to any lower neighbour, so a whole 12k-chunk world reads as solid 3D terrain.
+   * Absolute block coordinates, so structures/players/waypoints line up without translation.
+   */
+  async function open(world, centerCx, centerCz, opts) {
     if (canvas) return;
     if (typeof THREE === 'undefined') { alert('3D library not loaded'); return; }
 
@@ -711,6 +746,12 @@
       if (m && m.minY != null) minY = m.minY;
     } catch (e) { /* default */ }
     lastCenter = { world, cx: centerCx, cz: centerCz };
+    worldMinY = minY;
+    if (opts && opts.win) initialWin = opts.win;
+    // ONE view: the ladder always runs, from whole-world relief down to real blocks. There is no
+    // separate "detail mode" any more - zooming in is how you get detail.
+    worldView = true;
+    if (opts && opts.step) worldStep = opts.step;
     const half = Math.floor(N_CHUNKS / 2);
     const cx0 = Math.floor(centerCx) - half, cz0 = Math.floor(centerCz) - half;
     const cx1 = cx0 + N_CHUNKS - 1, cz1 = cz0 + N_CHUNKS - 1;
@@ -732,17 +773,41 @@
       if (c) { close(); open(c.world, c.cx, c.cz); }
     };
     document.body.appendChild(depthBtn);
+    depthBtn.style.display = worldView ? 'none' : '';
+    worldBtn = document.createElement('button');
+    worldBtn.textContent = '\u25c9 one view';
+    worldBtn.title = 'One continuous view: the ladder runs from the whole world down to real blocks';
+    worldBtn.style.display = 'none';
+    worldBtn.style.cssText = 'position:fixed;top:12px;right:268px;z-index:101;padding:8px 12px;font-size:14px;cursor:pointer;background:#222;color:#eee;border:1px solid #666;border-radius:4px;';
+    worldBtn.onclick = () => {
+      const c = lastCenter;
+      close();
+      if (c) open(c.world, c.cx, c.cz, { worldView: !worldView });
+    };
+    document.body.appendChild(worldBtn);
+    islandsBtn = document.createElement('button');
+    islandsBtn.textContent = worldIslands ? 'islands: on' : 'islands: off';
+    islandsBtn.title = 'Sky islands are ~200 blocks above the ground here; show them as floating slabs';
+    islandsBtn.style.cssText = 'position:fixed;top:12px;right:110px;z-index:101;padding:8px 12px;font-size:14px;cursor:pointer;background:#222;color:#eee;border:1px solid #666;border-radius:4px;';
+    islandsBtn.style.display = 'none'; // islands are real blocks at every level now
+    islandsBtn.onclick = () => {
+      const c = lastCenter;
+      worldIslands = !worldIslands;
+      close();
+      if (c) open(c.world, c.cx, c.cz, { worldView: true, step: worldStep });
+    };
+    document.body.appendChild(islandsBtn);
     statusEl = document.createElement('div');
     statusEl.textContent = 'loading voxel terrain\u2026';
     statusEl.style.cssText = 'position:fixed;bottom:12px;left:12px;z-index:101;color:#cfe;font:13px sans-serif;background:rgba(0,0,0,0.6);padding:6px 10px;border-radius:4px;';
     document.body.appendChild(statusEl);
 
-    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: worldView });
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
     renderer.setSize(innerWidth, innerHeight);
     scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0b1622);
-    camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.5, 6000);
+    scene.background = new THREE.Color(WORLD_TINT);
+    camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, worldView ? 2 : 0.5, worldView ? 400000 : 6000);
     controls = new THREE.OrbitControls(camera, canvas);
     controls.maxPolarAngle = Math.PI * 0.495;
     // PC: left-drag moves the map (pan), right-drag moves the view (orbit). Mobile: one finger
@@ -750,15 +815,18 @@
     controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
     controls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_ROTATE };
     // much calmer mouse feel
-    controls.zoomSpeed = 0.2;
+    controls.addEventListener('change', scheduleWorldRefine);
+    controls.zoomSpeed = 0.8;  // 0.95^0.8 ~ 4% per wheel notch (was ~1%: painfully slow)
     controls.panSpeed = 0.25;
     controls.rotateSpeed = 0.4;
-    scene.add(new THREE.AmbientLight(0xffffff, 0.65));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.5); // ambient+dir ~1.0 on top faces
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.45); // sums to 1.0 on top faces, so flat ground shows true colour
     dir.position.set(1, 2, 0.6);
     scene.add(dir);
 
-    try {
+    if (worldView) {
+      try { await loadWorldView(world, centerCx, centerCz); } catch (e) { statusEl.textContent = '3D world load failed: ' + e.message; }
+    } else try {
       const AV = Date.now(); // atlas/biome JSON change when regenerated; bypass the 1h tile cache
       const [atlas, biomeTints, bmodels, vox] = await Promise.all([
         fetch(`/tiles/atlas.json?v=${AV}`).then((r) => r.json()),
@@ -893,6 +961,401 @@
     animate();
   }
 
+  /** Which tier covers a span of N chunks, and at what resolution. */
+  /**
+   * The LOD ladder, in real blocks the whole way: 1m -> 2m -> 4m -> 8m -> 16m. Every level is the
+   * same renderer and the same textures, so zooming out looks like Minecraft getting chunkier, not
+   * like a different kind of map.
+   */
+  function tierFor(spanChunks) {
+    // pick the finest level whose window still covers what is on screen, so a ~1100-block view is
+    // still 1m blocks and 16m blocks only appear past ~9000 blocks
+    let lod = 0, f = 1;
+    while (f * VOXEL_MAX_VCHUNKS < spanChunks && lod < 4) { lod++; f *= 2; }
+    return { kind: 'vox', lod, key: 'v' + lod };
+  }
+
+  /**
+   * Mesh a dense block-level heightfield from /api/pixels. The server has already median-filtered it,
+   * so this is plain terrain: a top face per cell plus skirts to lower neighbours.
+   */
+  /**
+   * World view = a ladder of terrain meshes, not one fixed level. We always build a single mesh
+   * covering what you're looking at, and rebuild it at a finer resolution when you zoom in:
+   *   whole world -> 64m chunk cells -> 16m chunk cells -> n-metre block cells (from chunk_pixels)
+   * Rebuilding one mesh - rather than stitching LOD tiles - means there are no seams to manage.
+   */
+  async function loadWorldView(world, centerCx, centerCz) {
+    statusEl.textContent = 'loading world terrain\u2026';
+    // cheap probe for the world's extent (step 64 returns the bounds plus a couple of samples)
+    let probe;
+    try {
+      probe = await (await fetch(`/api/terrain?world=${encodeURIComponent(world)}&all=1&step=64&deflate=1`)).json();
+    } catch (e) { probe = null; }
+    if (!probe || probe.error || !probe.bounds) {
+      statusEl.textContent = 'no surface data for this world yet';
+      return;
+    }
+    worldBounds = probe.bounds;
+    worldMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+    // Open where the detail is: one full-detail window around the requested spot. Zooming OUT walks
+    // up the ladder from here; there is no separate world view to land in.
+    const c0x = Math.round(centerCx != null ? centerCx : 0);
+    const c0z = Math.round(centerCz != null ? centerCz : 0);
+    const w0 = initialWin || 30;
+    await buildWorldTier(world, c0x - w0 / 2, c0z - w0 / 2, c0x + w0 / 2, c0z + w0 / 2, true);
+    addWorldMarkers();
+  }
+
+  /** Load one terrain tile, meshing it small enough that no frame is ever blocked. */
+  /**
+   * Hide any tile of the previous level that the new level now fully covers. Tiles sit on a global
+   * grid, so this is just index arithmetic - no per-vertex work.
+   */
+  /** Free a level's geometry (a Group of tile Groups, each holding opaque/water meshes). */
+  function disposeGroup(g) {
+    if (!g) return;
+    g.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
+    scene.remove(g);
+  }
+
+  function disposeVoxelGroup() {
+    if (!voxelGroup) return;
+    for (const m of voxelGroup.children) m.geometry.dispose();
+    scene.remove(voxelGroup);
+    voxelGroup = null;
+  }
+
+  function disposeWorldGroup() {
+    if (!worldGroup) return;
+    for (const m of worldGroup.children) m.geometry.dispose();
+    scene.remove(worldGroup);
+    worldGroup = null;
+  }
+
+  /**
+   * Load the atlas/biome/model data the real-block mesher needs, once per session. The polygon offset
+   * makes the voxel surface win the depth test against the coarse heightfield still underneath it, so
+   * the fine mesh can be laid on top without z-fighting and without punching holes.
+   */
+  async function ensureVoxelAssets() {
+    if (voxMat) return true;
+    if (typeof THREE === 'undefined') return false;
+    const AV = Date.now();
+    const [atlas, tints, bmodels] = await Promise.all([
+      fetch(`/tiles/atlas.json?v=${AV}`).then((r) => r.json()),
+      fetch(`/tiles/biome_tints.json?v=${AV}`).then((r) => r.json()).catch(() => ({})),
+      fetch(`/tiles/blockmodels.json?v=${AV}`).then((r) => r.json()).catch(() => ({})),
+    ]);
+    const tex = await new THREE.TextureLoader().loadAsync(`/tiles/atlas.png?v=${AV}`);
+    tex.flipY = false;
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    let anim = null;
+    try {
+      anim = await new THREE.TextureLoader().loadAsync(`/tiles/anim.png?v=${AV}`);
+      anim.flipY = false;
+      anim.magFilter = THREE.NearestFilter;
+      anim.minFilter = THREE.NearestFilter;
+      anim.generateMipmaps = false;
+      anim.wrapS = THREE.ClampToEdgeWrapping;
+      anim.wrapT = THREE.ClampToEdgeWrapping;
+    } catch (e) { anim = null; }
+    // Tile the atlas sprite once per block: uv is in block units, atile is the tile's UV rect.
+    const patch = (shader) => {
+      shader.vertexShader = 'attribute vec4 atile;\nvarying vec4 vAtile;\n' + shader.vertexShader;
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <uv_vertex>', '#include <uv_vertex>\n  vAtile = atile;');
+      shader.fragmentShader = 'varying vec4 vAtile;\n' + shader.fragmentShader;
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <map_fragment>',
+        '#ifdef USE_MAP\n'
+        + '  vec2 gtu = vAtile.xy + fract(vUv) * (vAtile.zw - vAtile.xy);\n'
+        + '  vec4 sampledDiffuseColor = texture2D(map, gtu);\n'
+        + '  diffuseColor *= sampledDiffuseColor;\n'
+        + '#endif');
+    };
+    const mat = new THREE.MeshLambertMaterial({
+      map: tex, vertexColors: true, side: THREE.DoubleSide, alphaTest: 0.25,
+    });
+    mat.onBeforeCompile = patch;
+    let wmat = null;
+    if (anim) {
+      const animGrid = new THREE.Vector2(atlas.animCols || 1, atlas.animRows || 1);
+      wmat = new THREE.MeshLambertMaterial({
+        map: tex, vertexColors: true, side: THREE.DoubleSide,
+        transparent: true, opacity: 0.9, depthWrite: true,
+      });
+      wmat.onBeforeCompile = (shader) => {
+        shader.uniforms.animMap = { value: anim };
+        shader.uniforms.uTime = waterTime;
+        shader.uniforms.uAnimGrid = { value: animGrid };
+        shader.vertexShader = 'attribute vec3 aanim;\nvarying vec3 vAnim;\n' + shader.vertexShader;
+        shader.vertexShader = shader.vertexShader.replace(
+          '#include <uv_vertex>', '#include <uv_vertex>\n  vAnim = aanim;');
+        shader.fragmentShader = 'uniform sampler2D animMap;\nuniform float uTime;\nuniform vec2 uAnimGrid;\nvarying vec3 vAnim;\n' + shader.fragmentShader;
+        shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>',
+          '#ifdef USE_MAP\n'
+          + '  float afN = max(vAnim.y, 1.0);\n'
+          + '  float afI = mod(floor(uTime * vAnim.z), afN);\n'
+          + '  vec2 aUv = vec2((afI + fract(vUv.x)) / uAnimGrid.x, (vAnim.x + fract(vUv.y)) / uAnimGrid.y);\n'
+          + '  diffuseColor *= texture2D(animMap, aUv);\n'
+          + '#endif');
+      };
+    }
+    voxAtlas = atlas; voxTints = tints; voxModels = bmodels;
+    voxMat = mat; voxWaterMat = wmat;
+    voxMatBg = null;
+    voxWaterMatBg = null;
+    atlasTex = tex; animTex = anim;
+    return true;
+  }
+
+  /**
+   * Build one LOD level over a window, as tiles of 10x10 *virtual* chunks. A virtual chunk is 2^lod
+   * real chunks and is already assembled server-side into the mesher's native 16x16-cell shape, so
+   * each tile is meshed by the normal voxel mesher and the whole group is scaled by 2^lod. Nothing in
+   * the mesher has to know about LOD.
+   */
+  async function buildVoxelLevel(world, lod, vx0, vz0, vx1, vz1, bg) {
+    const f = 1 << lod;
+    const group = new THREE.Group();
+    scene.add(group);
+    const tileList = [];
+    for (let tx = vx0; tx <= vx1; tx += N_CHUNKS) {
+      for (let tz = vz0; tz <= vz1; tz += N_CHUNKS) {
+        tileList.push([tx, tz]);
+      }
+    }
+    const loaded = new Set();
+    let lastProblem = '';
+    const tileCells = N_CHUNKS * 16;              // 160 cells per tile side
+    const tileBlocks = tileCells * f;             // ...which is this many blocks at this level
+    let cells = 0, faces = 0, tiles = 0;
+    let next = 0;
+    const workers = Math.max(1, Math.min(3, tileList.length));
+    const runWorker = async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= tileList.length) return;
+        const tx = tileList[i][0], tz = tileList[i][1];
+        const tx1 = tx + N_CHUNKS - 1, tz1 = tz + N_CHUNKS - 1;
+        let res = null;
+        try {
+          res = await (await fetch(`/api/voxels?world=${encodeURIComponent(world)}&lod=${lod}`
+            + `&cx0=${tx}&cz0=${tz}&cx1=${tx1}&cz1=${tz1}`)).json();
+        } catch (e) { res = null; lastProblem = String(e && e.message || e); }
+        if (!res) { if (!lastProblem) lastProblem = 'request failed'; }
+        else if (res.error) { lastProblem = String(res.error); }
+        else if (!res.chunks || !res.chunks.length) { lastProblem = 'server has no ' + f + 'm blocks here'; }
+        if (res && res.chunks && res.chunks.length) {
+          for (const c of res.chunks) {
+            const buf = await inflated(c.data);
+            const v = parseVoxel(buf);
+            c._pal = v.pal;
+            c._cols = v.cols;
+          }
+          const r = buildGeometry(res, voxAtlas, voxTints, worldMinY >> lod, tx, tz, voxModels);
+          const g = new THREE.Group();
+          g.add(new THREE.Mesh(r.geo, voxMat));
+          if (r.waterGeo.getAttribute('position').count && voxWaterMat) {
+            g.add(new THREE.Mesh(r.waterGeo, voxWaterMat));
+          }
+          // the mesher lays the tile out in cells and centres it on the area; scale up to blocks
+          g.scale.setScalar(f);
+          g.position.set((tx + N_CHUNKS / 2) * 16 * f, r.baseY * f, (tz + N_CHUNKS / 2) * 16 * f);
+          g.userData.bbox = { x0: tx * 16 * f, z0: tz * 16 * f,
+                              x1: (tx + N_CHUNKS) * 16 * f, z1: (tz + N_CHUNKS) * 16 * f };
+          group.add(g);
+          const n = r.geo.getAttribute('position').count / 6;
+          faces += n;
+          tiles++;
+          loaded.add(tx + ',' + tz);
+          if (bg) hideCoveredVoxTiles(bg, loaded, tileBlocks);
+          statusEl.textContent = `lod ${lod} (${f}m blocks) \u00b7 ${tiles}/${tileList.length} tiles \u00b7 `
+            + `${faces.toLocaleString()} faces`;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: workers }, runWorker));
+    return { group, tiles, faces, tileBlocks, problem: lastProblem };
+  }
+
+  /** Hide background tiles the new level now fully covers (same grid arithmetic as the heightfield). */
+  function hideCoveredVoxTiles(bg, loaded, fineBlocks) {
+    for (const m of bg.children) {
+      if (m.visible === false) continue;
+      const b = m.userData && m.userData.bbox;
+      if (!b) continue;
+      let covered = true;
+      for (let tx = Math.floor(b.x0 / fineBlocks); tx <= Math.floor((b.x1 - 1) / fineBlocks) && covered; tx++) {
+        for (let tz = Math.floor(b.z0 / fineBlocks); tz <= Math.floor((b.z1 - 1) / fineBlocks); tz++) {
+          if (!loaded.has(tx + ',' + tz)) { covered = false; break; }
+        }
+      }
+      if (covered) m.visible = false;
+    }
+  }
+
+  /**
+   * Build one LOD level over the visible window. Everything here is real blocks - the only thing that
+   * changes with zoom is how big a block is - so there is no separate "world map" to fall back to.
+   * The previous (coarser) level stays on screen as the backdrop for anything the new level does not
+   * cover, and tiles of it are hidden as the finer level covers them.
+   */
+  async function buildWorldTier(world, cx0, cz0, cx1, cz1, frame) {
+    const spanChunks = Math.max(cx1 - cx0, cz1 - cz0);
+    const tier = tierFor(spanChunks);
+    const lod = tier.lod, f = 1 << lod;
+    if (!(await ensureVoxelAssets())) { statusEl.textContent = '3D library not loaded'; return; }
+
+    // Cover what is on screen, capped so an extreme zoom-out cannot ask for an absurd number of tiles.
+    // Cap the window in REAL chunks too: the level's own data is what costs, and asking a server to
+    // cover thousands of chunks on the fly would stall. 256 real chunks a side is 4096 blocks, which
+    // is the far edge we agreed on.
+    const winReal = Math.min(spanChunks, VOXEL_MAX_REAL_CHUNKS);
+    const winV = Math.max(2, Math.min(Math.ceil(winReal / f), VOXEL_MAX_VCHUNKS));
+    const midVx = Math.round(((cx0 + cx1) / 2) / f), midVz = Math.round(((cz0 + cz1) / 2) / f);
+    const vx0 = midVx - Math.floor(winV / 2), vz0 = midVz - Math.floor(winV / 2);
+    const vx1 = vx0 + winV - 1, vz1 = vz0 + winV - 1;
+
+    const bbox = { cx0: vx0 * f, cz0: vz0 * f, cx1: (vx1 + 1) * f - 1, cz1: (vz1 + 1) * f - 1 };
+
+    if (frame) {
+      // frame the middle of the window; zooming out is how you leave, so start where the detail is
+      const span = Math.max(cx1 - cx0, cz1 - cz0) * 16;
+      const ctr = new THREE.Vector3(((cx0 + cx1) / 2) * 16, 80, ((cz0 + cz1) / 2) * 16);
+      scene.fog = new THREE.Fog(WORLD_TINT, span * 1.2, span * 3.5);
+      const fitDist = (span * 0.5) / Math.tan((camera.fov / 2) * Math.PI / 180);
+      camera.position.copy(ctr).addScaledVector(new THREE.Vector3(0.32, 0.55, 0.32).normalize(), fitDist * 0.8);
+      controls.target.copy(ctr);
+      controls.minDistance = 8;
+      controls.maxDistance = 400000;
+      controls.update();
+    }
+
+    const prevLevel = worldLevel;
+    // Demote the active level to the backdrop, dropping any older one EVERY time. Keeping them
+    // around leaked a whole level of geometry per zoom step until the tab ran out of memory.
+    if (worldGroup) {
+      disposeGroup(backdropGroup);
+      backdropGroup = worldGroup;
+      backdropGroup.position.y = -1;   // one block lower so coincident surfaces cannot z-fight
+    }
+    const bg = backdropGroup;
+    const r = await buildVoxelLevel(world, lod, vx0, vz0, vx1, vz1, bg);
+    if (!r.tiles) {
+      scene.remove(r.group);
+      statusEl.textContent = 'no block data here yet \u00b7 lod ' + lod + ' \u00b7 '
+        + (r.problem || 'unknown') + (bg ? '' : ' \u00b7 try zooming out');
+      return;
+    }
+    for (const g of r.group.children) {
+      if (!g.userData.bbox) {
+        g.userData.bbox = { x0: 0, z0: 0, x1: 0, z1: 0 };
+      }
+    }
+    // drop the old level only once the new one is bigger than it (i.e. we zoomed out); when zooming
+    // in it stays as the backdrop, otherwise the world would end at the edge of the window
+    // when we zoomed out the new level covers the old, so the backdrop is no longer needed at all
+    if (backdropGroup && prevLevel) {
+      const covers = bbox.cx0 <= prevLevel.cx0 && bbox.cx1 >= prevLevel.cx1
+        && bbox.cz0 <= prevLevel.cz0 && bbox.cz1 >= prevLevel.cz1;
+      if (covers) { disposeGroup(backdropGroup); backdropGroup = null; }
+    }
+    worldGroup = r.group;
+    worldLevel = { key: tier.key, lod, cx0: bbox.cx0, cz0: bbox.cz0, cx1: bbox.cx1, cz1: bbox.cz1 };
+    statusEl.textContent = `lod ${lod} \u00b7 ${f}m blocks \u00b7 ${r.tiles} tiles \u00b7 `
+      + `${r.faces.toLocaleString()} faces`;
+  }
+
+  /**
+   * Rebuild the terrain at the resolution the current zoom calls for.
+   *
+   * Driven by OrbitControls' 'change' event with a short trailing timer, rather than polled from the
+   * render loop: the rebuild is a main-thread job, so we only ever want one, and only once the user
+   * has actually stopped moving. Polling tied the timing to the frame rate, which starved on slow
+   * machines (and a mid-gesture rebuild was what made the map hitch).
+   */
+  function scheduleWorldRefine() {
+    if (!worldView) return;
+    refineChanges++;
+    clearTimeout(refineTimer);
+    refineTimer = setTimeout(refineWorldNow, 450);
+  }
+
+  async function refineWorldNow() {
+    refineTries++;
+    if (!worldView) { refineWhy = 'notworld'; return; }
+    if (refineBusy) { refineWhy = 'busy'; return; }
+    if (worldLoading) { refineWhy = 'loading'; return; }
+    if (!worldGroup) { refineWhy = 'nogroup'; return; }
+    if (!worldBounds) { refineWhy = 'nobounds'; return; }
+    if (!camera || !controls) { refineWhy = 'nocam'; return; }
+
+    const dist = camera.position.distanceTo(controls.target);
+    const visBlocks = 2 * dist * Math.tan((camera.fov / 2) * Math.PI / 180) * 1.4;
+    const tier = tierFor(Math.max(8, visBlocks / 16));
+    // chunks the mesh should span at this resolution so the window covers the view
+    const half = Math.max(4, visBlocks / 32); // real chunks across the view, half going each way
+
+    const tx = controls.target.x / 16, tz = controls.target.z / 16;
+    const b = worldBounds;
+    const hx = Math.min(half, (b.maxCx - b.minCx) / 2), hz = Math.min(half, (b.maxCz - b.minCz) / 2);
+    const cxc = Math.min(Math.max(tx, b.minCx + hx), b.maxCx - hx);
+    const czc = Math.min(Math.max(tz, b.minCz + hz), b.maxCz - hz);
+    const cx0 = Math.round(cxc - hx), cx1 = Math.round(cxc + hx);
+    const cz0 = Math.round(czc - hz), cz1 = Math.round(czc + hz);
+
+    // nothing to do when the resolution is unchanged and the current mesh still covers the view
+    const same = worldLevel && worldLevel.key === tier.key;
+    const covers = worldLevel && cx0 >= worldLevel.cx0 && cx1 <= worldLevel.cx1
+      && cz0 >= worldLevel.cz0 && cz1 <= worldLevel.cz1;
+    if (same && covers) { refineWhy = 'uptodate'; return; }
+    refineWhy = 'rebuild ' + tier.key;
+
+    refineBusy = true;
+    worldLoading = true;
+    try {
+      await buildWorldTier(lastCenter.world, cx0, cz0, cx1, cz1, false);
+    } catch (e) { refineLastErr = String(e && e.message || e); }
+    worldLoading = false;
+    refineBusy = false;
+    refineDone++;
+  }
+
+  /** Structures + waypoints + live players, in absolute block coordinates (matches the world mesh). */
+  function addWorldMarkers() {
+    const pts = [];
+    if (window.GT && window.GT.getStructures) {
+      for (const s of window.GT.getStructures()) {
+        pts.push({ x: s.x, y: s.y, z: s.z, kind: 'structure', label: s.type });
+      }
+    }
+    if (window.GT && window.GT.getWaypoints) {
+      for (const w of window.GT.getWaypoints()) {
+        pts.push({ x: w.x, y: w.y, z: w.z, kind: 'waypoint', label: w.name + (w.public ? ' (public)' : '') });
+      }
+    }
+    if (window.GT && window.GT.getPlayers) {
+      for (const p of window.GT.getPlayers()) {
+        if (p.world !== lastCenter.world) continue;
+        pts.push({ x: p.x, y: (p.y || 64), z: p.z, kind: 'player', label: p.name });
+      }
+    }
+    if (!pts.length) return;
+    markerPoints = new THREE.Points(
+      new THREE.BufferGeometry().setFromPoints(
+        pts.map((p) => new THREE.Vector3(p.x, p.y * WORLD_YSCALE + 3, p.z))),
+      new THREE.PointsMaterial({ color: 0xffd25c, size: 8, sizeAttenuation: false, depthTest: true }));
+    markerPoints.userData.markers = pts.map((p) => ({
+      s: { type: p.label, x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) },
+      underground: false, kind: p.kind,
+    }));
+    scene.add(markerPoints);
+  }
+
   async function addMarkers(vox, baseY, cx0, cz0) {
     const structs = (window.GT && window.GT.getStructures) ? window.GT.getStructures() : [];
     const bbox = new Map();
@@ -969,15 +1432,26 @@
     window.removeEventListener('resize', onResize);
     window.removeEventListener('keydown', onKey);
     if (atlasTex) { atlasTex.dispose(); atlasTex = null; }
+    if (refineTimer) { clearTimeout(refineTimer); refineTimer = null; }
+    disposeGroup(backdropGroup);
+    backdropGroup = null;
+    disposeWorldGroup();
+    disposeVoxelGroup();
+    if (worldMat) { worldMat.dispose(); worldMat = null; }
+    worldLevel = null; worldBounds = null; refineBusy = false; worldLoading = false;
     if (renderer) renderer.dispose();
     if (controls) controls.dispose();
     if (canvas) canvas.remove();
     if (closeBtn) closeBtn.remove();
     if (depthBtn) { depthBtn.remove(); depthBtn = null; }
+    if (worldBtn) { worldBtn.remove(); worldBtn = null; }
+    if (islandsBtn) { islandsBtn.remove(); islandsBtn = null; }
     if (statusEl) statusEl.remove();
     if (popupEl) popupEl.remove();
     renderer = scene = camera = controls = canvas = closeBtn = statusEl = markerPoints = popupEl = null;
     downXY = null;
+    // tell the 2D map it can repaint now that the 3D view is gone
+    try { if (window.GT && window.GT.on3DClose) window.GT.on3DClose(); } catch (e) { /* ignore */ }
   }
 
   window.GT3D = {
@@ -985,5 +1459,23 @@
     isOpen: () => !!canvas,
     markerCount: () => (markerPoints ? markerPoints.userData.markers.length : 0),
     popupOpen: () => !!popupEl && popupEl.style.display === 'block',
+    // test/tuning hook: place the camera at a given distance from its target (fires 'change', so
+    // the LOD refine runs exactly as it would after a real zoom gesture)
+    setDistance: (d) => {
+      if (!camera || !controls) return;
+      const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+      camera.position.copy(controls.target).addScaledVector(dir, d);
+      controls.update();
+    },
+    // run the LOD refine immediately (tuning/testing hook - normally it is debounced after a gesture)
+    refine: () => refineWorldNow(),
+    // lightweight introspection (used by the deploy smoke test and for tuning the LOD ladder)
+    debug: () => ({
+      dist: (camera && controls) ? Math.round(camera.position.distanceTo(controls.target)) : null,
+      level: worldLevel ? worldLevel.key : null,
+      worldView,
+      tries: refineTries, done: refineDone, busy: refineBusy, why: refineWhy,
+      changes: refineChanges, group: !!worldGroup, vox: !!voxelGroup, err: refineLastErr,
+    }),
   };
 })();
