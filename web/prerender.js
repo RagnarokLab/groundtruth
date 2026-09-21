@@ -56,13 +56,24 @@ async function main() {
     fetchJSON(host, '/tiles/blockmodels.json').catch(() => ({})),
   ]);
 
-  const tx0 = Math.floor(cx0 / N), tz0 = Math.floor(cz0 / N);
-  const tx1 = Math.floor(cx1 / N), tz1 = Math.floor(cz1 / N);
-  const total = (tx1 - tx0 + 1) * (tz1 - tz0 + 1);
+  let tileList = [];
+  const tilesFile = arg('tiles', null);
+  if (tilesFile) {
+    // explicit tile list ("tx,tz" per line) - used when the inhabited area is scattered
+    tileList = fs.readFileSync(tilesFile, 'utf8').split('\n')
+      .map((s) => s.trim()).filter(Boolean)
+      .map((s) => { const p = s.split(','); return [parseInt(p[0], 10), parseInt(p[1], 10)]; });
+  } else {
+    const tx0 = Math.floor(cx0 / N), tz0 = Math.floor(cz0 / N);
+    const tx1 = Math.floor(cx1 / N), tz1 = Math.floor(cz1 / N);
+    for (let tx = tx0; tx <= tx1; tx++) for (let tz = tz0; tz <= tz1; tz++) tileList.push([tx, tz]);
+  }
+  const total = tileList.length;
   let done = 0, wrote = 0, skipped = 0;
 
-  for (let tx = tx0; tx <= tx1; tx++) {
-    for (let tz = tz0; tz <= tz1; tz++) {
+  for (const pair of tileList) {
+    {
+      const tx = pair[0], tz = pair[1];
       const c0 = tx * N, z0 = tz * N;
       const vox = await fetchJSON(host,
         `/api/voxels?world=${encodeURIComponent(world)}&lod=0&cx0=${c0}&cz0=${z0}&cx1=${c0 + N - 1}&cz1=${z0 + N - 1}`);

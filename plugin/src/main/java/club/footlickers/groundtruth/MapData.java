@@ -386,40 +386,36 @@ public final class MapData {
     }
 
     /**
-     * Chunk keys within {@code radius} (Chebyshev) of any visited chunk, for the "only show what we've
-     * actually seen" setting. Returns null when there is nothing to filter by (no visits recorded yet),
-     * so a fresh server is not blanked out. Cached ~30s because every map request asks for it.
+     * Chunk keys where a player has actually been, for the "only show what we've seen" setting.
+     *
+     * <p>Uses the chunk's {@code inhabited_time} (from the world itself) rather than our own visit
+     * logging: inhabited time is stored in the chunk NBT and accumulates whenever a player is near, so
+     * it covers the world's whole life, not just since logging was added. Returns null when nothing is
+     * recorded, so a fresh server is not blanked out. Cached ~30s.
      */
     public java.util.Set<Long> visitedScope(String world, int radius) {
-        if (radius < 0) return null;
         long now = System.currentTimeMillis();
         java.util.Set<Long> cached = scopeCache;
-        if (cached != null && world.equals(scopeCacheWorld) && radius == scopeCacheRadius
-                && now - scopeCacheAt < 30_000) {
+        if (cached != null && world.equals(scopeCacheWorld) && now - scopeCacheAt < 30_000) {
             return cached;
         }
         java.util.Set<Long> out = new java.util.HashSet<>();
-        int visited = 0;
+        int inhabited = 0;
         synchronized (lock) {
             try (PreparedStatement ps = conn().prepareStatement(
-                    "SELECT DISTINCT cx,cz FROM chunk_visits WHERE world=?")) {
+                    "SELECT cx,cz FROM chunks WHERE world=? AND inhabited_time > 0")) {
                 ps.setString(1, world);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        int cx = rs.getInt(1), cz = rs.getInt(2);
-                        visited++;
-                        for (int dx = -radius; dx <= radius; dx++) {
-                            for (int dz = -radius; dz <= radius; dz++) {
-                                out.add(((long) (cx + dx) << 32) ^ ((cz + dz) & 0xffffffffL));
-                            }
-                        }
+                        inhabited++;
+                        out.add(((long) rs.getInt(1) << 32) ^ (rs.getInt(2) & 0xffffffffL));
                     }
                 }
             } catch (Exception e) {
-                return null;   // no chunk_visits table yet - don't filter
+                return null;   // no chunks table yet - don't filter
             }
         }
-        if (visited == 0) return null;   // nothing seen yet - show everything rather than a blank map
+        if (inhabited == 0) return null;   // nothing seen yet - show everything rather than a blank map
         scopeCache = out;
         scopeCacheAt = now;
         scopeCacheWorld = world;

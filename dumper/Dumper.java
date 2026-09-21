@@ -256,38 +256,33 @@ public final class Dumper {
     }
 
     /**
-     * Chunk keys within {@code radius} (Chebyshev) of any visited chunk, or null when there is nothing
-     * to filter by (no visits recorded / table missing) - in which case the dump runs unfiltered.
+     * Chunk keys where a player has actually been, for {@code --only-visited}. Uses the chunk's own
+     * {@code inhabited_time} (world data, covers the world's whole life) rather than our visit log,
+     * which only goes back to when logging was added. Null when nothing is recorded (dump everything).
      */
     private static java.util.Set<Long> loadVisitedScope(String db, String world, int radius) {
         java.util.Set<Long> out = new java.util.HashSet<>();
-        int visited = 0;
+        int inhabited = 0;
         try (java.sql.Connection c = java.sql.DriverManager.getConnection("jdbc:sqlite:" + db);
              java.sql.PreparedStatement ps = c.prepareStatement(
-                     "SELECT DISTINCT cx,cz FROM chunk_visits WHERE world=?")) {
+                     "SELECT cx,cz FROM chunks WHERE world=? AND inhabited_time > 0")) {
             ps.setString(1, world);
             try (java.sql.ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    int cx = rs.getInt(1), cz = rs.getInt(2);
-                    visited++;
-                    for (int dx = -radius; dx <= radius; dx++) {
-                        for (int dz = -radius; dz <= radius; dz++) {
-                            out.add(((long) (cx + dx) << 32) ^ ((cz + dz) & 0xffffffffL));
-                        }
-                    }
+                    inhabited++;
+                    out.add(((long) rs.getInt(1) << 32) ^ (rs.getInt(2) & 0xffffffffL));
                 }
             }
         } catch (Exception e) {
-            System.out.println("visited filter: could not read chunk_visits (" + e.getMessage()
+            System.out.println("visited filter: could not read inhabited chunks (" + e.getMessage()
                     + ") - dumping everything");
             return null;
         }
-        if (visited == 0) {
-            System.out.println("visited filter: no visits recorded - dumping everything");
+        if (inhabited == 0) {
+            System.out.println("visited filter: no inhabited chunks recorded - dumping everything");
             return null;
         }
-        System.out.println("visited filter: " + visited + " visited chunk(s) -> " + out.size()
-                + " in scope (+" + radius + " chunk radius)");
+        System.out.println("visited filter: " + inhabited + " inhabited chunk(s) in scope");
         return out;
     }
 

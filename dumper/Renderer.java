@@ -141,24 +141,15 @@ public final class Renderer {
                 String sql = "SELECT cx,cz,biome,surface_block,surface_y FROM chunks "
                         + "WHERE world=? AND cx>=? AND cx<? AND cz>=? AND cz<?";
                 if (ONLY_VISITED) {
-                    if (VISITED_RADIUS > 0) {
-                        // a buffer of N chunks around anywhere a player has been (avoids a hard edge)
-                        sql += " AND EXISTS (SELECT 1 FROM chunk_visits v WHERE v.world=chunks.world "
-                             + "AND ABS(v.cx-chunks.cx)<=? AND ABS(v.cz-chunks.cz)<=?)";
-                    } else {
-                        sql += " AND EXISTS (SELECT 1 FROM chunk_visits v WHERE v.world=chunks.world "
-                             + "AND v.cx=chunks.cx AND v.cz=chunks.cz)";
-                    }
+                    // Inhabited time comes from the world itself and covers its whole life, unlike our
+                    // own visit logging which only goes back to when it was added.
+                    sql += " AND inhabited_time > 0";
                 }
                 try (PreparedStatement ps = conn.prepareStatement(sql)) {
                     int pi = 1;
                     ps.setString(pi++, world);
                     ps.setInt(pi++, cx0 - m); ps.setInt(pi++, cx0 + tile + m);
                     ps.setInt(pi++, cz0 - m); ps.setInt(pi++, cz0 + tile + m);
-                    if (ONLY_VISITED && VISITED_RADIUS > 0) {
-                        ps.setInt(pi++, VISITED_RADIUS);
-                        ps.setInt(pi++, VISITED_RADIUS);
-                    }
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
                             int px = rs.getInt(1) - cx0, py = rs.getInt(2) - cz0;
