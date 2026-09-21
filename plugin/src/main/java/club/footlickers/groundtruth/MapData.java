@@ -61,6 +61,21 @@ public final class MapData {
         }
     }
 
+    /**
+     * Open the read connection up front so the first map request doesn't pay the lazy-init cost (and
+     * so a momentary write lock at startup can't surface as a one-off 500 on the first request).
+     */
+    public void warmup() {
+        try {
+            synchronized (lock) {
+                conn();
+                colours.load(tilesDir);
+            }
+        } catch (Exception e) {
+            // not fatal - the first request will retry
+        }
+    }
+
     private byte[] inflate(byte[] deflated) throws Exception {
         java.util.zip.Inflater inf = new java.util.zip.Inflater();
         inf.setInput(deflated);
@@ -410,6 +425,53 @@ public final class MapData {
         scopeCacheWorld = world;
         scopeCacheRadius = radius;
         return out;
+    }
+
+    /**
+     * Compose a top-down map image around a block position straight from the rendered tile pyramid.
+     * Zoom 0 is one pixel per chunk (16 blocks); each higher zoom doubles the blocks per pixel. Reads
+     * only the tiles that overlap, so it is cheap. World/layer are sanitised (they become a path).
+     */
+    public byte[] mapImage(String world, String layer, int blockX, int blockZ, int zoom, int w, int h)
+            throws Exception {
+        world = world == null ? "world" : world.replaceAll("[^A-Za-z0-9_-]", "");
+        layer = layer == null ? "terrain" : layer.replaceAll("[^A-Za-z0-9_-]", "");
+        String meta = new String(java.nio.file.Files.readAllBytes(
+                new File(tilesDir, world + "/meta.json").toPath()),
+                java.nio.charset.StandardCharsets.UTF_8);
+        int tile = metaInt(meta, "tile", 256);
+        int minCx = metaInt(meta, "minCx", 0);
+        int minCz = metaInt(meta, "minCz", 0);
+        int maxZoom = metaInt(meta, "maxZoom", 0);
+        zoom = Math.max(0, Math.min(maxZoom, zoom));
+        w = Math.max(1, Math.min(2048, w));
+        h = Math.max(1, Math.min(2048, h));
+
+        int px0 = Math.floorDiv((blockX >> 4) - minCx, 1 << zoom) - w / 2;
+        int pz0 = Math.floorDiv((blockZ >> 4) - minCz, 1 << zoom) - h / 2;
+        java.awt.image.BufferedImage out =
+                new java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+        java.awt.Graphics2D g = out.createGraphics();
+        int tx0 = Math.floorDiv(px0, tile), tx1 = Math.floorDiv(px0 + w - 1, tile);
+        int tz0 = Math.floorDiv(pz0, tile), tz1 = Math.floorDiv(pz0 + h - 1, tile);
+        for (int tz = tz0; tz <= tz1; tz++) {
+            for (int tx = tx0; tx <= tx1; tx++) {
+                File f = new File(tilesDir, world + "/" + layer + "/" + zoom + "/" + tx + "_" + tz + ".png");
+                if (!f.isFile()) continue;
+                java.awt.image.BufferedImage img = javax.imageio.ImageIO.read(f);
+                if (img != null) g.drawImage(img, tx * tile - px0, tz * tile - pz0, null);
+            }
+        }
+        g.dispose();
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(1 << 16);
+        javax.imageio.ImageIO.write(out, "png", bos);
+        return bos.toByteArray();
+    }
+
+    private static int metaInt(String json, String key, int def) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\"" + key + "\"\\s*:\\s*(-?\\d+)").matcher(json);
+        return m.find() ? Integer.parseInt(m.group(1)) : def;
     }
 
     /** Merge 2^lod x 2^lod stored LOD chunks into one 16x16-cell blob the mesher understands. */

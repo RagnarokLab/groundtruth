@@ -94,6 +94,7 @@ public final class WebServer {
             return t;
         }));
         server.createContext("/", this::dispatch);
+        map.warmup();   // open the read connection now so the first request doesn't pay the lazy-init cost
         server.start();
         plugin.getLogger().info("[GroundTruth] web API listening on port " + port);
     }
@@ -186,6 +187,15 @@ public final class WebServer {
                             intOf(q, "cx0", 0), intOf(q, "cz0", 0),
                             intOf(q, "cx1", 0), intOf(q, "cz1", 0)));
                     return;
+                case "/api/map/image":
+                    // A top-down map PNG around a block position, composed from the tile pyramid.
+                    // Public (plain map data). ?world=&x=&z=&zoom=&w=&h=&layer=terrain|biome
+                    sendBytes(ex, "image/png", map.mapImage(
+                            q.getOrDefault("world", "world"),
+                            q.getOrDefault("layer", "terrain"),
+                            intOf(q, "x", 0), intOf(q, "z", 0),
+                            intOf(q, "zoom", 1), intOf(q, "w", 512), intOf(q, "h", 512)));
+                    return;
                 default:
                     // Not (yet) handled inside the plugin. Serve the web app / tiles from disk (GET
                     // only), and for anything still living on the old service proxy it through - POST
@@ -198,6 +208,8 @@ public final class WebServer {
                     proxy(ex, rawQuery == null ? path : path + "?" + rawQuery, method, ex.getRequestBody());
             }
         } catch (Exception e) {
+            // log it: a 500 with no trace was impossible to diagnose after the fact
+            plugin.getLogger().warning("[GroundTruth] web " + ex.getRequestURI() + " failed: " + e);
             try { send(ex, 500, "{\"error\":" + LogListener.Json.str(String.valueOf(e.getMessage())) + "}"); }
             catch (Exception ignored) { /* client gone */ }
         } finally {
@@ -220,6 +232,17 @@ public final class WebServer {
         ex.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
         ex.getResponseHeaders().add("Cache-Control", "no-store");
         ex.sendResponseHeaders(status, body.length);
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(body);
+        }
+    }
+
+    /** Send raw bytes (e.g. a generated PNG). */
+    private void sendBytes(HttpExchange ex, String contentType, byte[] body) throws IOException {
+        ex.getResponseHeaders().add("Content-Type", contentType);
+        ex.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
+        ex.getResponseHeaders().add("Cache-Control", "no-store");
+        ex.sendResponseHeaders(200, body.length);
         try (OutputStream os = ex.getResponseBody()) {
             os.write(body);
         }
