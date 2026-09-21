@@ -63,6 +63,8 @@ public final class Dumper {
         int minY = -64, limit = Integer.MAX_VALUE;
         int cx0 = Integer.MIN_VALUE, cz0 = Integer.MIN_VALUE, cx1 = Integer.MAX_VALUE, cz1 = Integer.MAX_VALUE;
         boolean skipStructures = false, dry = false, detail = false, voxels = false, wantNbt = false;
+        boolean onlyVisited = false;
+        int visitedRadius = 0;
         int[] voxelLods = null;
         String colorsPath = null, biomesPath = null;
         for (int i = 0; i < args.length; i++) {
@@ -86,6 +88,8 @@ public final class Dumper {
                     break;
                 }
                 case "--nbt": wantNbt = true; break;
+                case "--only-visited": onlyVisited = true; break;
+                case "--visited-radius": visitedRadius = Integer.parseInt(args[++i]); break;
                 case "--colors": colorsPath = args[++i]; break;
                 case "--biome-tints": biomesPath = args[++i]; break;
                 case "--dry": dry = true; break;
@@ -106,6 +110,10 @@ public final class Dumper {
         System.out.println("regions: " + files.length + " files in " + regions + " -> world " + world);
 
         Db out = dry ? null : new Db(db);
+        // "only show what we've seen": skip chunks outside the visited+radius scope entirely, so the
+        // voxel backfill matches the renderer's visited filter (and stays small).
+        java.util.Set<Long> visitedScope = (onlyVisited && db != null)
+                ? loadVisitedScope(db, world, visitedRadius) : null;
         byte[] rgbBuf = new byte[16 * 16 * 3];
         byte[] hBuf = new byte[16 * 16 * 2];
         byte[] gBuf = new byte[16 * 16 * 2];
@@ -132,6 +140,8 @@ public final class Dumper {
                         int cx = regionCoord(f, 1) * 32 + (i % 32);
                         int cz = regionCoord(f, 2) * 32 + (i / 32);
                         if (cx < cx0 || cx > cx1 || cz < cz0 || cz > cz1) continue; // outside requested bbox
+                        if (visitedScope != null
+                                && !visitedScope.contains(((long) cx << 32) ^ (cz & 0xffffffffL))) continue;
                         byte[] raw = new byte[len - 1];
                         raf.readFully(raw);
                         Map<String, Object> nbt;
@@ -243,6 +253,42 @@ public final class Dumper {
 
     private static byte[] readAll(java.io.InputStream in) throws IOException {
         try (in) { return in.readAllBytes(); }
+    }
+
+    /**
+     * Chunk keys within {@code radius} (Chebyshev) of any visited chunk, or null when there is nothing
+     * to filter by (no visits recorded / table missing) - in which case the dump runs unfiltered.
+     */
+    private static java.util.Set<Long> loadVisitedScope(String db, String world, int radius) {
+        java.util.Set<Long> out = new java.util.HashSet<>();
+        int visited = 0;
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection("jdbc:sqlite:" + db);
+             java.sql.PreparedStatement ps = c.prepareStatement(
+                     "SELECT DISTINCT cx,cz FROM chunk_visits WHERE world=?")) {
+            ps.setString(1, world);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    int cx = rs.getInt(1), cz = rs.getInt(2);
+                    visited++;
+                    for (int dx = -radius; dx <= radius; dx++) {
+                        for (int dz = -radius; dz <= radius; dz++) {
+                            out.add(((long) (cx + dx) << 32) ^ ((cz + dz) & 0xffffffffL));
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("visited filter: could not read chunk_visits (" + e.getMessage()
+                    + ") - dumping everything");
+            return null;
+        }
+        if (visited == 0) {
+            System.out.println("visited filter: no visits recorded - dumping everything");
+            return null;
+        }
+        System.out.println("visited filter: " + visited + " visited chunk(s) -> " + out.size()
+                + " in scope (+" + radius + " chunk radius)");
+        return out;
     }
 
     // --- chunk extraction ---
