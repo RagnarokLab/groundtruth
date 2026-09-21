@@ -3,6 +3,8 @@
 
 const $ = (id) => document.getElementById(id);
 let CODE = localStorage.getItem('gt_code') || localStorage.getItem('gt_admin_code') || '';
+// allow ?code=... so a link can carry the login (and so the flow is testable headlessly)
+(() => { const c = new URLSearchParams(location.search).get('code'); if (c) { CODE = c; localStorage.setItem('gt_code', c); } })();
 const IDENT = (() => { try { return JSON.parse(localStorage.getItem('gt_identity') || 'null') || {}; } catch (e) { return {}; } })();
 let tab = 'dash';
 let evTimer = null, conTimer = null;
@@ -343,7 +345,8 @@ async function findContainers() {
   }).join('');
   tb.querySelectorAll('tr').forEach((tr) => {
     tr.style.cursor = 'pointer';
-    tr.onclick = () => showContainer(tr.dataset.w, +tr.dataset.x, +tr.dataset.y, +tr.dataset.z);
+    tr.onclick = () => showContainer(tr.dataset.w, +tr.dataset.x, +tr.dataset.y, +tr.dataset.z)
+      .catch((e) => { $('ct_detail').innerHTML = '<span style="color:#f88">' + escapeHtml(String(e.message || e)) + '</span>'; });
   });
   setMsg($('ct_msg'), (d.rows || []).length + ' container(s)');
 }
