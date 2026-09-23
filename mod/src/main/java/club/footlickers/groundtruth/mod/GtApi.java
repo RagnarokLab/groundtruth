@@ -17,6 +17,14 @@ public final class GtApi {
             .connectTimeout(Duration.ofSeconds(8))
             .build();
 
+    /**
+     * Identify ourselves rather than let the JDK send an anonymous Java client string. A nameless
+     * client is the kind of thing a CDN will challenge, and a challenge page is not JSON - the map
+     * would just fail to load with no clue why.
+     */
+    private static final String USER_AGENT =
+            "GroundTruthMod/0.1 (+https://github.com/RagnarokLab/groundtruth)";
+
     private final String baseUrl;
     private final String key;
 
@@ -41,7 +49,9 @@ public final class GtApi {
     /** Raw bytes (map PNG, mesh tile, ...). Null on any non-200 / failure. */
     public CompletableFuture<byte[]> bytes(String path, String... query) {
         HttpRequest req = HttpRequest.newBuilder(uri(path, query))
-                .timeout(Duration.ofSeconds(30)).GET().build();
+                .timeout(Duration.ofSeconds(30))
+                .header("User-Agent", USER_AGENT)
+                .GET().build();
         return HTTP.sendAsync(req, HttpResponse.BodyHandlers.ofByteArray())
                 .thenApply(r -> r.statusCode() == 200 ? r.body() : null)
                 .exceptionally(e -> null);
@@ -50,7 +60,9 @@ public final class GtApi {
     /** JSON/text body. Null on any non-200 / failure. */
     public CompletableFuture<String> text(String path, String... query) {
         HttpRequest req = HttpRequest.newBuilder(uri(path, query))
-                .timeout(Duration.ofSeconds(15)).GET().build();
+                .timeout(Duration.ofSeconds(15))
+                .header("User-Agent", USER_AGENT)
+                .GET().build();
         return HTTP.sendAsync(req, HttpResponse.BodyHandlers.ofString())
                 .thenApply(r -> r.statusCode() == 200 ? r.body() : null)
                 .exceptionally(e -> null);

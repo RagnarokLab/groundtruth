@@ -112,9 +112,14 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             getServer().getPluginManager().registerEvents(new LogListener(logDb), this);
         }
         // Tell joining clients where the map is served: the join address and the map address can differ.
+        String publicApi = getConfig().getString("public-api-url", "");
         getServer().getMessenger().registerOutgoingPluginChannel(this, MapAdvertListener.CHANNEL);
-        getServer().getPluginManager().registerEvents(
-                new MapAdvertListener(this, getConfig().getString("public-api-url", "")), this);
+        getServer().getPluginManager().registerEvents(new MapAdvertListener(this, publicApi), this);
+        if (!publicApi.isEmpty()) {
+            getLogger().info("[GroundTruth] map API advertised to clients on join: " + publicApi);
+        } else {
+            getLogger().info("[GroundTruth] no public-api-url set; clients fall back to <server>:8095");
+        }
         startComponents();
         getCommand("groundtruth").setExecutor(this);
         getLogger().info("[GroundTruth] Ready. New chunks are indexed live; run /groundtruth dump <world> to backfill existing ones.");
