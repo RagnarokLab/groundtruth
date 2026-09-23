@@ -34,6 +34,8 @@
   let overlaySeq = 0;             // guards async overlay builds: a newer refresh wins
   let panelEl = null, bboxToggle = null, bboxColor = null, lastVoxWindow = null;
   let slimeToggle = null;
+  let borderToggle = null;
+  let showBorders = false;        // chunk grid: view-only, not a 2D map layer
   let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
   let includeUnderground = true;  // toggle: surface-only (false) vs all the way down to bedrock (true)
@@ -45,6 +47,7 @@
   const SLIME_MAX_CHUNKS = 104;  // /api/pixels refuses a request over 12000 chunks, so the slime
                                  // overlay covers a centred square inside that; slime chunks are 1 in
                                  // 10 and scattered, so nothing about the edge reads as a boundary
+  const BORDER_MAX_CHUNKS = 64;  // widest span the chunk grid is drawn at, in chunks per side
   const VOXEL_MAX_VCHUNKS = 70;   // cap on the window, in virtual chunks (7x7 tiles of 10) - also the
                                   // span at which the tier switches from 1m to 2m blocks
   const VOXEL_MAX_VCHUNKS_LOD1 = 128; // lod 1's own cap: its tiles cover 4x the area, so reaching the
@@ -1024,6 +1027,18 @@
     slimeRow.appendChild(slimeToggle);
     slimeRow.appendChild(document.createTextNode('slime chunks'));
     panelEl.appendChild(slimeRow);
+    const borderRow = document.createElement('label');
+    borderRow.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;';
+    borderToggle = document.createElement('input');
+    borderToggle.type = 'checkbox';
+    borderToggle.checked = showBorders;
+    borderToggle.onchange = () => {
+      showBorders = borderToggle.checked;
+      refreshOverlays();
+    };
+    borderRow.appendChild(borderToggle);
+    borderRow.appendChild(document.createTextNode('chunk borders'));
+    panelEl.appendChild(borderRow);
     for (const b of [depthBtn, worldBtn, islandsBtn]) {
       const hidden = b.style.display === 'none';
       b.style.cssText = 'padding:5px 8px;font-size:13px;cursor:pointer;background:#222;color:#eee;'
@@ -1717,42 +1732,74 @@
     scene.add(markerPoints);
   }
 
+  /** One chunk's square outline on the surface, lifted clear of the terrain so it cannot z-fight. */
+  function pushSquareEdges(out, cx, cz, y, lift) {
+    const x0 = cx * 16, z0 = cz * 16, x1 = x0 + 16, z1 = z0 + 16, yy = y + lift;
+    out.push(x0, yy, z0, x1, yy, z0, x1, yy, z0, x1, yy, z1,
+             x1, yy, z1, x0, yy, z1, x0, yy, z1, x0, yy, z0);
+  }
+
   /**
-   * Slime chunks as translucent green plates laid on the surface, outlined so they still read over
-   * grass. A slime chunk is a pure function of the world seed, so no data is stored for it; only the
-   * surface height comes from the server, as one sample per chunk from /api/pixels.
+   * Surface heights for a window, one sample per chunk: the height of the real terrain under each
+   * chunk. Returns null when there is nothing to draw or the request fails.
+   *
+   * Never past the level's own window: that is where terrain exists, and an overlay with no ground
+   * under it would hang in the background. Inside that, the request is capped to what the server will
+   * answer in one go, centred, so the overlays cover what is being looked at.
    */
-  async function addSlimePlates(cx0, cz0, cx1, cz1, seq) {
-    if (!window.GT || !window.GT.isSlime) return;
-    // Never past the level's own window: that is where terrain exists, and a plate with no ground
-    // under it would hang in the background. Inside that, cap the request to the server's cell limit,
-    // centred, so the plates cover what is being looked at.
+  async function fetchSurfaceHeights(cx0, cz0, cx1, cz1) {
     const half = SLIME_MAX_CHUNKS >> 1;
     const mx = (cx0 + cx1) >> 1, mz = (cz0 + cz1) >> 1;
     const ax0 = Math.max(cx0, mx - half), ax1 = Math.min(cx1, mx + half - 1);
     const az0 = Math.max(cz0, mz - half), az1 = Math.min(cz1, mz + half - 1);
-    let buf;
-    try {
-      const j = await (await fetch(`/api/pixels?world=${encodeURIComponent(lastCenter.world)}`
-        + `&cx0=${ax0}&cz0=${az0}&cx1=${ax1}&cz1=${az1}&px=16&deflate=1`)).json();
-      if (!j || !j.data) return;
-      buf = await inflated(j.data);
-    } catch (e) { return; }
-    if (seq !== overlaySeq) return;                 // a newer refresh has already taken over
-    const d = new DataView(buf);
+    const j = await (await fetch(`/api/pixels?world=${encodeURIComponent(lastCenter.world)}`
+      + `&cx0=${ax0}&cz0=${az0}&cx1=${ax1}&cz1=${az1}&px=16&deflate=1`)).json();
+    if (!j || !j.data) return null;
+    const d = new DataView(await inflated(j.data));
     const ox = d.getInt16(0), oz = d.getInt16(2), cols = d.getInt32(6), rows = d.getInt32(10);
-    const verts = [], edges = [];
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const cell = 14 + (r * cols + c) * 7;
-        const y = d.getInt16(cell);
+    const ys = new Int16Array(cols * rows);
+    for (let i = 0; i < ys.length; i++) ys[i] = d.getInt16(14 + i * 7);
+    return { ox, oz, cols, rows, ys };
+  }
+
+  /**
+   * Every chunk in range outlined along its own surface, so the grid steps with the terrain rather
+   * than cutting through it. Lifted differently from the slime plates, since the two coincide
+   * wherever a slime chunk also has a border and equal heights would make them fight.
+   */
+  function addChunkBorders(h) {
+    const edges = [];
+    for (let r = 0; r < h.rows; r++) {
+      for (let c = 0; c < h.cols; c++) {
+        const y = h.ys[r * h.cols + c];
         if (y === -32768) continue;                 // server has no surface for that chunk
-        const cx = ox + c, cz = oz + r;             // at one sample per chunk a cell IS a chunk
+        pushSquareEdges(edges, h.ox + c, h.oz + r, y, 1.02);
+      }
+    }
+    if (!edges.length) return;
+    if (!overlayGroup) { overlayGroup = new THREE.Group(); scene.add(overlayGroup); }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(edges, 3));
+    overlayGroup.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 0.22,
+    })));
+  }
+
+  /**
+   * Slime chunks as translucent green plates laid on the surface, outlined so they still read over
+   * grass. A slime chunk is a pure function of the world seed, so nothing is stored for it.
+   */
+  function addSlimePlates(h) {
+    const verts = [], edges = [];
+    for (let r = 0; r < h.rows; r++) {
+      for (let c = 0; c < h.cols; c++) {
+        const y = h.ys[r * h.cols + c];
+        if (y === -32768) continue;
+        const cx = h.ox + c, cz = h.oz + r;         // at one sample per chunk a cell IS a chunk
         if (!window.GT.isSlime(cx, cz)) continue;
-        const x0 = cx * 16, z0 = cz * 16, x1 = x0 + 16, z1 = z0 + 16, yy = y + 1;
+        const x0 = cx * 16, z0 = cz * 16, x1 = x0 + 16, z1 = z0 + 16, yy = y + 1.4;
         verts.push(x0, yy, z0, x1, yy, z0, x1, yy, z1, x0, yy, z0, x1, yy, z1, x0, yy, z1);
-        edges.push(x0, yy, z0, x1, yy, z0, x1, yy, z0, x1, yy, z1,
-                   x1, yy, z1, x0, yy, z1, x0, yy, z1, x0, yy, z0);
+        pushSquareEdges(edges, cx, cz, y, 1.4);
       }
     }
     if (!verts.length) return;
@@ -1779,11 +1826,27 @@
     const seq = ++overlaySeq;
     clearOverlays();
     if (worldLevel) {
-      addStructureBoxes(worldLevel.cx0, worldLevel.cz0, worldLevel.cx1, worldLevel.cz1);
-      if (window.GT && window.GT.showSlime && window.GT.showSlime()
-          && window.GT.canShowSlime && window.GT.canShowSlime()) {
-        await addSlimePlates(worldLevel.cx0, worldLevel.cz0, worldLevel.cx1, worldLevel.cz1, seq)
-          .catch(() => {});   // a bad payload just means no plates, never a broken view
+      const l = worldLevel;
+      addStructureBoxes(l.cx0, l.cz0, l.cx1, l.cz1);
+      const slimeOn = !!(window.GT && window.GT.showSlime && window.GT.showSlime()
+                         && window.GT.canShowSlime && window.GT.canShowSlime());
+      // Past a certain span the chunk lines merge into a wash, so the borders are only offered while
+      // there are few enough chunks on screen for them to read. The switch says so rather than
+      // silently doing nothing.
+      const tooWide = l.cx1 - l.cx0 + 1 > BORDER_MAX_CHUNKS;
+      if (borderToggle) {
+        borderToggle.disabled = tooWide;
+        borderToggle.parentNode.title = tooWide ? 'chunk borders read only when zoomed in' : '';
+        borderToggle.parentNode.style.opacity = tooWide ? '0.5' : '';
+      }
+      const bordersOn = showBorders && !tooWide;
+      if (slimeOn || bordersOn) {
+        // one height grid serves both overlays
+        const h = await fetchSurfaceHeights(l.cx0, l.cz0, l.cx1, l.cz1).catch(() => null);
+        if (h && seq === overlaySeq) {   // a newer refresh has already taken over
+          if (bordersOn) addChunkBorders(h);
+          if (slimeOn) addSlimePlates(h);
+        }
       }
     } else if (lastVoxWindow) {
       addStructureBoxes(lastVoxWindow.cx0, lastVoxWindow.cz0,
@@ -1924,7 +1987,7 @@
     if (statusEl) { statusEl.remove(); statusEl = null; }
     if (popupEl) { popupEl.remove(); popupEl = null; }
     if (panelEl) { panelEl.remove(); panelEl = null; }
-    bboxToggle = null; bboxColor = null; lastVoxWindow = null; slimeToggle = null;
+    bboxToggle = null; bboxColor = null; lastVoxWindow = null; slimeToggle = null; borderToggle = null;
     try {
       if (atlasTex) { atlasTex.dispose(); atlasTex = null; }
       if (animTex) { animTex.dispose(); animTex = null; }
