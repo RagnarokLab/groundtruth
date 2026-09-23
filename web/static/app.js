@@ -1067,7 +1067,9 @@ window.GT = {
   getCenter: () => ({ cx: panX, cz: panZ }),
   // the 3D view draws the same information, so it follows the same switches and colours as the 2D map
   showBboxes: () => toggleBboxesEl.checked,
+  setShowBboxes: (v) => { toggleBboxesEl.checked = !!v; draw(); },
   bboxColor: () => settings.bboxColor,
+  setBboxColor: (v) => { settings.bboxColor = v; saveSettings(); draw(); },
   on3DClose: () => draw(),
 };
 document.getElementById('view3dBtn').addEventListener('click', () => {

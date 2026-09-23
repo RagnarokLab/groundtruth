@@ -31,6 +31,7 @@
   let raf = null, canvas = null, closeBtn = null, statusEl = null;
   let markerPoints = null, popupEl = null, downXY = null;
   let overlayGroup = null;        // structure outlines etc: rebuilt per level, disposed with it
+  let panelEl = null, bboxToggle = null, bboxColor = null, lastVoxWindow = null;
   let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
   let includeUnderground = true;  // toggle: surface-only (false) vs all the way down to bedrock (true)
@@ -902,6 +903,51 @@
     statusEl.style.cssText = 'position:fixed;bottom:12px;left:12px;z-index:101;color:#cfe;font:13px sans-serif;background:rgba(0,0,0,0.6);padding:6px 10px;border-radius:4px;';
     document.body.appendChild(statusEl);
 
+    // Controls for the 3D view itself. The layer switches are the 2D map's own (read and written
+    // through window.GT, so the two views cannot disagree), and the view-only switches live here
+    // rather than floating separately over the map.
+    panelEl = document.createElement('div');
+    panelEl.style.cssText = 'position:fixed;top:12px;left:12px;z-index:101;display:flex;flex-direction:column;'
+      + 'gap:6px;background:rgba(0,0,0,0.6);border:1px solid #666;border-radius:6px;padding:8px 10px;'
+      + 'font:13px sans-serif;color:#eee;';
+    const panelTitle = document.createElement('div');
+    panelTitle.textContent = 'layers & view';
+    panelTitle.style.cssText = 'font-weight:bold;opacity:0.75;';
+    panelEl.appendChild(panelTitle);
+    const bboxRow = document.createElement('label');
+    bboxRow.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;';
+    bboxToggle = document.createElement('input');
+    bboxToggle.type = 'checkbox';
+    bboxToggle.checked = !!(window.GT && window.GT.showBboxes && window.GT.showBboxes());
+    bboxToggle.onchange = () => {
+      if (window.GT && window.GT.setShowBboxes) window.GT.setShowBboxes(bboxToggle.checked);
+      refreshOverlays();
+    };
+    bboxRow.appendChild(bboxToggle);
+    bboxRow.appendChild(document.createTextNode('structure boxes'));
+    panelEl.appendChild(bboxRow);
+    const colRow = document.createElement('label');
+    colRow.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;';
+    bboxColor = document.createElement('input');
+    bboxColor.type = 'color';
+    bboxColor.value = (window.GT && window.GT.bboxColor && window.GT.bboxColor()) || '#ffd25c';
+    bboxColor.style.cssText = 'width:30px;height:18px;padding:0;border:1px solid #666;background:none;cursor:pointer;';
+    bboxColor.oninput = () => {
+      if (window.GT && window.GT.setBboxColor) window.GT.setBboxColor(bboxColor.value);
+      refreshOverlays();
+    };
+    colRow.appendChild(bboxColor);
+    colRow.appendChild(document.createTextNode('box colour'));
+    panelEl.appendChild(colRow);
+    for (const b of [depthBtn, worldBtn, islandsBtn]) {
+      const hidden = b.style.display === 'none';
+      b.style.cssText = 'padding:5px 8px;font-size:13px;cursor:pointer;background:#222;color:#eee;'
+        + 'border:1px solid #666;border-radius:4px;text-align:left;';
+      if (hidden) b.style.display = 'none';
+      panelEl.appendChild(b);
+    }
+    document.body.appendChild(panelEl);
+
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: worldView });
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
     renderer.setSize(innerWidth, innerHeight);
@@ -1578,8 +1624,18 @@
       underground: false, kind: p.kind,
     }));
     scene.add(markerPoints);
+    refreshOverlays();
+  }
+
+  /** Rebuild the runtime overlays for whatever window is currently on screen. */
+  function refreshOverlays() {
     clearOverlays();
-    if (worldLevel) addStructureBoxes(worldLevel.cx0, worldLevel.cz0, worldLevel.cx1, worldLevel.cz1);
+    if (worldLevel) {
+      addStructureBoxes(worldLevel.cx0, worldLevel.cz0, worldLevel.cx1, worldLevel.cz1);
+    } else if (lastVoxWindow) {
+      addStructureBoxes(lastVoxWindow.cx0, lastVoxWindow.cz0,
+                        lastVoxWindow.cx0 + VOXEL_CHUNKS - 1, lastVoxWindow.cz0 + VOXEL_CHUNKS - 1);
+    }
   }
 
   /** Drop the previous overlays' geometry; they are rebuilt per level. */
@@ -1652,8 +1708,8 @@
       markerPoints.userData.markers = pts;
       scene.add(markerPoints);
     }
-    clearOverlays();
-    addStructureBoxes(cx0, cz0, cx0 + VOXEL_CHUNKS - 1, cz0 + VOXEL_CHUNKS - 1);
+    lastVoxWindow = { cx0, cz0 };
+    refreshOverlays();
   }
 
   // Arrow keys / WASD move the view in the horizontal plane (Q/E for up-down). Speed scales with
@@ -1714,6 +1770,8 @@
     if (islandsBtn) { islandsBtn.remove(); islandsBtn = null; }
     if (statusEl) { statusEl.remove(); statusEl = null; }
     if (popupEl) { popupEl.remove(); popupEl = null; }
+    if (panelEl) { panelEl.remove(); panelEl = null; }
+    bboxToggle = null; bboxColor = null; lastVoxWindow = null;
     try {
       if (atlasTex) { atlasTex.dispose(); atlasTex = null; }
       if (animTex) { animTex.dispose(); animTex = null; }
