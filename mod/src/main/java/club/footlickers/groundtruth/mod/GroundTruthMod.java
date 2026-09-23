@@ -3,6 +3,8 @@ package club.footlickers.groundtruth.mod;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ServerData;
@@ -17,14 +19,17 @@ public class GroundTruthMod implements ClientModInitializer {
     /** The plugin web API for the server currently connected to; set when the map is opened. */
     public static volatile GtApi api = new GtApi("http://127.0.0.1:8095", "");
 
+    /** Map URL the server advertised on join, if any. Authoritative when present. */
+    public static volatile String advertisedApi = null;
+
     /**
-     * The API host for the server the player is on: the game address, with the game port replaced by
-     * the plugin's web port. A dedicated server's map lives on that server, not on the client, so
-     * 127.0.0.1 is only right for a local test server. Override with -Dgroundtruth.api=...
+     * Where the map API lives. The server states its own public map URL on join, because the address
+     * a player joins on and the address the map is served on can differ - and that wins. Failing that,
+     * assume the map is on the same host as the game, on the plugin's web port.
      */
     public static String apiBase(Minecraft mc) {
-        String override = System.getProperty("groundtruth.api");
-        if (override != null && !override.isBlank()) return override;
+        String adv = advertisedApi;
+        if (adv != null && !adv.isBlank()) return adv;
         ServerData server = mc.getCurrentServer();
         if (server != null && server.ip != null && !server.ip.isBlank()) {
             String host = server.ip;
@@ -39,6 +44,12 @@ public class GroundTruthMod implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        // The server tells us its map URL on join, so no client-side configuration is needed.
+        PayloadTypeRegistry.clientboundPlay().register(GtApiPayload.ID, GtApiPayload.CODEC);
+        ClientPlayNetworking.registerGlobalReceiver(GtApiPayload.ID, (payload, context) -> {
+            advertisedApi = payload.url();
+            LOGGER.info("[GroundTruth] server map API: {}", advertisedApi);
+        });
         KeyMapping.Category category = new KeyMapping.Category(
                 Identifier.fromNamespaceAndPath("groundtruth", "map"));
         openKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(

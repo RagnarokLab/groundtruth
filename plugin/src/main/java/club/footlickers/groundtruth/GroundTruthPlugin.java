@@ -68,6 +68,8 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         getConfig().addDefault("web-static", "/opt/groundtruth-web/static");
         getConfig().addDefault("tiles-dir", "/opt/groundtruth-web/tiles");
         getConfig().addDefault("proxy-to", "http://127.0.0.1:8095");
+        // The map's public URL, told to clients on join so the mod needs no per-user config.
+        getConfig().addDefault("public-api-url", "");
         // The plugin writes the same per-block layers the offline dumper does, so a server that only
         // runs the plugin still gets full detail and 3D for new chunks. The dumper is then only for
         // backfilling an existing world and for maintenance renders.
@@ -109,6 +111,10 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         if (logDb != null) {
             getServer().getPluginManager().registerEvents(new LogListener(logDb), this);
         }
+        // Tell joining clients where the map is served: the join address and the map address can differ.
+        getServer().getMessenger().registerOutgoingPluginChannel(this, MapAdvertListener.CHANNEL);
+        getServer().getPluginManager().registerEvents(
+                new MapAdvertListener(this, getConfig().getString("public-api-url", "")), this);
         startComponents();
         getCommand("groundtruth").setExecutor(this);
         getLogger().info("[GroundTruth] Ready. New chunks are indexed live; run /groundtruth dump <world> to backfill existing ones.");

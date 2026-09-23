@@ -93,10 +93,11 @@ public class GroundTruthScreen extends Screen {
             g.blit(MAP_TEX, 0, 0, this.width, this.height, 0f, 0f, 1f, 1f);
         }
         g.text(this.font, "GroundTruth \u00b7 " + status, 12, 12, 0xFFFFFFFF);
+        g.text(this.font, GroundTruthMod.api.baseUrl(), 12, 26, 0xFFA0D8FF);
         Minecraft mc = Minecraft.getInstance();
         if (mc.player != null) {
             g.text(this.font, String.format("%.0f, %.0f, %.0f",
-                    mc.player.getX(), mc.player.getY(), mc.player.getZ()), 12, 26, 0xFFC0FFC0);
+                    mc.player.getX(), mc.player.getY(), mc.player.getZ()), 12, 40, 0xFFC0FFC0);
         }
         g.text(this.font, "M closes", 12, this.height - 16, 0xFF808080);
     }
