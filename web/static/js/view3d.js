@@ -837,6 +837,70 @@
    * plus skirts down to any lower neighbour, so a whole 12k-chunk world reads as solid 3D terrain.
    * Absolute block coordinates, so structures/players/waypoints line up without translation.
    */
+  /** One-time stylesheet for the status line's spinner and action button. */
+  function ensureStatusStyles() {
+    if (document.getElementById('gt3d-status-style')) return;
+    const s = document.createElement('style');
+    s.id = 'gt3d-status-style';
+    s.textContent = '@keyframes gt3d-spin{to{transform:rotate(360deg)}}'
+      + '#gt3d-status{display:flex;align-items:center;gap:8px}'
+      + '#gt3d-status .gt3d-spin{width:11px;height:11px;border:2px solid rgba(207,238,255,0.25);'
+      + 'border-top-color:#cfe;border-radius:50%;animation:gt3d-spin 0.8s linear infinite}'
+      + '#gt3d-status .gt3d-act{padding:2px 8px;font-size:12px;cursor:pointer;background:#222;color:#eee;'
+      + 'border:1px solid #666;border-radius:4px}';
+    document.head.appendChild(s);
+  }
+
+  /**
+   * The status line, in the three states that ask different things of the reader:
+   *   busy  - a load is running, so it carries a spinner and never reads as frozen
+   *   empty - there is nothing to draw here yet, so it carries the way out
+   *   error - what broke, and a retry
+   * Anything else is plain information and gets neither.
+   */
+  function setStatus(kind, text, actionLabel, action) {
+    if (!statusEl) return;
+    ensureStatusStyles();
+    statusEl.id = 'gt3d-status';
+    statusEl.style.cssText = 'position:fixed;bottom:12px;left:12px;z-index:101;font:13px sans-serif;'
+      + 'background:rgba(0,0,0,0.6);padding:6px 10px;border-radius:4px;color:#cfe;';
+    statusEl.textContent = '';
+    if (kind === 'busy') {
+      const sp = document.createElement('span');
+      sp.className = 'gt3d-spin';
+      statusEl.appendChild(sp);
+    } else if (kind === 'error') {
+      statusEl.style.color = '#ffb4b4';
+    }
+    const t = document.createElement('span');
+    t.textContent = text;
+    statusEl.appendChild(t);
+    if (actionLabel && action) {
+      const b = document.createElement('button');
+      b.className = 'gt3d-act';
+      b.textContent = actionLabel;
+      b.onclick = action;
+      statusEl.appendChild(b);
+    }
+  }
+
+  /** Re-open the same spot: the retry path after a load has failed. */
+  function retryOpen() {
+    const c = lastCenter;
+    if (!c) return;
+    close();
+    open(c.world, c.cx, c.cz);
+  }
+
+  /** Step the camera back out and rebuild at the resolution that implies. */
+  function zoomOutStep() {
+    if (!camera || !controls) return;
+    const d = camera.position.clone().sub(controls.target);
+    if (d.lengthSq() > 1) camera.position.copy(controls.target).addScaledVector(d, 2.2);
+    controls.update();
+    refineWorldNow();
+  }
+
   async function open(world, centerCx, centerCz, opts) {
     if (canvas) return;
     if (typeof THREE === 'undefined') { alert('3D library not loaded'); return; }
@@ -899,9 +963,8 @@
     };
     document.body.appendChild(islandsBtn);
     statusEl = document.createElement('div');
-    statusEl.textContent = 'loading voxel terrain\u2026';
-    statusEl.style.cssText = 'position:fixed;bottom:12px;left:12px;z-index:101;color:#cfe;font:13px sans-serif;background:rgba(0,0,0,0.6);padding:6px 10px;border-radius:4px;';
     document.body.appendChild(statusEl);
+    setStatus('busy', 'loading terrain\u2026');
 
     // Controls for the 3D view itself. The layer switches are the 2D map's own (read and written
     // through window.GT, so the two views cannot disagree), and the view-only switches live here
@@ -971,7 +1034,7 @@
     scene.add(dir);
 
     if (worldView) {
-      try { await loadWorldView(world, centerCx, centerCz); } catch (e) { statusEl.textContent = '3D world load failed: ' + e.message; }
+      try { await loadWorldView(world, centerCx, centerCz); } catch (e) { setStatus('error', 'terrain load failed: ' + e.message, 'retry', retryOpen); }
     } else try {
       const AV = Date.now(); // atlas/biome JSON change when regenerated; bypass the 1h tile cache
       // Small mesher assets FIRST (cached + retried), then the heavy voxel response: the tint table
@@ -980,7 +1043,7 @@
       const vox = await fetch(`/api/voxels?world=${encodeURIComponent(world)}&cx0=${cx0}&cz0=${cz0}&cx1=${cx1}&cz1=${cz1}`)
         .then((r) => r.json());
       if (!vox.chunks || !vox.chunks.length) {
-        statusEl.textContent = 'no voxel data for this area yet';
+        setStatus('empty', 'no block data for this area yet', 'back to 2D', close);
         animate();
         return;
       }
@@ -989,7 +1052,7 @@
         const v = parseVoxel(buf);
         c._pal = v.pal; c._cols = v.cols;
       }
-      statusEl.textContent = 'meshing\u2026';
+      setStatus('busy', 'meshing\u2026');
       await new Promise((r) => setTimeout(r, 0));
 
       atlasTex = await new THREE.TextureLoader().loadAsync(`/tiles/atlas.png?v=${AV}`);
@@ -1074,11 +1137,11 @@
       controls.maxDistance = fitDist * 6;
       controls.update();
       const faces = (geo.index ? geo.index.count : geo.getAttribute('position').count) / 6;
-      statusEl.textContent = `${vox.chunks.length} chunks \u00b7 ${N_CHUNKS * 16}\u00b2 blocks \u00b7 ${faces.toLocaleString()} faces \u00b7 drag to orbit`;
+      setStatus('info', `${vox.chunks.length} chunks \u00b7 ${N_CHUNKS * 16}\u00b2 blocks \u00b7 ${faces.toLocaleString()} faces \u00b7 drag to orbit`);
 
       await addMarkers(vox, baseY, cx0, cz0);
     } catch (e) {
-      statusEl.textContent = '3D load failed: ' + e.message;
+      setStatus('error', '3D load failed: ' + e.message, 'retry', retryOpen);
     }
 
     window.addEventListener('resize', onResize);
@@ -1133,14 +1196,14 @@
    * Rebuilding one mesh - rather than stitching LOD tiles - means there are no seams to manage.
    */
   async function loadWorldView(world, centerCx, centerCz) {
-    statusEl.textContent = 'loading world terrain\u2026';
+    setStatus('busy', 'loading terrain\u2026');
     // cheap probe for the world's extent (step 64 returns the bounds plus a couple of samples)
     let probe;
     try {
       probe = await (await fetch(`/api/terrain?world=${encodeURIComponent(world)}&all=1&step=64&deflate=1`)).json();
     } catch (e) { probe = null; }
     if (!probe || probe.error || !probe.bounds) {
-      statusEl.textContent = 'no surface data for this world yet';
+      setStatus('empty', 'no surface data for this world yet', '2D map', close);
       return;
     }
     worldBounds = probe.bounds;
@@ -1360,8 +1423,8 @@
               tiles++;
               loaded.add(tx + ',' + tz);
               if (bg) hideCoveredVoxTiles(bg, loaded, tileBlocks);
-              statusEl.textContent = `lod ${lod} (${f}m blocks) \u00b7 ${tiles}/${tileList.length} tiles \u00b7 `
-                + `${faces.toLocaleString()} faces`;
+              setStatus('busy', `lod ${lod} (${f}m blocks) \u00b7 ${tiles}/${tileList.length} tiles \u00b7 `
+                + `${faces.toLocaleString()} faces`);
               continue;
             }
           } catch (e) { /* fall back to the live mesher below */ }
@@ -1399,8 +1462,8 @@
           tiles++;
           loaded.add(tx + ',' + tz);
           if (bg) hideCoveredVoxTiles(bg, loaded, tileBlocks);
-          statusEl.textContent = `lod ${lod} (${f}m blocks) \u00b7 ${tiles}/${tileList.length} tiles \u00b7 `
-            + `${faces.toLocaleString()} faces`;
+          setStatus('busy', `lod ${lod} (${f}m blocks) \u00b7 ${tiles}/${tileList.length} tiles \u00b7 `
+            + `${faces.toLocaleString()} faces`);
         }
       }
     };
@@ -1435,7 +1498,7 @@
     const spanChunks = Math.max(cx1 - cx0, cz1 - cz0);
     const tier = tierFor(spanChunks);
     const lod = tier.lod, f = 1 << lod;
-    if (!(await ensureVoxelAssets())) { statusEl.textContent = '3D library not loaded'; return; }
+    if (!(await ensureVoxelAssets())) { setStatus('error', '3D library not loaded', 'retry', retryOpen); return; }
 
     // Cover what is on screen, capped so an extreme zoom-out cannot ask for an absurd number of tiles.
     // Cap the window in REAL chunks too: the level's own data is what costs, and asking a server to
@@ -1514,8 +1577,10 @@
                                     coreLevel ? MAX_LEVEL_FACES - CORE_FACE_BUDGET : undefined);
     if (!r.tiles) {
       scene.remove(r.group);
-      statusEl.textContent = 'no block data here yet \u00b7 lod ' + lod + ' \u00b7 '
-        + (r.problem || 'unknown') + (bg ? '' : ' \u00b7 try zooming out');
+      const why = 'no block data here yet \u00b7 lod ' + lod + ' \u00b7 ' + (r.problem || 'unknown');
+      // the way out depends on whether a coarser level is left to try
+      if (lod === 0) setStatus('empty', why, 'zoom out', zoomOutStep);
+      else setStatus('empty', why, '2D map', close);
       return;
     }
     for (const g of r.group.children) {
@@ -1528,10 +1593,10 @@
     if (backdropGroup) { disposeGroup(backdropGroup); backdropGroup = null; }
     worldGroup = r.group;
     worldLevel = { key: tier.key, lod, cx0: bbox.cx0, cz0: bbox.cz0, cx1: bbox.cx1, cz1: bbox.cz1 };
-    statusEl.textContent = `lod ${lod} \u00b7 ${f}m blocks \u00b7 ${r.tiles} tiles \u00b7 `
+    setStatus('info', `lod ${lod} \u00b7 ${f}m blocks \u00b7 ${r.tiles} tiles \u00b7 `
       + `${r.faces.toLocaleString()} faces \u00b7 biomes `
       + (lastBiomeStats ? `${lastBiomeStats.withBiome}/${lastBiomeStats.chunks}` : '?')
-      + ` \u00b7 tints ${lastBiomeStats ? lastBiomeStats.tintKeys : '?'}`;
+      + ` \u00b7 tints ${lastBiomeStats ? lastBiomeStats.tintKeys : '?'}`);
   }
 
   /**
