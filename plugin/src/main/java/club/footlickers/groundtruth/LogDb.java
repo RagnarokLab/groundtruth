@@ -30,8 +30,9 @@ public class LogDb implements AutoCloseable {
     private static final int QUEUE_CAP = 200_000;
     private static final int BATCH_MAX = 4_000;
 
-    private final Connection writeConn;
-    private final Connection readConn;
+    // Opened on first use and closed again once idle (see DbConn for why that matters).
+    private final DbConn wdb;
+    private final DbConn rdb;
     private final Object readLock = new Object();
     private final Logger log;
 
@@ -46,18 +47,11 @@ public class LogDb implements AutoCloseable {
         if (!dataFolder.exists()) dataFolder.mkdirs();
         File dbFile = new File(dataFolder, "groundtruth-log.db");
         String url = "jdbc:sqlite:" + dbFile.getAbsolutePath();
-        this.writeConn = DriverManager.getConnection(url);
-        this.readConn = DriverManager.getConnection(url);
-        try (Statement st = writeConn.createStatement()) {
-            st.execute("PRAGMA journal_mode=WAL");
-            st.execute("PRAGMA synchronous=NORMAL");
-            st.execute("PRAGMA busy_timeout=10000");
-            st.execute("PRAGMA mmap_size=0");
-        }
-        try (Statement st = readConn.createStatement()) {
-            st.execute("PRAGMA busy_timeout=5000");
-            st.execute("PRAGMA mmap_size=0");
-        }
+        this.wdb = new DbConn(url, 45_000,
+                "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL",
+                "PRAGMA busy_timeout=10000", "PRAGMA mmap_size=0");
+        this.rdb = new DbConn(url, 45_000,
+                "PRAGMA busy_timeout=5000", "PRAGMA mmap_size=0");
         migrate();
         writer = new Thread(this::writerLoop, "GroundTruth-LogWriter");
         writer.setDaemon(true);
@@ -65,7 +59,7 @@ public class LogDb implements AutoCloseable {
     }
 
     private void migrate() throws SQLException {
-        try (Statement st = writeConn.createStatement()) {
+        try (Statement st = wdb.get().createStatement()) {
             st.execute("CREATE TABLE IF NOT EXISTS log_events (" +
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, " +
                     "world TEXT NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, " +
@@ -161,7 +155,7 @@ public class LogDb implements AutoCloseable {
     /** The most recent inventory snapshot for a uuid: {ts, reason, contents} or null. */
     public String[] latestInventory(String uuid) {
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(
+            try (PreparedStatement ps = rdb.get().prepareStatement(
                     "SELECT ts,reason,contents FROM log_inventories WHERE uuid=? ORDER BY ts DESC LIMIT 1")) {
                 ps.setString(1, uuid);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -178,7 +172,7 @@ public class LogDb implements AutoCloseable {
     public String uuidFor(String name) {
         if (name == null || name.isEmpty()) return null;
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(
+            try (PreparedStatement ps = rdb.get().prepareStatement(
                     "SELECT uuid FROM log_players WHERE ltrim(name,'.')=? LIMIT 1")) {
                 ps.setString(1, stripDot(name));
                 try (ResultSet rs = ps.executeQuery()) { if (rs.next()) return rs.getString(1); }
@@ -190,7 +184,7 @@ public class LogDb implements AutoCloseable {
     /** Last known position for a uuid: {world, x, y, z} or null. */
     public String[] lastPosition(String uuid) {
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(
+            try (PreparedStatement ps = rdb.get().prepareStatement(
                     "SELECT world,x,y,z FROM log_positions WHERE uuid=? ORDER BY ts DESC LIMIT 1")) {
                 ps.setString(1, uuid);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -207,7 +201,7 @@ public class LogDb implements AutoCloseable {
     /** Last-known contents of a container at a position: {kind, contents, ts} or null. */
     public String[] containerAt(String world, int x, int y, int z) {
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(
+            try (PreparedStatement ps = rdb.get().prepareStatement(
                     "SELECT kind,contents,updated_ts FROM log_containers WHERE world=? AND x=? AND y=? AND z=?")) {
                 ps.setString(1, world);
                 ps.setInt(2, x); ps.setInt(3, y); ps.setInt(4, z);
@@ -280,8 +274,8 @@ public class LogDb implements AutoCloseable {
         }
         synchronized (this) {
             try {
-                writeConn.setAutoCommit(false);
-                try (PreparedStatement ps = writeConn.prepareStatement(
+                wdb.get().setAutoCommit(false);
+                try (PreparedStatement ps = wdb.get().prepareStatement(
                         "INSERT INTO log_container_flow (world,x,y,z,item,bucket,n,updated_ts) VALUES (?,?,?,?,?,?,?,?) " +
                         "ON CONFLICT(world,x,y,z,item,bucket) DO UPDATE SET n = n + excluded.n, " +
                         "updated_ts = excluded.updated_ts")) {
@@ -300,12 +294,12 @@ public class LogDb implements AutoCloseable {
                     }
                     ps.executeBatch();
                 }
-                writeConn.commit();
+                wdb.get().commit();
             } catch (SQLException e) {
-                try { writeConn.rollback(); } catch (SQLException ignored) {}
+                try { wdb.get().rollback(); } catch (SQLException ignored) {}
                 log.warning("[GroundTruth] flow flush failed: " + e.getMessage());
             } finally {
-                try { writeConn.setAutoCommit(true); } catch (SQLException ignored) {}
+                try { wdb.get().setAutoCommit(true); } catch (SQLException ignored) {}
             }
         }
     }
@@ -318,13 +312,13 @@ public class LogDb implements AutoCloseable {
         synchronized (this) {
             try {
                 long last = 0;
-                try (PreparedStatement ps = writeConn.prepareStatement("SELECT v FROM log_meta WHERE k='heat_ts'");
+                try (PreparedStatement ps = wdb.get().prepareStatement("SELECT v FROM log_meta WHERE k='heat_ts'");
                      ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) last = rs.getLong(1);
                 }
                 long now = System.currentTimeMillis();
-                writeConn.setAutoCommit(false);
-                try (PreparedStatement ps = writeConn.prepareStatement(
+                wdb.get().setAutoCommit(false);
+                try (PreparedStatement ps = wdb.get().prepareStatement(
                         "INSERT INTO log_heat (uuid,day,world,gx,gz,n) " +
                         "SELECT uuid, ts/86400000, world, " +
                         "  (x - (((x % 16) + 16) % 16)) / 16, (z - (((z % 16) + 16) % 16)) / 16, COUNT(*) " +
@@ -334,44 +328,44 @@ public class LogDb implements AutoCloseable {
                     ps.setLong(2, now);
                     ps.executeUpdate();
                 }
-                try (PreparedStatement ps = writeConn.prepareStatement(
+                try (PreparedStatement ps = wdb.get().prepareStatement(
                         "INSERT INTO log_meta (k,v) VALUES ('heat_ts',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v")) {
                     ps.setLong(1, now);
                     ps.executeUpdate();
                 }
-                writeConn.commit();
+                wdb.get().commit();
             } catch (SQLException e) {
-                try { writeConn.rollback(); } catch (SQLException ignored) {}
+                try { wdb.get().rollback(); } catch (SQLException ignored) {}
                 log.warning("[GroundTruth] heat aggregation failed: " + e.getMessage());
             } finally {
-                try { writeConn.setAutoCommit(true); } catch (SQLException ignored) {}
+                try { wdb.get().setAutoCommit(true); } catch (SQLException ignored) {}
             }
         }
     }
 
     private void writeBatch(List<Object[]> batch) throws SQLException {        synchronized (this) {
-            writeConn.setAutoCommit(false);
-            try (PreparedStatement ev = writeConn.prepareStatement(
+            wdb.get().setAutoCommit(false);
+            try (PreparedStatement ev = wdb.get().prepareStatement(
                         "INSERT INTO log_events (ts,world,x,y,z,action,actor_kind,actor_id,actor_name," +
                         "cause_kind,cause_id,cause_name,target,before,after,meta,session_id) " +
                         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-                 PreparedStatement ss = writeConn.prepareStatement(
+                 PreparedStatement ss = wdb.get().prepareStatement(
                         "INSERT INTO log_sessions (uuid,name,join_ts,ip,world) VALUES (?,?,?,?,?)");
-                 PreparedStatement se = writeConn.prepareStatement(
+                 PreparedStatement se = wdb.get().prepareStatement(
                         "UPDATE log_sessions SET quit_ts=?, world=?, last_x=?, last_y=?, last_z=? " +
                         "WHERE id=(SELECT id FROM log_sessions WHERE uuid=? AND quit_ts IS NULL " +
                         "ORDER BY join_ts DESC LIMIT 1)");
-                 PreparedStatement ps = writeConn.prepareStatement(
+                 PreparedStatement ps = wdb.get().prepareStatement(
                         "INSERT INTO log_players (uuid,name,first_seen,last_seen,last_ip) VALUES (?,?,?,?,?) " +
                         "ON CONFLICT(uuid) DO UPDATE SET name=excluded.name, last_seen=excluded.last_seen, " +
                         "last_ip=excluded.last_ip");
-                 PreparedStatement po = writeConn.prepareStatement(
+                 PreparedStatement po = wdb.get().prepareStatement(
                         "INSERT INTO log_positions (uuid,world,x,y,z,ts) VALUES (?,?,?,?,?,?)");
-                 PreparedStatement cs = writeConn.prepareStatement(
+                 PreparedStatement cs = wdb.get().prepareStatement(
                         "INSERT INTO log_containers (world,x,y,z,kind,contents,updated_ts) VALUES (?,?,?,?,?,?,?) " +
                         "ON CONFLICT(world,x,y,z) DO UPDATE SET kind=excluded.kind, contents=excluded.contents, " +
                         "updated_ts=excluded.updated_ts");
-                 PreparedStatement iv = writeConn.prepareStatement(
+                 PreparedStatement iv = wdb.get().prepareStatement(
                         "INSERT INTO log_inventories (uuid,ts,reason,contents) VALUES (?,?,?,?)")) {
                 for (Object[] r : batch) {
                     String kind = (String) r[0];
@@ -428,12 +422,12 @@ public class LogDb implements AutoCloseable {
                 }
                 ev.executeBatch();
                 po.executeBatch();
-                writeConn.commit();
+                wdb.get().commit();
             } catch (SQLException e) {
-                writeConn.rollback();
+                wdb.get().rollback();
                 throw e;
             } finally {
-                writeConn.setAutoCommit(true);
+                wdb.get().setAutoCommit(true);
             }
         }
     }
@@ -470,7 +464,7 @@ public class LogDb implements AutoCloseable {
         sql.append(" ORDER BY ts DESC LIMIT ?");
         args.add(Math.max(1, limit));
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(sql.toString())) {
+            try (PreparedStatement ps = rdb.get().prepareStatement(sql.toString())) {
                 for (int i = 0; i < args.size(); i++) ps.setObject(i + 1, args.get(i));
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -520,7 +514,7 @@ public class LogDb implements AutoCloseable {
         sql.append(" ORDER BY ts DESC LIMIT ?");
         args.add(limit);
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(sql.toString())) {
+            try (PreparedStatement ps = rdb.get().prepareStatement(sql.toString())) {
                 for (int i = 0; i < args.size(); i++) ps.setObject(i + 1, args.get(i));
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -568,7 +562,7 @@ public class LogDb implements AutoCloseable {
         sql.append(" ORDER BY ts DESC LIMIT ?");
         args.add(Math.max(1, Math.min(limit, 50000)));
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(sql.toString())) {
+            try (PreparedStatement ps = rdb.get().prepareStatement(sql.toString())) {
                 for (int i = 0; i < args.size(); i++) ps.setObject(i + 1, args.get(i));
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -592,9 +586,9 @@ public class LogDb implements AutoCloseable {
     public synchronized int markReverted(List<Long> ids, String actorId, String actorName, String query) {
         if (ids.isEmpty()) return 0;
         try {
-            writeConn.setAutoCommit(false);
+            wdb.get().setAutoCommit(false);
             long rollbackId;
-            try (PreparedStatement ps = writeConn.prepareStatement(
+            try (PreparedStatement ps = wdb.get().prepareStatement(
                     "INSERT INTO log_events (ts,world,x,y,z,action,actor_kind,actor_id,actor_name,target,meta) " +
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)", Statement.RETURN_GENERATED_KEYS)) {
                 ps.setLong(1, System.currentTimeMillis());
@@ -605,7 +599,7 @@ public class LogDb implements AutoCloseable {
                 ps.executeUpdate();
                 try (ResultSet rs = ps.getGeneratedKeys()) { rollbackId = rs.next() ? rs.getLong(1) : 0; }
             }
-            try (PreparedStatement ps = writeConn.prepareStatement(
+            try (PreparedStatement ps = wdb.get().prepareStatement(
                     "UPDATE log_events SET reverted=1, reverted_by=?, reverted_at=? WHERE id=?")) {
                 for (Long id : ids) {
                     ps.setLong(1, rollbackId);
@@ -615,14 +609,14 @@ public class LogDb implements AutoCloseable {
                 }
                 ps.executeBatch();
             }
-            writeConn.commit();
+            wdb.get().commit();
             return ids.size();
         } catch (SQLException e) {
-            try { writeConn.rollback(); } catch (SQLException ignored) {}
+            try { wdb.get().rollback(); } catch (SQLException ignored) {}
             log.warning("[GroundTruth] markReverted failed: " + e.getMessage());
             return 0;
         } finally {
-            try { writeConn.setAutoCommit(true); } catch (SQLException ignored) {}
+            try { wdb.get().setAutoCommit(true); } catch (SQLException ignored) {}
         }
     }
 
@@ -630,7 +624,7 @@ public class LogDb implements AutoCloseable {
     public List<Hit> findReverted(long rollbackId) {
         List<Hit> out = new ArrayList<>();
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(
+            try (PreparedStatement ps = rdb.get().prepareStatement(
                     "SELECT id,ts,world,x,y,z,action,actor_name,target,before,after FROM log_events " +
                     "WHERE reverted_by=? ORDER BY ts ASC")) {
                 ps.setLong(1, rollbackId);
@@ -653,8 +647,8 @@ public class LogDb implements AutoCloseable {
     public synchronized int unmarkReverted(List<Long> ids, String actorId, String actorName, String query) {
         if (ids.isEmpty()) return 0;
         try {
-            writeConn.setAutoCommit(false);
-            try (PreparedStatement ps = writeConn.prepareStatement(
+            wdb.get().setAutoCommit(false);
+            try (PreparedStatement ps = wdb.get().prepareStatement(
                     "INSERT INTO log_events (ts,world,x,y,z,action,actor_kind,actor_id,actor_name,meta) " +
                     "VALUES (?,?,?,?,?,?,?,?,?,?)")) {
                 ps.setLong(1, System.currentTimeMillis());
@@ -664,24 +658,24 @@ public class LogDb implements AutoCloseable {
                 ps.setString(10, query);
                 ps.executeUpdate();
             }
-            try (PreparedStatement ps = writeConn.prepareStatement(
+            try (PreparedStatement ps = wdb.get().prepareStatement(
                     "UPDATE log_events SET reverted=0, reverted_by=NULL, reverted_at=NULL WHERE id=?")) {
                 for (Long id : ids) { ps.setLong(1, id); ps.addBatch(); }
                 ps.executeBatch();
             }
-            writeConn.commit();
+            wdb.get().commit();
             return ids.size();
         } catch (SQLException e) {
-            try { writeConn.rollback(); } catch (SQLException ignored) {}
+            try { wdb.get().rollback(); } catch (SQLException ignored) {}
             log.warning("[GroundTruth] unmarkReverted failed: " + e.getMessage());
             return 0;
         } finally {
-            try { writeConn.setAutoCommit(true); } catch (SQLException ignored) {}
+            try { wdb.get().setAutoCommit(true); } catch (SQLException ignored) {}
         }
     }
 
     public long eventCount() {        synchronized (readLock) {
-            try (Statement st = readConn.createStatement();
+            try (Statement st = rdb.get().createStatement();
                  ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM log_events")) {
                 return rs.next() ? rs.getLong(1) : -1;
             } catch (SQLException e) { return -1; }
@@ -697,7 +691,7 @@ public class LogDb implements AutoCloseable {
         running = false;
         try { writer.join(5000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
         try { flushFlow(); } catch (Exception ignored) {}
-        try { writeConn.close(); } catch (SQLException ignored) {}
-        try { readConn.close(); } catch (SQLException ignored) {}
+        wdb.close();
+        rdb.close();
     }
 }

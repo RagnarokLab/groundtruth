@@ -27,7 +27,7 @@ public final class MapData {
     private final File dbFile;
     private final File tilesDir;
     private final MapColours colours;
-    private Connection ro;
+    private final DbConn ro;   // read-only, closed when idle (see DbConn)
     private final Object lock = new Object();
     // cached "visited + radius" scope (rebuilt at most every 30s; every map request asks for it)
     private volatile java.util.Set<Long> scopeCache;
@@ -39,20 +39,14 @@ public final class MapData {
         this.dbFile = new File(dataFolder, "groundtruth.db");
         this.tilesDir = tilesDir;
         this.colours = colours;
+        // busy_timeout matters because the dumpers and the plugin write to this database too; without
+        // it a momentary write lock surfaced as an HTTP 500 on the first request after a restart.
+        this.ro = new DbConn("jdbc:sqlite:file:" + dbFile.getAbsolutePath() + "?mode=ro", 45_000,
+                "PRAGMA busy_timeout=15000", "PRAGMA mmap_size=0");
     }
 
     private Connection conn() throws SQLException {
-        if (ro == null || ro.isClosed()) {
-            ro = DriverManager.getConnection("jdbc:sqlite:file:" + dbFile.getAbsolutePath() + "?mode=ro");
-            ro.setReadOnly(true);
-            // the dumpers and the plugin write to this database too; without a busy timeout a
-            // momentary write lock surfaced as an HTTP 500 on the first request after a restart
-            try (java.sql.Statement st = ro.createStatement()) {
-                st.execute("PRAGMA busy_timeout=15000");
-                st.execute("PRAGMA mmap_size=0");
-            }
-        }
-        return ro;
+        return ro.get();
     }
 
     /** Load the colour table and biome tints once, from the same files the dumper uses. */

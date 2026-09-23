@@ -21,15 +21,19 @@ import java.util.logging.Logger;
  * Concurrency (fixed 2026-09-20 after a real watchdog kill):
  *  - The DB runs in WAL mode with synchronous=NORMAL, so writers don't fsync per statement and
  *    readers never block on an in-progress write.
- *  - WRITES go through `conn` guarded by this object's monitor.
- *  - READS go through a SEPARATE `readConn` guarded by its own lock, so a `/groundtruth status`
+ *  - WRITES go through `wdb` guarded by this object's monitor.
+ *  - READS go through a SEPARATE `rdb` guarded by its own lock, so a `/groundtruth status`
  *    (or find) on the main thread can never queue behind the dump's write task and stall the
  *    server tick - which is exactly what tripped Paper's watchdog before.
  */
 public class Storage {
 
-    private Connection conn;      // writes only
-    private Connection readConn;  // reads only
+    /** How long a connection may sit unused before it is closed again. */
+    private static final long IDLE_MS = 45_000;
+
+    // Opened on first use and closed again once idle (see DbConn for why that matters).
+    private final DbConn wdb;      // writes only
+    private final DbConn rdb;      // reads only
     private final String url;
     private final Object readLock = new Object();
     private final Logger log;
@@ -41,22 +45,13 @@ public class Storage {
         }
         File dbFile = new File(dataFolder, "groundtruth.db");
         this.url = "jdbc:sqlite:" + dbFile.getAbsolutePath();
-        this.conn = DriverManager.getConnection(url);
-        this.readConn = DriverManager.getConnection(url);
-        try (Statement st = conn.createStatement()) {
-            st.execute("PRAGMA journal_mode=WAL");
-            st.execute("PRAGMA synchronous=NORMAL");
-            st.execute("PRAGMA busy_timeout=5000");
-            st.execute("PRAGMA mmap_size=0");
-            // Never memory-map the database. A long-lived process holding a stale mmap while another
-            // writer (the offline dumper) grows the file faults with SIGBUS inside the native SQLite
-            // driver - which kills the whole JVM, not just the query (crashed the server 2026-09-22).
-            st.execute("PRAGMA mmap_size=0");
-        }
-        try (Statement st = readConn.createStatement()) {
-            st.execute("PRAGMA busy_timeout=5000");
-            st.execute("PRAGMA mmap_size=0");
-        }
+        // journal_mode is persistent in the file, but setting it here keeps a freshly created
+        // database in WAL. mmap_size=0 keeps the main database file out of memory entirely.
+        this.wdb = new DbConn(url, IDLE_MS,
+                "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL",
+                "PRAGMA busy_timeout=5000", "PRAGMA mmap_size=0");
+        this.rdb = new DbConn(url, IDLE_MS,
+                "PRAGMA busy_timeout=5000", "PRAGMA mmap_size=0");
         migrate();
     }
 
@@ -68,24 +63,9 @@ public class Storage {
      */
     private synchronized void reopen() {
         log.warning("[GroundTruth] database connection went stale (likely an external dump/checkpoint) - reopening");
-        try { conn.close(); } catch (SQLException ignored) {}
-        try { readConn.close(); } catch (SQLException ignored) {}
-        try {
-            conn = DriverManager.getConnection(url);
-            readConn = DriverManager.getConnection(url);
-            try (Statement st = conn.createStatement()) {
-                st.execute("PRAGMA journal_mode=WAL");
-                st.execute("PRAGMA synchronous=NORMAL");
-                st.execute("PRAGMA busy_timeout=5000");
-            st.execute("PRAGMA mmap_size=0");
-            }
-            try (Statement st = readConn.createStatement()) {
-                st.execute("PRAGMA busy_timeout=5000");
-            st.execute("PRAGMA mmap_size=0");
-            }
-        } catch (SQLException e) {
-            log.severe("[GroundTruth] failed to reopen the database: " + e.getMessage());
-        }
+        // Drop them; the next access reopens and re-applies the pragmas.
+        wdb.close();
+        rdb.close();
     }
 
     private static boolean isStale(SQLException e) {
@@ -96,7 +76,7 @@ public class Storage {
 
     private void migrate() throws SQLException {
         synchronized (this) {
-            try (Statement st = conn.createStatement()) {
+            try (Statement st = wdb.get().createStatement()) {
                 st.execute("CREATE TABLE IF NOT EXISTS chunks (" +
                         "world TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL, " +
                         "biome TEXT, inhabited_time INTEGER, indexed_at INTEGER, " +
@@ -153,11 +133,11 @@ public class Storage {
 
     private void addColumn(String table, String col, String type) {
         try {
-            DatabaseMetaData md = conn.getMetaData();
+            DatabaseMetaData md = wdb.get().getMetaData();
             try (ResultSet rs = md.getColumns(null, null, table, col)) {
                 if (rs.next()) return;
             }
-            try (Statement st = conn.createStatement()) {
+            try (Statement st = wdb.get().createStatement()) {
                 st.execute("ALTER TABLE " + table + " ADD COLUMN " + col + " " + type);
             }
         } catch (SQLException e) {
@@ -177,7 +157,7 @@ public class Storage {
                 "ground_y=COALESCE(excluded.ground_y, chunks.ground_y)";
         synchronized (this) {
             for (int attempt = 0; attempt < 2; attempt++) {
-                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                try (PreparedStatement ps = wdb.get().prepareStatement(sql)) {
                     ps.setString(1, world);
                     ps.setInt(2, cx);
                     ps.setInt(3, cz);
@@ -209,7 +189,7 @@ public class Storage {
             for (int attempt = 0; attempt < 2; attempt++) {
                 try {
                     if (rgb != null) {
-                        try (PreparedStatement ps = conn.prepareStatement(
+                        try (PreparedStatement ps = wdb.get().prepareStatement(
                                 "INSERT OR REPLACE INTO chunk_pixels (world,cx,cz,rgb,hgt,ground_hgt) "
                                         + "VALUES (?,?,?,?,?,?)")) {
                             ps.setString(1, world);
@@ -224,7 +204,7 @@ public class Storage {
                     }
                     long now = System.currentTimeMillis() / 1000L;
                     if (voxels != null) {
-                        try (PreparedStatement ps = conn.prepareStatement(
+                        try (PreparedStatement ps = wdb.get().prepareStatement(
                                 "INSERT OR REPLACE INTO chunk_voxels (world,cx,cz,data,indexed_at) "
                                         + "VALUES (?,?,?,?,?)")) {
                             ps.setString(1, world);
@@ -236,7 +216,7 @@ public class Storage {
                         }
                     }
                     if (lods != null && !lods.isEmpty()) {
-                        try (PreparedStatement ps = conn.prepareStatement(
+                        try (PreparedStatement ps = wdb.get().prepareStatement(
                                 "INSERT OR REPLACE INTO chunk_voxels_lod (world,cx,cz,lod,data,indexed_at) "
                                         + "VALUES (?,?,?,?,?,?)")) {
                             for (java.util.Map.Entry<Integer, byte[]> e : lods.entrySet()) {
@@ -265,7 +245,7 @@ public class Storage {
     public boolean isChunkIndexed(String world, int cx, int cz) {
         synchronized (readLock) {
             String sql = "SELECT 1 FROM chunks WHERE world=? AND cx=? AND cz=?";
-            try (PreparedStatement ps = readConn.prepareStatement(sql)) {
+            try (PreparedStatement ps = rdb.get().prepareStatement(sql)) {
                 ps.setString(1, world);
                 ps.setInt(2, cx);
                 ps.setInt(3, cz);
@@ -283,7 +263,7 @@ public class Storage {
     public Set<Long> chunkKeys(String world) {
         Set<Long> out = new HashSet<>();
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement("SELECT cx, cz FROM chunks WHERE world=?")) {
+            try (PreparedStatement ps = rdb.get().prepareStatement("SELECT cx, cz FROM chunks WHERE world=?")) {
                 ps.setString(1, world);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -303,7 +283,7 @@ public class Storage {
                 "(world, type, min_x, min_y, min_z, max_x, max_y, max_z, first_seen) VALUES (?,?,?,?,?,?,?,?,?)";
         synchronized (this) {
             for (int attempt = 0; attempt < 2; attempt++) {
-                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                try (PreparedStatement ps = wdb.get().prepareStatement(sql)) {
                     ps.setString(1, world);
                     ps.setString(2, type);
                     ps.setInt(3, minX);
@@ -344,7 +324,7 @@ public class Storage {
     public List<WorldRow> worlds() {
         List<WorldRow> out = new ArrayList<>();
         synchronized (readLock) {
-            try (Statement st = readConn.createStatement();
+            try (Statement st = rdb.get().createStatement();
                  ResultSet rs = st.executeQuery(
                          "SELECT c.world, COUNT(*), "
                        + "(SELECT COUNT(*) FROM structures s WHERE s.world=c.world) "
@@ -371,7 +351,7 @@ public class Storage {
                 "min_x, min_y, min_z, max_x, max_y, max_z FROM structures WHERE world=?");
         if (typeFilter != null) sql.append(" AND type LIKE ?");
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(sql.toString())) {
+            try (PreparedStatement ps = rdb.get().prepareStatement(sql.toString())) {
                 ps.setString(1, world);
                 if (typeFilter != null) ps.setString(2, "%" + typeFilter.toUpperCase() + "%");
                 try (ResultSet rs = ps.executeQuery()) {
@@ -403,7 +383,7 @@ public class Storage {
         long now = System.currentTimeMillis() / 1000L;
         synchronized (this) {
             for (int attempt = 0; attempt < 2; attempt++) {
-                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                try (PreparedStatement ps = wdb.get().prepareStatement(sql)) {
                     ps.setString(1, uuid);
                     ps.setString(2, world);
                     ps.setInt(3, cx);
@@ -438,7 +418,7 @@ public class Storage {
         long now = System.currentTimeMillis() / 1000L;
         synchronized (this) {
             for (int attempt = 0; attempt < 2; attempt++) {
-                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                try (PreparedStatement ps = wdb.get().prepareStatement(sql)) {
                     ps.setString(1, uuid);
                     ps.setString(2, name);
                     ps.setString(3, world);
@@ -458,7 +438,7 @@ public class Storage {
 
     public boolean removeWaypoint(String uuid, String name) {
         synchronized (this) {
-            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM waypoints WHERE uuid=? AND name=?")) {
+            try (PreparedStatement ps = wdb.get().prepareStatement("DELETE FROM waypoints WHERE uuid=? AND name=?")) {
                 ps.setString(1, uuid);
                 ps.setString(2, name);
                 return ps.executeUpdate() > 0;
@@ -473,7 +453,7 @@ public class Storage {
     public List<Waypoint> listWaypoints(String uuid) {
         List<Waypoint> out = new ArrayList<>();
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(
+            try (PreparedStatement ps = rdb.get().prepareStatement(
                     "SELECT uuid,name,world,x,y,z,public FROM waypoints WHERE public=1 OR uuid=?")) {
                 ps.setString(1, uuid == null ? "" : uuid);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -498,7 +478,7 @@ public class Storage {
 
     private long count(String sql, String world) {
         synchronized (readLock) {
-            try (PreparedStatement ps = readConn.prepareStatement(sql)) {
+            try (PreparedStatement ps = rdb.get().prepareStatement(sql)) {
                 ps.setString(1, world);
                 try (ResultSet rs = ps.executeQuery()) {
                     return rs.next() ? rs.getLong(1) : 0;
@@ -510,7 +490,7 @@ public class Storage {
     }
 
     public void close() {
-        try { conn.close(); } catch (SQLException ignored) {}
-        try { readConn.close(); } catch (SQLException ignored) {}
+        wdb.close();
+        rdb.close();
     }
 }
