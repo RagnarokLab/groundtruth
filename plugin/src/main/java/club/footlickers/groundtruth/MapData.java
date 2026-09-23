@@ -45,6 +45,11 @@ public final class MapData {
                 "PRAGMA busy_timeout=15000", "PRAGMA mmap_size=0");
     }
 
+    /** Close the read connection if it has gone idle. */
+    public void closeIdle() {
+        ro.closeIfIdle();
+    }
+
     private Connection conn() throws SQLException {
         return ro.get();
     }

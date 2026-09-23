@@ -686,6 +686,12 @@ public class LogDb implements AutoCloseable {
     public long dropped() { return dropped.get(); }
     public int queueDepth() { return queue.size(); }
 
+    /** Close both connections if they have gone idle, so SQLite can checkpoint the WAL. */
+    public void closeIdle() {
+        wdb.closeIfIdle();
+        rdb.closeIfIdle();
+    }
+
     @Override
     public void close() {
         running = false;

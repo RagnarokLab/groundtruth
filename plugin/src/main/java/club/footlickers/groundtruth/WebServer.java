@@ -99,8 +99,12 @@ public final class WebServer {
         plugin.getLogger().info("[GroundTruth] web API listening on port " + port);
     }
 
-    public void stop() {
-        if (server != null) {
+    /** Let the periodic sweep close the map's read connection once it has gone idle. */
+    public void closeIdle() {
+        map.closeIdle();
+    }
+
+    public void stop() {        if (server != null) {
             server.stop(0);
             // HttpServer.stop() does NOT shut down a user-supplied executor, so without this the pool's
             // threads leaked on every /groundtruth reload.

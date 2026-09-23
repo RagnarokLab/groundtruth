@@ -23,7 +23,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     private ChunkIndexer indexer;
     private LogDb logDb;
     private WebServer web;
-    private org.bukkit.scheduler.BukkitTask playerSnapTask, heatTask, posTask, invTask, reindexTask;
+    private org.bukkit.scheduler.BukkitTask playerSnapTask, heatTask, posTask, invTask, reindexTask, idleTask;
     private BlockChangeListener blockChange;
     private MapColours colours;
     private Auth auth;
@@ -740,6 +740,15 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
                         () -> logDb.aggregateHeat(), 200L, heatSecs * 20L);
             }
         }
+
+        // Close database connections once they have been idle. SQLite cannot checkpoint the WAL while
+        // a connection is open, and a connection left open also keeps this process holding a wal-index
+        // mapping that another process may reset underneath it.
+        idleTask = getServer().getScheduler().runTaskTimerAsynchronously(this, () -> {
+            if (storage != null) storage.closeIdle();
+            if (logDb != null) logDb.closeIdle();
+            if (web != null) web.closeIdle();
+        }, 200L, 200L);
     }
 
     /** Tear down everything startComponents() created, so it can be created again cleanly. */
@@ -748,6 +757,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         if (heatTask != null) { heatTask.cancel(); heatTask = null; }
         if (posTask != null) { posTask.cancel(); posTask = null; }
         if (invTask != null) { invTask.cancel(); invTask = null; }
+        if (idleTask != null) { idleTask.cancel(); idleTask = null; }
         if (web != null) { web.stop(); web = null; }
     }
 

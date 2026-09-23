@@ -489,6 +489,12 @@ public class Storage {
         }
     }
 
+    /** Close both connections if they have gone idle, so SQLite can checkpoint the WAL. */
+    public void closeIdle() {
+        wdb.closeIfIdle();
+        rdb.closeIfIdle();
+    }
+
     public void close() {
         wdb.close();
         rdb.close();

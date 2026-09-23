@@ -54,6 +54,15 @@ final class DbConn {
         }
     }
 
+    /** Close now if it has been idle longer than the timeout. Used by the periodic sweep. */
+    void closeIfIdle() {
+        synchronized (lock) {
+            if (c != null && System.currentTimeMillis() - lastUsed > idleMillis) {
+                closeLocked();
+            }
+        }
+    }
+
     /** Close now; the next {@link #get()} reopens. */
     void close() {
         synchronized (lock) {
