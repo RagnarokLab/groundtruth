@@ -404,18 +404,36 @@ public final class WebServer {
         return sb.append("]}").toString();
     }
 
+    /**
+     * Structures for a world, in the shape the web app was written against (the legacy Python service
+     * returned the same): every structure with its bounding box, plus the world seed - the 2D map
+     * computes its slime-chunk overlay from the seed, so without it that overlay silently disappears.
+     * Passing ?x=&z= gives the nearest-N form instead, and ?type= filters by type.
+     */
     private String structures(Map<String, String> q) {
         String world = q.getOrDefault("world", "world");
         String type = q.get("type");
-        int x = intOf(q, "x", 0), z = intOf(q, "z", 0), limit = Math.min(500, intOf(q, "limit", 50));
-        List<Storage.StructureHit> hits = storage.findNearest(world, type, x, z, limit);
+        boolean nearest = q.containsKey("x") || q.containsKey("z");
+        List<Storage.StructureHit> hits = nearest
+                ? storage.findNearest(world, type, intOf(q, "x", 0), intOf(q, "z", 0),
+                        Math.min(20000, intOf(q, "limit", 50)))
+                : storage.structuresAll(world, 20000);
+        if (!nearest && type != null) {
+            String t = type.toUpperCase();
+            hits.removeIf(s -> !s.type.toUpperCase().contains(t));
+        }
+        org.bukkit.World w = org.bukkit.Bukkit.getWorld(world);
         StringBuilder sb = new StringBuilder("{\"world\":").append(LogListener.Json.str(world))
+                .append(",\"seed\":").append(w == null ? "null" : w.getSeed())
                 .append(",\"count\":").append(hits.size()).append(",\"structures\":[");
         boolean first = true;
         for (Storage.StructureHit s : hits) {
             if (!first) sb.append(',');
             first = false;
             sb.append("{\"type\":").append(LogListener.Json.str(s.type))
+              .append(",\"minX\":").append(s.minX).append(",\"minY\":").append(s.minY)
+              .append(",\"minZ\":").append(s.minZ).append(",\"maxX\":").append(s.maxX)
+              .append(",\"maxY\":").append(s.maxY).append(",\"maxZ\":").append(s.maxZ)
               .append(",\"x\":").append(s.x).append(",\"y\":").append(s.y).append(",\"z\":").append(s.z)
               .append('}');
         }

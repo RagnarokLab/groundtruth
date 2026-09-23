@@ -376,6 +376,34 @@ public class Storage {
         return dx * dx + dz * dz;
     }
 
+    /**
+     * Every structure in a world, with its bounding box and centre, for the web map. Types with more
+     * than maxPerType instances are excluded: one common type (a mod that starts a structure for every
+     * monster room) can run to over a million rows and a response far too large for the client.
+     */
+    public List<StructureHit> structuresAll(String world, int maxPerType) {
+        List<StructureHit> out = new ArrayList<>();
+        String sql = "SELECT type, (min_x+max_x)/2, (min_y+max_y)/2, (min_z+max_z)/2, "
+                + "min_x, min_y, min_z, max_x, max_y, max_z FROM structures WHERE world=? "
+                + "AND type NOT IN (SELECT type FROM structures WHERE world=? GROUP BY type HAVING COUNT(*) > ?)";
+        synchronized (readLock) {
+            try (PreparedStatement ps = rdb.get().prepareStatement(sql)) {
+                ps.setString(1, world);
+                ps.setString(2, world);
+                ps.setInt(3, maxPerType);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        out.add(new StructureHit(rs.getString(1), rs.getInt(2), rs.getInt(3), rs.getInt(4),
+                                rs.getInt(5), rs.getInt(6), rs.getInt(7), rs.getInt(8), rs.getInt(9), rs.getInt(10)));
+                    }
+                }
+            } catch (SQLException e) {
+                log.warning("[GroundTruth] structure list query failed: " + e.getMessage());
+            }
+        }
+        return out;
+    }
+
     /** Record that a player has been in a chunk (first/last seen + a visit count). Cheap upsert. */
     public void recordVisit(String uuid, String world, int cx, int cz) {
         String sql = "INSERT INTO chunk_visits (uuid,world,cx,cz,first_seen,last_seen,visits) VALUES (?,?,?,?,?,?,1) " +
