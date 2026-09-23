@@ -36,6 +36,9 @@
   let slimeToggle = null;
   let borderToggle = null;
   let showBorders = false;        // chunk grid: view-only, not a 2D map layer
+  let labelGroup = null, labelTimer = null, labelsToggle = null;
+  let showLabels = true;          // structure/waypoint/player name tags, culled to nearby
+  const labelMats = new Map();    // one canvas texture per label text, shared across sprites
   let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
   let includeUnderground = true;  // toggle: surface-only (false) vs all the way down to bedrock (true)
@@ -48,6 +51,8 @@
                                  // overlay covers a centred square inside that; slime chunks are 1 in
                                  // 10 and scattered, so nothing about the edge reads as a boundary
   const BORDER_MAX_CHUNKS = 64;  // widest span the chunk grid is drawn at, in chunks per side
+  const LABEL_RADIUS = 280;      // name tags only within this many blocks of the camera target
+  const LABEL_MAX = 60;          // ...and never more than this many on screen at once
   const VOXEL_MAX_VCHUNKS = 70;   // cap on the window, in virtual chunks (7x7 tiles of 10) - also the
                                   // span at which the tier switches from 1m to 2m blocks
   const VOXEL_MAX_VCHUNKS_LOD1 = 128; // lod 1's own cap: its tiles cover 4x the area, so reaching the
@@ -1039,6 +1044,15 @@
     borderRow.appendChild(borderToggle);
     borderRow.appendChild(document.createTextNode('chunk borders'));
     panelEl.appendChild(borderRow);
+    const labelsRow = document.createElement('label');
+    labelsRow.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;';
+    labelsToggle = document.createElement('input');
+    labelsToggle.type = 'checkbox';
+    labelsToggle.checked = showLabels;
+    labelsToggle.onchange = () => { showLabels = labelsToggle.checked; updateLabels(); };
+    labelsRow.appendChild(labelsToggle);
+    labelsRow.appendChild(document.createTextNode('name labels'));
+    panelEl.appendChild(labelsRow);
     for (const b of [depthBtn, worldBtn, islandsBtn]) {
       const hidden = b.style.display === 'none';
       b.style.cssText = 'padding:5px 8px;font-size:13px;cursor:pointer;background:#222;color:#eee;'
@@ -1062,6 +1076,7 @@
     controls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_ROTATE };
     // much calmer mouse feel
     controls.addEventListener('change', scheduleWorldRefine);
+    controls.addEventListener('change', scheduleLabels);
     controls.zoomSpeed = 0.8;  // 0.95^0.8 ~ 4% per wheel notch (was ~1%: painfully slow)
     controls.panSpeed = 0.25;
     controls.rotateSpeed = 0.4;
@@ -1252,6 +1267,7 @@
     const w0 = initialWin || 30;
     await buildWorldTier(world, c0x - w0 / 2, c0z - w0 / 2, c0x + w0 / 2, c0z + w0 / 2, true);
     addWorldMarkers();
+    updateLabels();
   }
 
   /** Load one terrain tile, meshing it small enough that no frame is ever blocked. */
@@ -1732,6 +1748,67 @@
     scene.add(markerPoints);
   }
 
+  /** A shared canvas texture for one label text, so a hundred identical "village" tags reuse it. */
+  function labelMaterial(text) {
+    if (labelMats.has(text)) return labelMats.get(text);
+    const pad = 6, fs = 12, h = 22;
+    const cv = document.createElement('canvas');
+    const measure = cv.getContext('2d');
+    measure.font = `600 ${fs}px sans-serif`;
+    cv.width = Math.max(2, Math.ceil(measure.measureText(text).width) + pad * 2);
+    cv.height = h;
+    const g = cv.getContext('2d');
+    g.font = `600 ${fs}px sans-serif`;
+    g.fillStyle = 'rgba(10,14,20,0.72)';
+    g.fillRect(0, 0, cv.width, h);
+    g.fillStyle = '#e8eef5';
+    g.textBaseline = 'middle';
+    g.fillText(text, pad, h / 2);
+    const tex = new THREE.CanvasTexture(cv);
+    tex.minFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: true, depthWrite: false });
+    mat.userData.aspect = cv.width / cv.height;
+    labelMats.set(text, mat);
+    return mat;
+  }
+
+  /**
+   * Name tags over the nearest markers: a sprite per nearby structure/waypoint/player, so the yellow
+   * dots stop being anonymous. Rebuilt on camera moves (debounced) and culled by distance, because
+   * labelling all ~30k structures at once would be a wall of overlapping text.
+   */
+  function updateLabels() {
+    if (labelGroup) { disposeGroup(labelGroup); labelGroup = null; }
+    if (!showLabels || !markerPoints || !markerPoints.userData || !markerPoints.userData.markers) return;
+    const tgt = controls.target;
+    const near = [];
+    for (const m of markerPoints.userData.markers) {
+      const dx = m.s.x - tgt.x, dz = m.s.z - tgt.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < LABEL_RADIUS * LABEL_RADIUS) near.push([d2, m]);
+    }
+    if (!near.length) return;
+    near.sort((a, b) => a[0] - b[0]);
+    labelGroup = new THREE.Group();
+    for (let i = 0; i < Math.min(LABEL_MAX, near.length); i++) {
+      const m = near[i][1];
+      const mat = labelMaterial(m.s.type);
+      const sp = new THREE.Sprite(mat);
+      const H = 7;
+      sp.position.set(m.s.x, m.s.y * WORLD_YSCALE + 7, m.s.z);
+      sp.scale.set(H * mat.userData.aspect, H, 1);
+      labelGroup.add(sp);
+    }
+    scene.add(labelGroup);
+  }
+
+  /** Debounced so a drag does not rebuild the tags on every frame. */
+  function scheduleLabels() {
+    clearTimeout(labelTimer);
+    labelTimer = setTimeout(updateLabels, 250);
+  }
+
   /** One chunk's square outline on the surface, lifted clear of the terrain so it cannot z-fight. */
   function pushSquareEdges(out, cx, cz, y, lift) {
     const x0 = cx * 16, z0 = cz * 16, x1 = x0 + 16, z1 = z0 + 16, yy = y + lift;
@@ -1976,6 +2053,7 @@
     window.removeEventListener('resize', onResize);
     window.removeEventListener('keydown', onKey);
     if (refineTimer) { clearTimeout(refineTimer); refineTimer = null; }
+    if (labelTimer) { clearTimeout(labelTimer); labelTimer = null; }
     // Take the 3D layer down FIRST so the 2D map always comes back, even if a three.js/WebGL
     // dispose throws underneath us. (The canvas used to come off at the very end, so one throwing
     // dispose left the 3D view stuck on screen and the "2D map" button looking dead.)
@@ -1988,6 +2066,7 @@
     if (popupEl) { popupEl.remove(); popupEl = null; }
     if (panelEl) { panelEl.remove(); panelEl = null; }
     bboxToggle = null; bboxColor = null; lastVoxWindow = null; slimeToggle = null; borderToggle = null;
+    labelsToggle = null;
     try {
       if (atlasTex) { atlasTex.dispose(); atlasTex = null; }
       if (animTex) { animTex.dispose(); animTex = null; }
@@ -1996,6 +2075,9 @@
       disposeWorldGroup();
       disposeVoxelGroup();
       if (overlayGroup) { disposeGroup(overlayGroup); overlayGroup = null; }
+      if (labelGroup) { disposeGroup(labelGroup); labelGroup = null; }
+      for (const mat of labelMats.values()) { if (mat.map) mat.map.dispose(); mat.dispose(); }
+      labelMats.clear();
       if (worldMat) { worldMat.dispose(); worldMat = null; }
       if (renderer) renderer.dispose();
       if (controls) controls.dispose();
