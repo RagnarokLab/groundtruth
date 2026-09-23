@@ -30,6 +30,7 @@
   let renderer = null, scene = null, camera = null, controls = null;
   let raf = null, canvas = null, closeBtn = null, statusEl = null;
   let markerPoints = null, popupEl = null, downXY = null;
+  let overlayGroup = null;        // structure outlines etc: rebuilt per level, disposed with it
   let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
   let includeUnderground = true;  // toggle: surface-only (false) vs all the way down to bedrock (true)
@@ -1577,6 +1578,51 @@
       underground: false, kind: p.kind,
     }));
     scene.add(markerPoints);
+    clearOverlays();
+    if (worldLevel) addStructureBoxes(worldLevel.cx0, worldLevel.cz0, worldLevel.cx1, worldLevel.cz1);
+  }
+
+  /** Drop the previous overlays' geometry; they are rebuilt per level. */
+  function clearOverlays() {
+    if (!overlayGroup) return;
+    for (const c of overlayGroup.children.slice()) {
+      overlayGroup.remove(c);
+      if (c.geometry) c.geometry.dispose();
+      if (c.material) c.material.dispose();
+    }
+  }
+
+  /**
+   * Structure outlines for the visible window, as line geometry - the same boxes the 2D map strokes,
+   * following the same toggle and colour. Drawn at runtime rather than baked into the tiles: a
+   * structure can be discovered at any time, and a baked box would go stale the moment it is.
+   */
+  function addStructureBoxes(cx0, cz0, cx1, cz1) {
+    if (!window.GT || !window.GT.getStructures || !window.GT.showBboxes || !window.GT.showBboxes()) return;
+    const structs = window.GT.getStructures() || [];
+    if (!structs.length) return;
+    if (!overlayGroup) { overlayGroup = new THREE.Group(); scene.add(overlayGroup); }
+    const verts = [];
+    const EDGES = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+    for (const s of structs) {
+      if (!s || s.minX === undefined) continue;                   // nearest-N shape: no box to draw
+      if (s.maxX < cx0 * 16 || s.minX > (cx1 + 1) * 16) continue;  // outside the visible window
+      if (s.maxZ < cz0 * 16 || s.minZ > (cz1 + 1) * 16) continue;
+      const x0 = s.minX, x1 = s.maxX + 1, y0 = s.minY, y1 = s.maxY + 1;
+      const z0 = s.minZ, z1 = s.maxZ + 1;
+      const c = [
+        [x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1],
+        [x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1],
+      ];
+      for (const [a, b] of EDGES) verts.push(...c[a], ...c[b]);
+    }
+    if (!verts.length) return;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    overlayGroup.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
+      color: new THREE.Color(window.GT.bboxColor ? window.GT.bboxColor() : '#ffd25c'),
+      transparent: true, opacity: 0.6,
+    })));
   }
 
   async function addMarkers(vox, baseY, cx0, cz0) {
@@ -1606,6 +1652,8 @@
       markerPoints.userData.markers = pts;
       scene.add(markerPoints);
     }
+    clearOverlays();
+    addStructureBoxes(cx0, cz0, cx0 + VOXEL_CHUNKS - 1, cz0 + VOXEL_CHUNKS - 1);
   }
 
   // Arrow keys / WASD move the view in the horizontal plane (Q/E for up-down). Speed scales with
@@ -1673,6 +1721,7 @@
       backdropGroup = null;
       disposeWorldGroup();
       disposeVoxelGroup();
+      if (overlayGroup) { disposeGroup(overlayGroup); overlayGroup = null; }
       if (worldMat) { worldMat.dispose(); worldMat = null; }
       if (renderer) renderer.dispose();
       if (controls) controls.dispose();

@@ -1065,6 +1065,9 @@ window.GT = {
   getPlayers: () => players,
   getWaypoints: () => waypoints,
   getCenter: () => ({ cx: panX, cz: panZ }),
+  // the 3D view draws the same information, so it follows the same switches and colours as the 2D map
+  showBboxes: () => toggleBboxesEl.checked,
+  bboxColor: () => settings.bboxColor,
   on3DClose: () => draw(),
 };
 document.getElementById('view3dBtn').addEventListener('click', () => {
