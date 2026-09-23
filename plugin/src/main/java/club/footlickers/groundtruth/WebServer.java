@@ -129,7 +129,9 @@ public final class WebServer {
               .append(",\"y\":").append(round(p.getLocation().getY()))
               .append(",\"z\":").append(round(p.getLocation().getZ()))
               .append(",\"world\":").append(LogListener.Json.str(p.getWorld().getName()))
+              .append(",\"dimension\":").append(LogListener.Json.str(p.getWorld().getEnvironment().name()))
               .append(",\"health\":").append(round(p.getHealth()))
+              .append(",\"hearts\":").append(round(p.getHealth() / 2.0))
               .append(",\"food\":").append(p.getFoodLevel())
               .append('}');
         }
@@ -763,9 +765,29 @@ public final class WebServer {
     private String spawns(Map<String, String> q) {
         int minutes = Math.max(1, intOf(q, "minutes", 30));
         int limit = Math.min(200, Math.max(1, intOf(q, "limit", 20)));
+        String player = q.get("player");
+        int radius = Math.max(0, intOf(q, "radius", 0));
         long since = System.currentTimeMillis() - minutes * 60_000L;
-        List<LogDb.Event> rows = logDb.recent("mob-spawn", null, null, since, limit);
+        // With a filter, fetch a wider window than asked for so the filter cannot starve the result.
+        List<LogDb.Event> rows = logDb.recent("mob-spawn", null, null, since,
+                player == null ? limit : Math.min(2000, limit * 20));
+        if (player != null) {
+            rows.removeIf(e -> {
+                if (!metaRaw(e.meta, "nearestPlayer").equalsIgnoreCase(player)) return true;
+                if (radius <= 0) return false;
+                String d = metaNum(e.meta, "nearestPlayerDist");
+                if ("null".equals(d)) return false;
+                try {
+                    return Double.parseDouble(d) > radius;
+                } catch (NumberFormatException ex) {
+                    return false;
+                }
+            });
+            if (rows.size() > limit) rows = rows.subList(0, limit);
+        }
         StringBuilder sb = new StringBuilder("{\"window_minutes\":").append(minutes)
+                .append(",\"player\":").append(player == null ? "null" : LogListener.Json.str(player))
+                .append(",\"radius\":").append(radius)
                 .append(",\"count\":").append(rows.size()).append(",\"spawns\":[");
         boolean first = true;
         for (LogDb.Event e : rows) {

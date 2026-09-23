@@ -1565,6 +1565,9 @@
       }
     }
     if (!pts.length) return;
+    // drop the previous markers first: rebuilding them on every open without this leaked a whole
+    // Points geometry + material per view
+    if (markerPoints) { scene.remove(markerPoints); markerPoints.geometry.dispose(); markerPoints.material.dispose(); }
     markerPoints = new THREE.Points(
       new THREE.BufferGeometry().setFromPoints(
         pts.map((p) => new THREE.Vector3(p.x, p.y * WORLD_YSCALE + 3, p.z))),
@@ -1596,6 +1599,7 @@
       pts.push({ pos: new THREE.Vector3(lx - N_CHUNKS * 8, surf - baseY, lz - N_CHUNKS * 8), s, underground: s.y < surf - 3 });
     }
     if (pts.length) {
+      if (markerPoints) { scene.remove(markerPoints); markerPoints.geometry.dispose(); markerPoints.material.dispose(); }
       markerPoints = new THREE.Points(
         new THREE.BufferGeometry().setFromPoints(pts.map((p) => p.pos)),
         new THREE.PointsMaterial({ color: 0xffd25c, size: 12, sizeAttenuation: true }));
