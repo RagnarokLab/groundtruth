@@ -55,7 +55,7 @@
   let backdropGroup = null;      // at most ONE previous level, kept behind the active one
   let coreGroup = null;           // fine (lod 0) detail island kept in the middle at coarse tiers
   let coreLevel = null;           // { cx0, cz0, cx1, cz1 } that core covers, in real chunks
-  let lastBiomeStats = null;      // temporary diagnostic: what biome data a build actually received
+  let lastBiomeStats = null;      // HUD readout: biome coverage and tint-table size of the last build
   let worldLevel = null;          // { key, cell, cx0, cz0, cx1, cz1 } that group covers
   let worldBounds = null;         // world chunk bounds (from a cheap probe request)
   let worldMat = null;
@@ -1064,8 +1064,8 @@
   /**
    * Two stages, in real blocks: 1m for the detail layer and 2m for the low-res one around it. Every
    * level is the same renderer and the same textures, so zooming out looks like Minecraft getting
-   * chunkier, not like a different kind of map. 4m and beyond is deliberately not used: at that size
-   * real builds (the spawn tower) collapse into a couple of blocks.
+   * chunkier, not like a different kind of map. 4m and beyond is not used: at that cell size narrow
+   * structures (towers, masts, thin walls) collapse into a block or two.
    */
   function tierFor(spanChunks) {
     // pick the finest level whose window still covers what is on screen, so a ~1100-block view is
@@ -1144,8 +1144,8 @@
    * racing the very large responses (a whole-area /api/voxels, atlas.png, multi-MB .gtmesh tiles)
    * for the plugin's web thread pool. When the small fetch lost that race it rejected, and
    * `.catch(() => ({}))` silently substituted an EMPTY tint table - so grass/leaves/water (whose
-   * textures are greyscale) rendered uncoloured for that entire load. Move away and back and it
-   * re-rolled the dice, which is exactly the intermittent "loads coloured / doesn't" symptom.
+   * textures are greyscale) rendered uncoloured for that entire load. Fetching them once, with
+   * retries, and before the heavy requests removes the race.
    */
   let voxAssetsPromise = null;
   function fetchJsonRetry(url, tries) {
@@ -1266,7 +1266,7 @@
       }
     }
     // Nearest tiles first, so if the face budget binds it drops the far edge rather than the ground
-    // under your feet.
+    // under the camera.
     const midTx = (vx0 + vx1) / 2, midTz = (vz0 + vz1) / 2;
     tileList.sort((a, b) => (Math.abs(a[0] - midTx) + Math.abs(a[1] - midTz))
                           - (Math.abs(b[0] - midTx) + Math.abs(b[1] - midTz)));
@@ -1284,7 +1284,7 @@
         if (faces >= budget) { lastProblem = 'face budget reached'; return; }
         const tx = tileList[i][0], tz = tileList[i][1];
         // Coarse levels are a RING around the finer level still on screen: never draw over it, or the
-        // near field is covered with low-detail (and currently untinted) geometry.
+        // near field is covered with low-detail geometry that carries no per-chunk biome tint.
         if (exclude) {
           const rx0 = tx * 16 * f, rz0 = tz * 16 * f;
           const rx1 = (tx + N_CHUNKS) * 16 * f, rz1 = (tz + N_CHUNKS) * 16 * f;
@@ -1393,7 +1393,7 @@
     // Cover what is on screen, capped so an extreme zoom-out cannot ask for an absurd number of tiles.
     // Cap the window in REAL chunks too: the level's own data is what costs, and asking a server to
     // cover thousands of chunks on the fly would stall. 256 real chunks a side is 4096 blocks, which
-    // is the far edge we agreed on.
+    // is the far edge of the loaded view.
     const winReal = Math.min(spanChunks, VOXEL_MAX_REAL_CHUNKS);
     // lod 1 gets a wider window than lod 0: its tiles are 4x the area, so it can reach the same 256
     // real chunks with ~1/4 the tiles - which is what lets the low-res ring fill the screen.
@@ -1407,8 +1407,8 @@
 
     // Fine island in the middle: at a coarse tier the tier's own level is only
     // a backdrop for the distance, and real blocks stay where you are actually looking. Sized to a
-    // share of the view, face-capped, and dropped once the view is so wide that fine blocks would
-    // cover almost none of it - that is the only point at which lod 0 "fades out".
+    // share of the view and face-capped, so a wide view drops it once fine blocks would cover too
+    // little of the screen to justify their cost.
     let coreWin = null;
     if (lod > 0 && spanChunks <= CORE_DROP_SPAN) {
       const n = Math.max(N_CHUNKS, Math.min(CORE_MAX_CHUNKS, Math.round(spanChunks * CORE_SPAN_FRACTION)));
@@ -1491,8 +1491,8 @@
    * Rebuild the terrain at the resolution the current zoom calls for.
    *
    * Driven by OrbitControls' 'change' event with a short trailing timer, rather than polled from the
-   * render loop: the rebuild is a main-thread job, so we only ever want one, and only once the user
-   * has actually stopped moving. Polling tied the timing to the frame rate, which starved on slow
+   * render loop: the rebuild is a main-thread job, so only one runs at a time, and only once the
+   * camera has stopped moving. Polling tied the timing to the frame rate, which starved on slow
    * machines (and a mid-gesture rebuild was what made the map hitch).
    */
   function scheduleWorldRefine() {
