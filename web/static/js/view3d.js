@@ -42,6 +42,7 @@
   let trailGroup = null, trailToggle = null;
   let showTrail = false;          // the logged-in player's own path, login-gated
   let legendEl = null;
+  let bottomBar = null;           // one bar holding the status line and the legend
   let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
   let includeUnderground = true;  // toggle: surface-only (false) vs all the way down to bedrock (true)
@@ -879,7 +880,7 @@
     if (!statusEl) return;
     ensureStatusStyles();
     statusEl.id = 'gt3d-status';
-    statusEl.style.cssText = 'position:fixed;bottom:12px;left:12px;z-index:101;font:13px sans-serif;'
+    statusEl.style.cssText = 'font:13px sans-serif;pointer-events:auto;'
       + 'background:rgba(0,0,0,0.6);padding:6px 10px;border-radius:4px;color:#cfe;';
     statusEl.textContent = '';
     if (kind === 'busy') {
@@ -980,7 +981,11 @@
     };
     document.body.appendChild(islandsBtn);
     statusEl = document.createElement('div');
-    document.body.appendChild(statusEl);
+    bottomBar = document.createElement('div');
+    bottomBar.style.cssText = 'position:fixed;left:12px;right:12px;bottom:12px;z-index:101;display:flex;'
+      + 'justify-content:space-between;align-items:flex-end;gap:10px;pointer-events:none;';
+    bottomBar.appendChild(statusEl);
+    document.body.appendChild(bottomBar);
     setStatus('busy', 'loading terrain\u2026');
 
     // Controls for the 3D view itself. The layer switches are the 2D map's own (read and written
@@ -1082,7 +1087,7 @@
 
     // What the overlay colours mean, now that there are several of them on the map at once.
     legendEl = document.createElement('div');
-    legendEl.style.cssText = 'position:fixed;bottom:12px;right:12px;z-index:101;background:rgba(0,0,0,0.6);'
+    legendEl.style.cssText = 'pointer-events:auto;background:rgba(0,0,0,0.6);'
       + 'border:1px solid #666;border-radius:6px;padding:6px 10px;font:12px sans-serif;color:#ddd;'
       + 'display:flex;flex-direction:column;gap:3px;';
     const legendTitle = document.createElement('div');
@@ -1104,7 +1109,7 @@
       row.appendChild(document.createTextNode(label));
       legendEl.appendChild(row);
     }
-    document.body.appendChild(legendEl);
+    bottomBar.appendChild(legendEl);
 
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: worldView });
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
@@ -2165,6 +2170,7 @@
     if (statusEl) { statusEl.remove(); statusEl = null; }
     if (popupEl) { popupEl.remove(); popupEl = null; }
     if (panelEl) { panelEl.remove(); panelEl = null; }
+    if (bottomBar) { bottomBar.remove(); bottomBar = null; }
     if (legendEl) { legendEl.remove(); legendEl = null; }
     bboxToggle = null; bboxColor = null; lastVoxWindow = null; slimeToggle = null; borderToggle = null;
     labelsToggle = null; trailToggle = null;
