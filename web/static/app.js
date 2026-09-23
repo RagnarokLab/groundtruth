@@ -1105,6 +1105,9 @@ window.GT = {
       return d.points || [];
     } catch (e) { return []; }
   },
+  // the WorldEdit-style pos1/pos2 wand selection, so the 3D view shows the same region
+  getSelection: () => (pos1 && pos2 ? { pos1, pos2 } : null),
+  selectionColor: () => settings.selectionColor,
   on3DClose: () => draw(),
 };
 document.getElementById('view3dBtn').addEventListener('click', () => {

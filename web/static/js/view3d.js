@@ -1951,6 +1951,7 @@
     if (worldLevel) {
       const l = worldLevel;
       addStructureBoxes(l.cx0, l.cz0, l.cx1, l.cz1);
+      addSelectionBox();
       const slimeOn = !!(window.GT && window.GT.showSlime && window.GT.showSlime()
                          && window.GT.canShowSlime && window.GT.canShowSlime());
       // Past a certain span the chunk lines merge into a wash, so the borders are only offered while
@@ -1987,6 +1988,39 @@
     }
   }
 
+  /** Push the 12 edges of an axis-aligned box, so boxes of any kind share one definition. */
+  function pushBoxEdges(out, x0, y0, z0, x1, y1, z1) {
+    const c = [
+      [x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1],
+      [x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1],
+    ];
+    for (const [a, b] of [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]]) {
+      out.push(...c[a], ...c[b]);
+    }
+  }
+
+  /**
+   * The 2D map's wand selection (a pos1/pos2 pair carrying x and z only) as a full-height outline,
+   * so the region picked on the map is visible in 3D. The selection has no y, so the box spans the
+   * world's height rather than implying a depth the selection does not have.
+   */
+  function addSelectionBox() {
+    if (!window.GT || !window.GT.getSelection) return;
+    const sel = window.GT.getSelection();
+    if (!sel || !sel.pos1 || !sel.pos2) return;
+    const x0 = Math.min(sel.pos1[0], sel.pos2[0]), x1 = Math.max(sel.pos1[0], sel.pos2[0]) + 1;
+    const z0 = Math.min(sel.pos1[1], sel.pos2[1]), z1 = Math.max(sel.pos1[1], sel.pos2[1]) + 1;
+    const verts = [];
+    pushBoxEdges(verts, x0, worldMinY, z0, x1, worldMinY + 384, z1);
+    if (!overlayGroup) { overlayGroup = new THREE.Group(); scene.add(overlayGroup); }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    overlayGroup.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
+      color: new THREE.Color(window.GT.selectionColor ? window.GT.selectionColor() : '#ffd25c'),
+      transparent: true, opacity: 0.9,
+    })));
+  }
+
   /**
    * Structure outlines for the visible window, as line geometry - the same boxes the 2D map strokes,
    * following the same toggle and colour. Drawn at runtime rather than baked into the tiles: a
@@ -1998,18 +2032,11 @@
     if (!structs.length) return;
     if (!overlayGroup) { overlayGroup = new THREE.Group(); scene.add(overlayGroup); }
     const verts = [];
-    const EDGES = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
     for (const s of structs) {
       if (!s || s.minX === undefined) continue;                   // nearest-N shape: no box to draw
       if (s.maxX < cx0 * 16 || s.minX > (cx1 + 1) * 16) continue;  // outside the visible window
       if (s.maxZ < cz0 * 16 || s.minZ > (cz1 + 1) * 16) continue;
-      const x0 = s.minX, x1 = s.maxX + 1, y0 = s.minY, y1 = s.maxY + 1;
-      const z0 = s.minZ, z1 = s.maxZ + 1;
-      const c = [
-        [x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1],
-        [x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1],
-      ];
-      for (const [a, b] of EDGES) verts.push(...c[a], ...c[b]);
+      pushBoxEdges(verts, s.minX, s.minY, s.minZ, s.maxX + 1, s.maxY + 1, s.maxZ + 1);
     }
     if (!verts.length) return;
     const geo = new THREE.BufferGeometry();
