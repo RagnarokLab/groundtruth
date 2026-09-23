@@ -41,6 +41,7 @@
   const labelMats = new Map();    // one canvas texture per label text, shared across sprites
   let trailGroup = null, trailToggle = null;
   let showTrail = false;          // the logged-in player's own path, login-gated
+  let legendEl = null;
   let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
   let includeUnderground = true;  // toggle: surface-only (false) vs all the way down to bedrock (true)
@@ -1078,6 +1079,32 @@
       panelEl.appendChild(b);
     }
     document.body.appendChild(panelEl);
+
+    // What the overlay colours mean, now that there are several of them on the map at once.
+    legendEl = document.createElement('div');
+    legendEl.style.cssText = 'position:fixed;bottom:12px;right:12px;z-index:101;background:rgba(0,0,0,0.6);'
+      + 'border:1px solid #666;border-radius:6px;padding:6px 10px;font:12px sans-serif;color:#ddd;'
+      + 'display:flex;flex-direction:column;gap:3px;';
+    const legendTitle = document.createElement('div');
+    legendTitle.textContent = 'legend';
+    legendTitle.style.cssText = 'font-weight:bold;opacity:0.75;';
+    legendEl.appendChild(legendTitle);
+    const legendRows = [
+      ['#3ce65a', 'slime chunk'],
+      ['#ffffff', 'chunk border'],
+      ['#ffd25c', 'marker / trail'],
+    ];
+    if (window.GT && window.GT.selectionColor) legendRows.push([window.GT.selectionColor(), 'selection']);
+    for (const [col, label] of legendRows) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:6px;';
+      const sw = document.createElement('span');
+      sw.style.cssText = `width:10px;height:10px;border-radius:2px;background:${col};display:inline-block;`;
+      row.appendChild(sw);
+      row.appendChild(document.createTextNode(label));
+      legendEl.appendChild(row);
+    }
+    document.body.appendChild(legendEl);
 
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: worldView });
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
@@ -2138,6 +2165,7 @@
     if (statusEl) { statusEl.remove(); statusEl = null; }
     if (popupEl) { popupEl.remove(); popupEl = null; }
     if (panelEl) { panelEl.remove(); panelEl = null; }
+    if (legendEl) { legendEl.remove(); legendEl = null; }
     bboxToggle = null; bboxColor = null; lastVoxWindow = null; slimeToggle = null; borderToggle = null;
     labelsToggle = null; trailToggle = null;
     try {
