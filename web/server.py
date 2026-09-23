@@ -258,23 +258,32 @@ def where(player, radius, limit):
     return data
 
 
+def _service_key():
+    # The plugin's own service credential, read from its config so this service never holds a second
+    # copy; the RCON relay for players/worlds is gone in favour of the plugin's HTTP API.
+    try:
+        with open("/opt/minecraft/plugins/GroundTruth/config.yml") as fh:
+            for line in fh:
+                if line.startswith("service-key:"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _plugin(path):
+    # GET the plugin's HTTP API on localhost - the authoritative source now that the RCON relay is
+    # gone. Returns the parsed JSON object, or {} when the plugin is not answering.
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8095" + path, timeout=15) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return {}
+
+
 def worlds():
-    # Authoritative list from the plugin (Bukkit.getWorlds()), via RCON - so custom
-    # dimensions (BentoBox, Incendium, parkour) show up without hardcoding.
-    raw = rcon_cmd("groundtruth worlds")
-    payload = raw.split("GTWORLDS|", 1)[-1]
-    out = []
-    for seg in payload.split(";"):
-        seg = seg.strip()
-        if seg.count(",") < 3:
-            continue
-        name, env, chunks, structs = seg.split(",", 3)
-        try:
-            out.append({"world": name, "env": env,
-                        "chunks": int(chunks), "structures": int(structs)})
-        except ValueError:
-            continue
-    return {"worlds": out}
+    # Authoritative list from the plugin over HTTP (its DB + Bukkit world list), not RCON.
+    return {"worlds": (_plugin("/api/worlds") or {}).get("worlds") or []}
 
 
 def _default_world():
@@ -551,27 +560,21 @@ def last_attack(minutes=10):
 
 
 def players():
-    raw = rcon_cmd("groundtruth players")
-    payload = raw.split("GTPLAYERS|", 1)[-1]
-    envs = {w["world"]: w["env"] for w in (worlds().get("worlds") or [])}
+    # Live player list from the plugin over HTTP; map its field names to what the rest of this
+    # service has always returned (env rather than dimension, floats for x/y/z, etc).
+    key = _service_key()
+    data = _plugin("/api/players?key=" + urllib.parse.quote(key)) if key else {}
     out = []
-    for seg in payload.split(";"):
-        seg = seg.strip()
-        if seg.count(",") < 5:
-            continue
-        parts = seg.split(",")
-        name, uuid, x, y, z, world = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
-        name = name.lstrip(".")  # Floodgate bedrock prefix
+    for p in data.get("players") or []:
         try:
-            rec = {"name": name, "uuid": uuid, "x": float(x), "y": float(y),
-                   "z": float(z), "world": world, "env": envs.get(world)}
-            # added 2026-09-21: health/food so "what just attacked me" can say how close to death
-            if len(parts) > 6 and parts[6]:
-                rec["health"] = float(parts[6])
-            if len(parts) > 7 and parts[7]:
-                rec["food"] = int(parts[7])
-            out.append(rec)
-        except ValueError:
+            out.append({
+                "name": (p.get("name") or "").lstrip("."),  # Floodgate bedrock prefix
+                "uuid": p.get("uuid"),
+                "x": float(p.get("x")), "y": float(p.get("y")), "z": float(p.get("z")),
+                "world": p.get("world"), "env": p.get("dimension"),
+                "health": p.get("health"), "food": p.get("food"),
+            })
+        except (TypeError, ValueError):
             continue
     return {"players": out}
 

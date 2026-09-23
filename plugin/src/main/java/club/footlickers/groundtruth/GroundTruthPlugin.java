@@ -169,7 +169,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|link|logstatus|reload> ..."
+            sender.sendMessage("Usage: /groundtruth <dump|stop|status|pos|find|portal|slime|lookup|rollback|link|logstatus|reload> ..."
                     + "  (reload re-reads config.yml; a new JAR needs a server restart)");
             return true;
         }
@@ -180,12 +180,8 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
                 return handleStop(sender, args);
             case "status":
                 return handleStatus(sender, args);
-            case "worlds":
-                return handleWorlds(sender, args);
             case "pos":
                 return handlePos(sender, args);
-            case "players":
-                return handlePlayers(sender, args);
             case "find":
                 return handleFind(sender, args);
             case "portal":
@@ -207,7 +203,7 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
             case "reload":
                 return handleReload(sender, args);
             default:
-                sender.sendMessage("Unknown subcommand. Usage: /groundtruth <dump|stop|status|worlds|pos|players|find|portal|slime|lookup|rollback|link|logstatus> ...");
+                sender.sendMessage("Unknown subcommand. Usage: /groundtruth <dump|stop|status|pos|find|portal|slime|lookup|rollback|link|logstatus> ...");
                 return true;
         }
     }
@@ -407,18 +403,6 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         return true;
     }
 
-    /** Machine-readable list of every loaded world (the map's dimension selector reads this via RCON). */
-    private boolean handleWorlds(CommandSender sender, String[] args) {
-        StringBuilder sb = new StringBuilder("GTWORLDS|");
-        for (World w : Bukkit.getWorlds()) {
-            sb.append(w.getName()).append(",").append(w.getEnvironment().name()).append(",")
-              .append(storage.countChunks(w.getName())).append(",")
-              .append(storage.countStructures(w.getName())).append(";");
-        }
-        sender.sendMessage(sb.toString());
-        return true;
-    }
-
     /** Live player position + the REAL name of the world they're in (no name assumptions). */
     private boolean handlePos(CommandSender sender, String[] args) {
         if (args.length < 2) {
@@ -433,28 +417,6 @@ public class GroundTruthPlugin extends JavaPlugin implements CommandExecutor {
         Location loc = p.getLocation();
         sender.sendMessage(String.format("GTPOS|%s|%.1f|%.1f|%.1f",
                 p.getWorld().getName(), loc.getX(), loc.getY(), loc.getZ()));
-        return true;
-    }
-
-    /**
-     * Machine-readable list of every online player: name, uuid, x, y, z, world, health, food.
-     * Health and food are here so a question like "what just attacked me" can be answered with how
-     * close to death the player actually is.
-     */
-    private boolean handlePlayers(CommandSender sender, String[] args) {
-        StringBuilder sb = new StringBuilder("GTPLAYERS|");
-        for (Player p : Bukkit.getOnlinePlayers()) {
-            Location l = p.getLocation();
-            sb.append(p.getName()).append(",")
-              .append(p.getUniqueId()).append(",")
-              .append(String.format("%.1f", l.getX())).append(",")
-              .append(String.format("%.1f", l.getY())).append(",")
-              .append(String.format("%.1f", l.getZ())).append(",")
-              .append(p.getWorld().getName()).append(",")
-              .append(String.format("%.1f", p.getHealth())).append(",")
-              .append(p.getFoodLevel()).append(";");
-        }
-        sender.sendMessage(sb.toString());
         return true;
     }
 
