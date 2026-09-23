@@ -39,6 +39,8 @@
   let labelGroup = null, labelTimer = null, labelsToggle = null;
   let showLabels = true;          // structure/waypoint/player name tags, culled to nearby
   const labelMats = new Map();    // one canvas texture per label text, shared across sprites
+  let trailGroup = null, trailToggle = null;
+  let showTrail = false;          // the logged-in player's own path, login-gated
   let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
   let includeUnderground = true;  // toggle: surface-only (false) vs all the way down to bedrock (true)
@@ -53,6 +55,7 @@
   const BORDER_MAX_CHUNKS = 64;  // widest span the chunk grid is drawn at, in chunks per side
   const LABEL_RADIUS = 280;      // name tags only within this many blocks of the camera target
   const LABEL_MAX = 60;          // ...and never more than this many on screen at once
+  const TRAIL_HOURS = 12;        // window of a player's own trail to draw
   const VOXEL_MAX_VCHUNKS = 70;   // cap on the window, in virtual chunks (7x7 tiles of 10) - also the
                                   // span at which the tier switches from 1m to 2m blocks
   const VOXEL_MAX_VCHUNKS_LOD1 = 128; // lod 1's own cap: its tiles cover 4x the area, so reaching the
@@ -1053,6 +1056,20 @@
     labelsRow.appendChild(labelsToggle);
     labelsRow.appendChild(document.createTextNode('name labels'));
     panelEl.appendChild(labelsRow);
+    const trailRow = document.createElement('label');
+    trailRow.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;color:#ffd25c;';
+    trailToggle = document.createElement('input');
+    trailToggle.type = 'checkbox';
+    trailToggle.checked = showTrail;
+    if (!(window.GT && window.GT.hasLogin && window.GT.hasLogin())) {
+      trailToggle.disabled = true;
+      trailRow.style.opacity = '0.5';
+      trailRow.title = 'your trail needs a login (the endpoint only returns your own track)';
+    }
+    trailToggle.onchange = () => { showTrail = trailToggle.checked; updateTrail(); };
+    trailRow.appendChild(trailToggle);
+    trailRow.appendChild(document.createTextNode('my trail'));
+    panelEl.appendChild(trailRow);
     for (const b of [depthBtn, worldBtn, islandsBtn]) {
       const hidden = b.style.display === 'none';
       b.style.cssText = 'padding:5px 8px;font-size:13px;cursor:pointer;background:#222;color:#eee;'
@@ -1268,6 +1285,7 @@
     await buildWorldTier(world, c0x - w0 / 2, c0z - w0 / 2, c0x + w0 / 2, c0z + w0 / 2, true);
     addWorldMarkers();
     updateLabels();
+    updateTrail();
   }
 
   /** Load one terrain tile, meshing it small enough that no frame is ever blocked. */
@@ -1809,6 +1827,34 @@
     labelTimer = setTimeout(updateLabels, 250);
   }
 
+  /**
+   * The logged-in player's own trail, drawn as a line through the real logged positions (each point
+   * carries its own height, so the path follows them into caves rather than being draped on the
+   * surface). Login-gated: the endpoint only ever returns the caller's own track.
+   */
+  async function updateTrail() {
+    if (trailGroup) {
+      trailGroup.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+      scene.remove(trailGroup);
+      trailGroup = null;
+    }
+    if (!showTrail || !window.GT || !window.GT.fetchTrail) return;
+    const pts = await window.GT.fetchTrail(TRAIL_HOURS).catch(() => []);
+    if (!showTrail || !pts || pts.length < 2) return;   // toggled off while fetching, or nothing to draw
+    const vs = pts.map((p) => new THREE.Vector3(p[0], p[1] + 1, p[2]));
+    trailGroup = new THREE.Group();
+    trailGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(vs),
+      new THREE.LineBasicMaterial({ color: 0xffd25c })));
+    // start and end, matching the 2D trail's green/orange ends
+    for (const [v, col] of [[vs[0], 0x8adf6b], [vs[vs.length - 1], 0xff8a5c]]) {
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(3, 8, 6),
+        new THREE.MeshBasicMaterial({ color: col }));
+      dot.position.copy(v);
+      trailGroup.add(dot);
+    }
+    scene.add(trailGroup);
+  }
+
   /** One chunk's square outline on the surface, lifted clear of the terrain so it cannot z-fight. */
   function pushSquareEdges(out, cx, cz, y, lift) {
     const x0 = cx * 16, z0 = cz * 16, x1 = x0 + 16, z1 = z0 + 16, yy = y + lift;
@@ -2066,7 +2112,7 @@
     if (popupEl) { popupEl.remove(); popupEl = null; }
     if (panelEl) { panelEl.remove(); panelEl = null; }
     bboxToggle = null; bboxColor = null; lastVoxWindow = null; slimeToggle = null; borderToggle = null;
-    labelsToggle = null;
+    labelsToggle = null; trailToggle = null;
     try {
       if (atlasTex) { atlasTex.dispose(); atlasTex = null; }
       if (animTex) { animTex.dispose(); animTex = null; }
@@ -2076,6 +2122,7 @@
       disposeVoxelGroup();
       if (overlayGroup) { disposeGroup(overlayGroup); overlayGroup = null; }
       if (labelGroup) { disposeGroup(labelGroup); labelGroup = null; }
+      if (trailGroup) { disposeGroup(trailGroup); trailGroup = null; }
       for (const mat of labelMats.values()) { if (mat.map) mat.map.dispose(); mat.dispose(); }
       labelMats.clear();
       if (worldMat) { worldMat.dispose(); worldMat = null; }

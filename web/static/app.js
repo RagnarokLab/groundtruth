@@ -1094,6 +1094,17 @@ window.GT = {
   isSlime: (cx, cz) => isSlimeChunk(worldSeed, cx, cz),
   // slime chunks only exist in overworld-type dimensions, and the seed is needed to compute them
   canShowSlime: () => currentEnv === 'NORMAL' && worldSeed != null,
+  // a player's own trail is login-gated, exactly as the 2D trail layer is
+  hasLogin: () => !!localStorage.getItem('gt_code'),
+  fetchTrail: async (hours) => {
+    const code = localStorage.getItem('gt_code');
+    if (!code) return [];
+    try {
+      const d = await (await fetch('/api/track?code=' + encodeURIComponent(code)
+        + '&hours=' + (hours || 12))).json();
+      return d.points || [];
+    } catch (e) { return []; }
+  },
   on3DClose: () => draw(),
 };
 document.getElementById('view3dBtn').addEventListener('click', () => {
