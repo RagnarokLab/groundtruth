@@ -46,6 +46,10 @@
   #selection div { padding: 1px 0; }
   #selection button { margin-top: 4px; font-size: 11px; font-family: sans-serif; }
 
+  #view { min-width: 180px; }
+  #view .panel-header { font-family: sans-serif; }
+  #view label { display: block; margin-top: 4px; font-family: sans-serif; }
+
   #typesPanel { bottom: 8px; right: 8px; width: 260px; max-height: 50vh; display: flex; flex-direction: column; }
   #typesPanel .panel-body { display: flex; flex-direction: column; overflow: hidden; flex: 1; }
   #typesPanel input[type=text] { width: 100%; box-sizing: border-box; margin: 4px 0; }
@@ -137,11 +141,17 @@
       <div id="ow-coords">overworld: -, -</div>
       <div id="nether-coords" style="display:none">nether: -, -</div>
       <div id="hover-biome">biome: -</div>
+      <div style="margin-top:4px;font-size:11px;color:#aaa">tap a structure for info &middot; press &amp; hold to select area</div>
+    </div>
+  </div>
+
+  <div id="view" class="panel">
+    <div class="panel-header"><span>View</span><button class="panel-collapse-btn">&minus;</button></div>
+    <div class="panel-body">
       <label><input type="checkbox" id="toggleNether"> show nether coords</label>
       <label><input type="checkbox" id="toggleBboxes"> show structure bounding boxes</label>
       <label><input type="checkbox" id="toggleSlime"> show slime chunks</label>
       <label><input type="checkbox" id="toggleBiomeOverlay"> show biome overlay</label>
-      <div style="margin-top:4px;font-size:11px;color:#aaa">tap a structure for info &middot; press &amp; hold to select area</div>
     </div>
   </div>
 
