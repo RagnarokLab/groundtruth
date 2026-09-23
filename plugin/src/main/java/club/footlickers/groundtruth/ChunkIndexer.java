@@ -90,8 +90,13 @@ public class ChunkIndexer {
         Material surfaceMat = maxSurfaceY == Integer.MIN_VALUE
                 ? Material.AIR : snap.getBlockType(maxX, maxSurfaceY, maxZ);
         String surfaceBlockKey = surfaceMat.getKey().toString();
+        // MUST use the 3-arg getBiome: the 2-arg (x,z) form is the pre-1.18 legacy call, deprecated
+        // because "biomes are now 3-dimensional", and it resolves at a fixed low Y - so it reported
+        // the biome *underground* (usually a cave biome) instead of the one at the surface. That fed
+        // wrong grass/foliage/water tints into the 2D map, the live 3D mesh and every prerendered
+        // tile. Sample at the surface block's own Y, which is what the offline dumper does.
         Biome biome = maxSurfaceY == Integer.MIN_VALUE
-                ? snap.getBiome(8, 8) : snap.getBiome(maxX, maxZ);
+                ? snap.getBiome(8, world.getSeaLevel(), 8) : snap.getBiome(maxX, maxSurfaceY, maxZ);
         long inhabitedTime = chunk.getInhabitedTime();
 
         Integer groundY = null;

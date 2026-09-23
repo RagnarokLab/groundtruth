@@ -49,6 +49,7 @@ public final class MapData {
             // momentary write lock surfaced as an HTTP 500 on the first request after a restart
             try (java.sql.Statement st = ro.createStatement()) {
                 st.execute("PRAGMA busy_timeout=15000");
+                st.execute("PRAGMA mmap_size=0");
             }
         }
         return ro;
@@ -396,7 +397,8 @@ public final class MapData {
     public java.util.Set<Long> visitedScope(String world, int radius) {
         long now = System.currentTimeMillis();
         java.util.Set<Long> cached = scopeCache;
-        if (cached != null && world.equals(scopeCacheWorld) && now - scopeCacheAt < 30_000) {
+        if (cached != null && world.equals(scopeCacheWorld) && radius == scopeCacheRadius
+                && now - scopeCacheAt < 300_000) {
             return cached;
         }
         java.util.Set<Long> out = new java.util.HashSet<>();
@@ -407,8 +409,15 @@ public final class MapData {
                 ps.setString(1, world);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        int cx = rs.getInt(1), cz = rs.getInt(2);
                         inhabited++;
-                        out.add(((long) rs.getInt(1) << 32) ^ (rs.getInt(2) & 0xffffffffL));
+                        // buffer: the map extends `radius` chunks past anywhere a player has been, so
+                        // it doesn't end abruptly at the edge of the explored area.
+                        for (int dx = -radius; dx <= radius; dx++) {
+                            for (int dz = -radius; dz <= radius; dz++) {
+                                out.add(((long) (cx + dx) << 32) ^ ((cz + dz) & 0xffffffffL));
+                            }
+                        }
                     }
                 }
             } catch (Exception e) {

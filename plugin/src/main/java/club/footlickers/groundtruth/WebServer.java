@@ -102,6 +102,12 @@ public final class WebServer {
     public void stop() {
         if (server != null) {
             server.stop(0);
+            // HttpServer.stop() does NOT shut down a user-supplied executor, so without this the pool's
+            // threads leaked on every /groundtruth reload.
+            java.util.concurrent.Executor ex = server.getExecutor();
+            if (ex instanceof java.util.concurrent.ExecutorService) {
+                ((java.util.concurrent.ExecutorService) ex).shutdownNow();
+            }
             server = null;
         }
     }
@@ -459,11 +465,15 @@ public final class WebServer {
         int[] vmeta = new int[5];
         List<Object[]> rows = map.voxels(world, intOf(q, "cx0", 0), intOf(q, "cz0", 0),
                 intOf(q, "cx1", 0), intOf(q, "cz1", 0), lod, vmeta);
-        // lod 0 hands back real chunks, so we can attach each one's biome (drives grass/foliage/water
-        // tinting in the 3D view). Higher levels are merged virtual chunks with no single biome.
-        java.util.Map<Long, String> biomes = (lod == 0)
-                ? map.biomes(world, intOf(q, "cx0", 0), intOf(q, "cz0", 0), intOf(q, "cx1", 0), intOf(q, "cz1", 0))
-                : null;
+        int bc0 = intOf(q, "cx0", 0), bz0 = intOf(q, "cz0", 0),
+            bc1 = intOf(q, "cx1", 0), bz1 = intOf(q, "cz1", 0);
+        int k = 1 << lod;
+        // Attach a biome to every chunk so the 3D view can tint grass/foliage/water. lod 0 returns real
+        // chunks; coarser levels are merged virtual chunks, so each takes the biome of the real chunk at
+        // its centre (falling back to the first non-null inside the block it covers). Without this the
+        // coarse levels came back with no biome at all and rendered untinted.
+        java.util.Map<Long, String> biomes = map.biomes(world, bc0 * k, bz0 * k,
+                bc1 * k + k - 1, bz1 * k + k - 1);
         // "only show what we've seen": drop anything outside the visited+radius scope, using the same
         // rule the 2D renderer uses so the whole map agrees. null scope = filtering off / nothing seen yet.
         java.util.Set<Long> scope = renderOnlyVisited ? map.visitedScope(world, visitedRadius) : null;
@@ -478,9 +488,20 @@ public final class WebServer {
             if (scope != null && !inScope(scope, lod, (Integer) r[0], (Integer) r[1])) continue;
             if (!first) sb.append(',');
             first = false;
-            String biome = (biomes != null)
-                    ? biomes.get(((long) (Integer) r[0] << 32) ^ ((Integer) r[1] & 0xffffffffL))
-                    : null;
+            String biome;
+            if (lod == 0) {
+                biome = biomes.get(((long) (Integer) r[0] << 32) ^ ((Integer) r[1] & 0xffffffffL));
+            } else {
+                int rcx = (Integer) r[0] * k, rcz = (Integer) r[1] * k;
+                biome = biomes.get(((long) (rcx + (k >> 1)) << 32) ^ ((rcz + (k >> 1)) & 0xffffffffL));
+                if (biome == null) {
+                    for (int dx = 0; dx < k && biome == null; dx++) {
+                        for (int dz = 0; dz < k && biome == null; dz++) {
+                            biome = biomes.get(((long) (rcx + dx) << 32) ^ ((rcz + dz) & 0xffffffffL));
+                        }
+                    }
+                }
+            }
             sb.append("{\"cx\":").append((Integer) r[0]).append(",\"cz\":").append((Integer) r[1])
               .append(",\"biome\":").append(biome == null ? "null" : LogListener.Json.str(biome))
               .append(",\"data\":\"")

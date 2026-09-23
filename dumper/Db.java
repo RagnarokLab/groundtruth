@@ -51,6 +51,8 @@ public class Db implements AutoCloseable {
             st.execute("PRAGMA journal_mode=WAL");
             st.execute("PRAGMA synchronous=NORMAL");
             st.execute("PRAGMA busy_timeout=10000");
+            // no mmap: a stale mapping faults SIGBUS in native SQLite and kills the JVM
+            st.execute("PRAGMA mmap_size=0");
         }
         migrate();
         chunkPs = conn.prepareStatement(

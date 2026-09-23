@@ -52,9 +52,11 @@ public class LogDb implements AutoCloseable {
             st.execute("PRAGMA journal_mode=WAL");
             st.execute("PRAGMA synchronous=NORMAL");
             st.execute("PRAGMA busy_timeout=10000");
+            st.execute("PRAGMA mmap_size=0");
         }
         try (Statement st = readConn.createStatement()) {
             st.execute("PRAGMA busy_timeout=5000");
+            st.execute("PRAGMA mmap_size=0");
         }
         migrate();
         writer = new Thread(this::writerLoop, "GroundTruth-LogWriter");

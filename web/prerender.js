@@ -36,10 +36,19 @@ function parseVoxel(buf) {
   return { pal, cols };
 }
 
-async function fetchJSON(host, url) {
-  const r = await fetch(host + url);
-  if (!r.ok) throw new Error(url + ' -> ' + r.status);
-  return r.json();
+async function fetchJSON(host, url, tries) {
+  tries = tries || 6;
+  try {
+    const r = await fetch(host + url);
+    if (!r.ok) throw new Error(url + ' -> ' + r.status);
+    return r.json();
+  } catch (e) {
+    // A long backfill must survive a transient failure (e.g. the server restarting to apply a plugin
+    // change) instead of dying a few hundred tiles in.
+    if (tries <= 1) throw e;
+    await new Promise((res) => setTimeout(res, 1500 * (7 - tries)));
+    return fetchJSON(host, url, tries - 1);
+  }
 }
 
 async function main() {

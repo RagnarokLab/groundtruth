@@ -269,8 +269,13 @@ public final class Dumper {
             ps.setString(1, world);
             try (java.sql.ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
+                    int cx = rs.getInt(1), cz = rs.getInt(2);
                     inhabited++;
-                    out.add(((long) rs.getInt(1) << 32) ^ (rs.getInt(2) & 0xffffffffL));
+                    for (int dx = -radius; dx <= radius; dx++) {
+                        for (int dz = -radius; dz <= radius; dz++) {
+                            out.add(((long) (cx + dx) << 32) ^ ((cz + dz) & 0xffffffffL));
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
@@ -282,7 +287,8 @@ public final class Dumper {
             System.out.println("visited filter: no inhabited chunks recorded - dumping everything");
             return null;
         }
-        System.out.println("visited filter: " + inhabited + " inhabited chunk(s) in scope");
+        System.out.println("visited filter: " + inhabited + " inhabited chunk(s) -> " + out.size()
+                + " in scope (+" + radius + " chunk buffer)");
         return out;
     }
 

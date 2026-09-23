@@ -11,24 +11,25 @@
  *   i32    baseY
  *   then the opaque mesh, then the water mesh (if flagged). Each mesh:
  *     u32  vertexCount V
- *     per vertex (30 bytes):  pos f32*3, uv f32*2, col u8*3, nor i8*3, atile u8*4
+ *     per vertex (34 bytes):  pos f32*3, uv f32*2, col u8*3, nor i8*3, atile u16*4
  *     water only: per vertex aanim f32*3 (strip row, frame count, fps)
  *   (non-indexed on purpose: the greedy mesher already merges faces, and 6 verts/face keeps the
  *    client loader trivial. Indexing is a later size optimisation.)
  *
- * Quantisation is deliberately visually lossless: colour/normal/atile carry 1/255..1/127 steps.
+ * Quantisation is deliberately visually lossless: colour/normal carry 1/255..1/127 steps; the atlas rect must be u16 (a u8 bleeds the neighbouring tile).
  */
 'use strict';
 const zlib = require('zlib');
 
-const MAGIC = 'GTM1';
+const MAGIC = 'GTM2';   // GTM1 = u8 atlas rect (bled the neighbour), GTM2 = u16
 
 function i8(n) { n = Math.round(n); return n < -128 ? -128 : n > 127 ? 127 : n; }
 function u8(n) { n = Math.round(n); return n < 0 ? 0 : n > 255 ? 255 : n; }
+function u16(n) { n = Math.round(n); return n < 0 ? 0 : n > 65535 ? 65535 : n; }
 
 function encodeMesh(mesh, withAanim) {
   const V = mesh.pos.length / 3;
-  const stride = 3 * 4 + 2 * 4 + 3 + 3 + 4 + (withAanim ? 3 * 4 : 0);
+  const stride = 3 * 4 + 2 * 4 + 3 + 3 + 8 + (withAanim ? 3 * 4 : 0);
   const buf = Buffer.alloc(4 + V * stride);
   let o = 0;
   buf.writeUInt32LE(V, o); o += 4;
@@ -44,10 +45,12 @@ function encodeMesh(mesh, withAanim) {
     buf.writeInt8(i8(mesh.nor[i * 3] * 127), o); o += 1;
     buf.writeInt8(i8(mesh.nor[i * 3 + 1] * 127), o); o += 1;
     buf.writeInt8(i8(mesh.nor[i * 3 + 2] * 127), o); o += 1;
-    buf.writeUInt8(u8(mesh.atile[i * 4] * 255), o); o += 1;
-    buf.writeUInt8(u8(mesh.atile[i * 4 + 1] * 255), o); o += 1;
-    buf.writeUInt8(u8(mesh.atile[i * 4 + 2] * 255), o); o += 1;
-    buf.writeUInt8(u8(mesh.atile[i * 4 + 3] * 255), o); o += 1;
+    // atlas rect as u16 (1/65535): a u8 quantises a 0.03-wide rect by ~0.5 texel and bleeds the
+    // neighbouring atlas tile along every block edge
+    buf.writeUInt16LE(u16(mesh.atile[i * 4] * 65535), o); o += 2;
+    buf.writeUInt16LE(u16(mesh.atile[i * 4 + 1] * 65535), o); o += 2;
+    buf.writeUInt16LE(u16(mesh.atile[i * 4 + 2] * 65535), o); o += 2;
+    buf.writeUInt16LE(u16(mesh.atile[i * 4 + 3] * 65535), o); o += 2;
     if (withAanim) {
       buf.writeFloatLE(mesh.aanim[i * 3], o); o += 4;
       buf.writeFloatLE(mesh.aanim[i * 3 + 1], o); o += 4;
@@ -70,7 +73,7 @@ function encodeTile(mesh) {
 
 function decodeMesh(buf, start, withAanim) {
   const V = buf.readUInt32LE(start);
-  const stride = 3 * 4 + 2 * 4 + 3 + 3 + 4 + (withAanim ? 3 * 4 : 0);
+  const stride = 3 * 4 + 2 * 4 + 3 + 3 + 8 + (withAanim ? 3 * 4 : 0);
   const mesh = { pos: [], uv: [], col: [], nor: [], atile: [], aanim: withAanim ? [] : null };
   let o = start + 4;
   for (let i = 0; i < V; i++) {
@@ -78,8 +81,8 @@ function decodeMesh(buf, start, withAanim) {
     mesh.uv.push(buf.readFloatLE(o), buf.readFloatLE(o + 4)); o += 8;
     mesh.col.push(buf.readUInt8(o) / 255, buf.readUInt8(o + 1) / 255, buf.readUInt8(o + 2) / 255); o += 3;
     mesh.nor.push(buf.readInt8(o) / 127, buf.readInt8(o + 1) / 127, buf.readInt8(o + 2) / 127); o += 3;
-    mesh.atile.push(buf.readUInt8(o) / 255, buf.readUInt8(o + 1) / 255,
-      buf.readUInt8(o + 2) / 255, buf.readUInt8(o + 3) / 255); o += 4;
+    mesh.atile.push(buf.readUInt16LE(o) / 65535, buf.readUInt16LE(o + 2) / 65535,
+      buf.readUInt16LE(o + 4) / 65535, buf.readUInt16LE(o + 6) / 65535); o += 8;
     if (withAanim) {
       mesh.aanim.push(buf.readFloatLE(o), buf.readFloatLE(o + 4), buf.readFloatLE(o + 8)); o += 12;
     }

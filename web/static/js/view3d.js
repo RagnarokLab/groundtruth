@@ -13,6 +13,9 @@
   'use strict';
 
   const N_CHUNKS = 10;      // voxel area side length in chunks (160 blocks)
+  // Hard ceiling on faces per level. With the compact geometry ~3M faces is ~350 MB, so this is a
+  // runaway guard (far tiles get dropped) rather than a normal limit.
+  const MAX_LEVEL_FACES = 3500000;   // the ring gets MAX - CORE, i.e. ~2.5M for the lod 1 backdrop
   const TILE = 16;
   // the 16 dye colours (RGB 0..1) - banner flags are tinted by their base colour
   const DYE_COLOURS = {
@@ -35,19 +38,32 @@
   let worldStep = 4;              // chunk decimation in world mode (4 -> 64-block cells)
   const WORLD_YSCALE = 1;         // TRUE proportions - GroundTruth shows the world as it actually is
   let worldIslands = true;        // draw sky islands as real floating geometry
-  const VOXEL_MAX_VCHUNKS = 70;   // cap on the window, in virtual chunks (7x7 tiles of 10)
+  const VOXEL_MAX_VCHUNKS = 70;   // cap on the window, in virtual chunks (7x7 tiles of 10) - also the
+                                  // span at which the tier switches from 1m to 2m blocks
+  const VOXEL_MAX_VCHUNKS_LOD1 = 128; // lod 1's own cap: its tiles cover 4x the area, so reaching the
+                                      // same 256 real chunks costs ~1/4 the tiles and can fill the screen
   const VOXEL_MAX_REAL_CHUNKS = 256; // cap on the window in real chunks (4096 blocks across)
+  const CORE_MAX_CHUNKS = 30;        // fine detail island at coarse tiers: up to 3x3 lod-0 tiles
+  const CORE_DROP_SPAN = 700;        // ...dropped once the view spans more chunks than this
+  const CORE_FACE_BUDGET = 1000000;  // ...and never allowed to eat more than this many faces
+  const CORE_SPAN_FRACTION = 0.4;    // ...sized to this share of the visible span
   const VOXEL_CHUNKS = 12;        // chunks per side of the real-block window
   const TILE_CELLS = 256;         // cells per tile side (~65k cells, still only a few ms to mesh).
                                   // Bigger tiles mean far fewer requests, which matters much more than
                                   // mesh time on a slow link.
   let worldGroup = null;          // THREE.Group holding the terrain tiles for the active level
   let backdropGroup = null;      // at most ONE previous level, kept behind the active one
+  let coreGroup = null;           // fine (lod 0) detail island kept in the middle at coarse tiers
+  let coreLevel = null;           // { cx0, cz0, cx1, cz1 } that core covers, in real chunks
+  let lastBiomeStats = null;      // temporary diagnostic: what biome data a build actually received
   let worldLevel = null;          // { key, cell, cx0, cz0, cx1, cz1 } that group covers
   let worldBounds = null;         // world chunk bounds (from a cheap probe request)
   let worldMat = null;
   let worldLoading = false;
   let voxelGroup = null;          // the real-block mesh that takes over once you are close enough
+  // cache-buster for the prerendered tiles: they are rewritten in place by the prerenderer, and with
+  // no version the browser keeps serving the old bytes (the atlas already does this).
+  const TILES_V = Date.now();
   let voxAtlas = null, voxTints = null, voxModels = null, voxMat = null, voxWaterMat = null;
   let voxMatBg = null, voxWaterMatBg = null;   // pushed-back copies for the level that is now backdrop
   let worldMinY = -64;
@@ -105,7 +121,10 @@
   /** Parse a prerendered .gtmesh tile (already inflated). Mirrors gt_tile.js's on-disk layout. */
   function parseTile(buf) {
     const d = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    let o = 4;                                            // "GTM1"
+    // GTM1 stored the atlas rect as a u8, which quantised it by ~0.5 texel and bled the neighbouring
+    // atlas tile along every block edge; GTM2 uses u16. Accept both so a re-render can run live.
+    const atile16 = d.getUint8(3) === 0x32;               // '2'
+    let o = 4;
     const hasWater = d.getUint8(o) === 1; o += 1;
     const baseY = d.getInt32(o, true); o += 4;
     const read = (withAanim) => {
@@ -116,8 +135,13 @@
         b.uv.push(d.getFloat32(o, true), d.getFloat32(o + 4, true)); o += 8;
         b.col.push(d.getUint8(o) / 255, d.getUint8(o + 1) / 255, d.getUint8(o + 2) / 255); o += 3;
         b.nor.push(d.getInt8(o) / 127, d.getInt8(o + 1) / 127, d.getInt8(o + 2) / 127); o += 3;
-        b.atile.push(d.getUint8(o) / 255, d.getUint8(o + 1) / 255,
-          d.getUint8(o + 2) / 255, d.getUint8(o + 3) / 255); o += 4;
+        if (atile16) {
+          b.atile.push(d.getUint16(o, true) / 65535, d.getUint16(o + 2, true) / 65535,
+            d.getUint16(o + 4, true) / 65535, d.getUint16(o + 6, true) / 65535); o += 8;
+        } else {
+          b.atile.push(d.getUint8(o) / 255, d.getUint8(o + 1) / 255,
+            d.getUint8(o + 2) / 255, d.getUint8(o + 3) / 255); o += 4;
+        }
         if (withAanim) { b.aanim.push(d.getFloat32(o, true), d.getFloat32(o + 4, true), d.getFloat32(o + 8, true)); o += 12; }
       }
       return b;
@@ -127,15 +151,53 @@
     return { opaque, water, baseY };
   }
 
-  /** BufferGeometry from a mesher bucket - the same attributes the live mesher emits. */
+  /**
+   * BufferGeometry from a mesher bucket, in the smallest form three.js accepts. The mesher emits 6
+   * vertices per face (two triangles); we index it down to the quad's 4 corners, and store colour,
+   * normal and atlas-rect as compact normalised integers instead of floats. Both are visually
+   * lossless, but a full lod-0 window was ~3 GB of plain JS number arrays + float attributes before
+   * this, which is what killed phone browsers.
+   */
   function geoFromBucket(b) {
+    const faces = Math.floor(b.pos.length / 18);        // 6 verts x 3 floats per face
     const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(b.pos, 3));
-    g.setAttribute('uv', new THREE.Float32BufferAttribute(b.uv, 2));
-    g.setAttribute('color', new THREE.Float32BufferAttribute(b.col, 3));
-    g.setAttribute('normal', new THREE.Float32BufferAttribute(b.nor, 3));
-    g.setAttribute('atile', new THREE.Float32BufferAttribute(b.atile, 4));
-    if (b.aanim) g.setAttribute('aanim', new THREE.Float32BufferAttribute(b.aanim, 3));
+    if (!faces) return g;
+    const n = faces * 4;
+    const pos = new Float32Array(n * 3);
+    const uv = new Float32Array(n * 2);
+    const col = new Uint8Array(n * 3);
+    const nor = new Int8Array(n * 3);
+    const atile = new Uint16Array(n * 4);         // u16 (1/65535): a u8 quantises a 0.03-wide atlas
+                                                  // rect by ~2 texels and bleeds the neighbouring tile
+    const aanim = b.aanim ? new Float32Array(n * 3) : null;
+    const index = n > 65535 ? new Uint32Array(faces * 6) : new Uint16Array(faces * 6);
+    let v = 0, ix = 0;
+    for (let f = 0; f < faces; f++) {
+      const s = f * 6;
+      const corners = [s, s + 1, s + 2, s + 5];         // v0,v1,v2,v5 are the quad's unique corners
+      for (let k = 0; k < 4; k++) {
+        const i = corners[k], o = v * 3, o2 = v * 2, o4 = v * 4;
+        pos[o] = b.pos[i * 3]; pos[o + 1] = b.pos[i * 3 + 1]; pos[o + 2] = b.pos[i * 3 + 2];
+        uv[o2] = b.uv[i * 2]; uv[o2 + 1] = b.uv[i * 2 + 1];
+        col[o] = b.col[i * 3] * 255; col[o + 1] = b.col[i * 3 + 1] * 255; col[o + 2] = b.col[i * 3 + 2] * 255;
+        nor[o] = b.nor[i * 3] * 127; nor[o + 1] = b.nor[i * 3 + 1] * 127; nor[o + 2] = b.nor[i * 3 + 2] * 127;
+        atile[o4] = b.atile[i * 4] * 65535; atile[o4 + 1] = b.atile[i * 4 + 1] * 65535;
+        atile[o4 + 2] = b.atile[i * 4 + 2] * 65535; atile[o4 + 3] = b.atile[i * 4 + 3] * 65535;
+        if (aanim) {
+          aanim[o] = b.aanim[i * 3]; aanim[o + 1] = b.aanim[i * 3 + 1]; aanim[o + 2] = b.aanim[i * 3 + 2];
+        }
+        v++;
+      }
+      index[ix++] = v - 4; index[ix++] = v - 3; index[ix++] = v - 2;
+      index[ix++] = v - 4; index[ix++] = v - 2; index[ix++] = v - 1;
+    }
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    g.setAttribute('color', new THREE.BufferAttribute(col, 3, true));
+    g.setAttribute('normal', new THREE.BufferAttribute(nor, 3, true));
+    g.setAttribute('atile', new THREE.BufferAttribute(atile, 4, true));
+    if (aanim) g.setAttribute('aanim', new THREE.BufferAttribute(aanim, 3));
+    g.setIndex(new THREE.BufferAttribute(index, 1));
     return g;
   }
 
@@ -283,6 +345,8 @@
     const gpal = [''];                             // 1-based name list
     const gid = new Map();
     const biome2d = new Array(AX * AZ).fill(null);
+    lastBiomeStats = { chunks: data.chunks.length, withBiome: 0,
+                       tintKeys: biomeTints ? Object.keys(biomeTints).length : -1 };
     const infoCache = new Map();
     const specials = []; // fallback shapes for blocks with no compiled model
     const MODELS = (bmodels && bmodels.models) || {};
@@ -318,6 +382,7 @@
       const bx = (c.cx - cx0) * 16, bz = (c.cz - cz0) * 16;
       if (bx < 0 || bz < 0 || bx + 15 >= AX || bz + 15 >= AZ) continue;
       const biome = c.biome;
+      if (biome) lastBiomeStats.withBiome++;
       for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) biome2d[(bz + z) * AX + (bx + x)] = biome;
       const pal = c._pal;
       for (let zi = 0; zi < 16; zi++) {
@@ -762,17 +827,7 @@
     };
     for (const [mx, my, mz, idName] of modelBlocks) { bucket = opaque; renderModel(mx, my, mz, idName); }
 
-    const makeGeo = (b) => {
-      const g = new THREE.BufferGeometry();
-      g.setAttribute('position', new THREE.Float32BufferAttribute(b.pos, 3));
-      g.setAttribute('uv', new THREE.Float32BufferAttribute(b.uv, 2));
-      g.setAttribute('color', new THREE.Float32BufferAttribute(b.col, 3));
-      g.setAttribute('normal', new THREE.Float32BufferAttribute(b.nor, 3));
-      g.setAttribute('atile', new THREE.Float32BufferAttribute(b.atile, 4));
-      if (b.aanim) g.setAttribute('aanim', new THREE.Float32BufferAttribute(b.aanim, 3));
-      return g;
-    };
-    return { geo: makeGeo(opaque), waterGeo: makeGeo(water), baseY };
+    return { geo: geoFromBucket(opaque), waterGeo: geoFromBucket(water), baseY };
   }
 
   /**
@@ -872,13 +927,11 @@
       try { await loadWorldView(world, centerCx, centerCz); } catch (e) { statusEl.textContent = '3D world load failed: ' + e.message; }
     } else try {
       const AV = Date.now(); // atlas/biome JSON change when regenerated; bypass the 1h tile cache
-      const [atlas, biomeTints, bmodels, vox] = await Promise.all([
-        fetch(`/tiles/atlas.json?v=${AV}`).then((r) => r.json()),
-        fetch(`/tiles/biome_tints.json?v=${AV}`).then((r) => r.json()).catch(() => ({})),
-        fetch(`/tiles/blockmodels.json?v=${AV}`).then((r) => r.json()).catch(() => ({})),
-        fetch(`/api/voxels?world=${encodeURIComponent(world)}&cx0=${cx0}&cz0=${cz0}&cx1=${cx1}&cz1=${cz1}`)
-          .then((r) => r.json()),
-      ]);
+      // Small mesher assets FIRST (cached + retried), then the heavy voxel response: the tint table
+      // must never lose a race against a whole-area voxels fetch, or the whole load comes out grey.
+      const { atlas, tints: biomeTints, bmodels } = await loadVoxAssets();
+      const vox = await fetch(`/api/voxels?world=${encodeURIComponent(world)}&cx0=${cx0}&cz0=${cz0}&cx1=${cx1}&cz1=${cz1}`)
+        .then((r) => r.json());
       if (!vox.chunks || !vox.chunks.length) {
         statusEl.textContent = 'no voxel data for this area yet';
         animate();
@@ -916,11 +969,13 @@
         shader.vertexShader = 'attribute vec4 atile;\nvarying vec4 vAtile;\n' + shader.vertexShader;
         shader.vertexShader = shader.vertexShader.replace(
           '#include <uv_vertex>', '#include <uv_vertex>\n  vAtile = atile;');
-        shader.fragmentShader = 'varying vec4 vAtile;\n' + shader.fragmentShader;
+        shader.uniforms.uAtileTexel = { value: new THREE.Vector2(1 / (atlas.cols * 16), 1 / (atlas.rows * 16)) };
+        shader.fragmentShader = 'varying vec4 vAtile;\nuniform vec2 uAtileTexel;\n' + shader.fragmentShader;
         shader.fragmentShader = shader.fragmentShader.replace(
           '#include <map_fragment>',
           '#ifdef USE_MAP\n'
-          + '  vec2 gtu = vAtile.xy + fract(vUv) * (vAtile.zw - vAtile.xy);\n'
+          // inset half a texel so a block edge can never sample the neighbouring atlas tile
+          + '  vec2 gtu = vAtile.xy + uAtileTexel * 0.5 + fract(vUv) * (vAtile.zw - vAtile.xy - uAtileTexel);\n'
           + '  vec4 sampledDiffuseColor = texture2D(map, gtu);\n'
           + '  diffuseColor *= sampledDiffuseColor;\n'
           + '#endif');
@@ -971,7 +1026,7 @@
       controls.minDistance = maxDim * 0.1;
       controls.maxDistance = fitDist * 6;
       controls.update();
-      const faces = geo.getAttribute('position').count / 6;
+      const faces = (geo.index ? geo.index.count : geo.getAttribute('position').count) / 6;
       statusEl.textContent = `${vox.chunks.length} chunks \u00b7 ${N_CHUNKS * 16}\u00b2 blocks \u00b7 ${faces.toLocaleString()} faces \u00b7 drag to orbit`;
 
       await addMarkers(vox, baseY, cx0, cz0);
@@ -1007,15 +1062,16 @@
 
   /** Which tier covers a span of N chunks, and at what resolution. */
   /**
-   * The LOD ladder, in real blocks the whole way: 1m -> 2m -> 4m -> 8m -> 16m. Every level is the
-   * same renderer and the same textures, so zooming out looks like Minecraft getting chunkier, not
-   * like a different kind of map.
+   * Two stages, in real blocks: 1m for the detail layer and 2m for the low-res one around it. Every
+   * level is the same renderer and the same textures, so zooming out looks like Minecraft getting
+   * chunkier, not like a different kind of map. 4m and beyond is deliberately not used: at that size
+   * real builds (the spawn tower) collapse into a couple of blocks.
    */
   function tierFor(spanChunks) {
     // pick the finest level whose window still covers what is on screen, so a ~1100-block view is
-    // still 1m blocks and 16m blocks only appear past ~9000 blocks
+    // still 1m blocks and 2m blocks only appear past that
     let lod = 0, f = 1;
-    while (f * VOXEL_MAX_VCHUNKS < spanChunks && lod < 4) { lod++; f *= 2; }
+    while (f * VOXEL_MAX_VCHUNKS < spanChunks && lod < 1) { lod++; f *= 2; }
     return { kind: 'vox', lod, key: 'v' + lod };
   }
 
@@ -1071,10 +1127,8 @@
   }
 
   function disposeWorldGroup() {
-    if (!worldGroup) return;
-    for (const m of worldGroup.children) m.geometry.dispose();
-    scene.remove(worldGroup);
-    worldGroup = null;
+    if (coreGroup) { disposeGroup(coreGroup); coreGroup = null; coreLevel = null; }
+    if (worldGroup) { disposeGroup(worldGroup); worldGroup = null; }
   }
 
   /**
@@ -1082,15 +1136,46 @@
    * makes the voxel surface win the depth test against the coarse heightfield still underneath it, so
    * the fine mesh can be laid on top without z-fighting and without punching holes.
    */
+  /**
+   * Fetch + cache the small mesher assets (atlas index, biome tints, block models) ONCE per page
+   * load, with retries, and load them BEFORE the heavy requests.
+   *
+   * Why: these files are tiny, but they used to be re-fetched on every 3D open inside a Promise.all
+   * racing the very large responses (a whole-area /api/voxels, atlas.png, multi-MB .gtmesh tiles)
+   * for the plugin's web thread pool. When the small fetch lost that race it rejected, and
+   * `.catch(() => ({}))` silently substituted an EMPTY tint table - so grass/leaves/water (whose
+   * textures are greyscale) rendered uncoloured for that entire load. Move away and back and it
+   * re-rolled the dice, which is exactly the intermittent "loads coloured / doesn't" symptom.
+   */
+  let voxAssetsPromise = null;
+  function fetchJsonRetry(url, tries) {
+    return fetch(url).then((r) => {
+      if (!r.ok) throw new Error(url + ' -> ' + r.status);
+      return r.json();
+    }).catch((e) => {
+      if (tries <= 1) throw e;
+      return new Promise((res) => setTimeout(res, 200 * (5 - tries)))
+        .then(() => fetchJsonRetry(url, tries - 1));
+    });
+  }
+  function loadVoxAssets() {
+    if (!voxAssetsPromise) {
+      const AV = Date.now();
+      voxAssetsPromise = Promise.all([
+        fetchJsonRetry(`/tiles/atlas.json?v=${AV}`, 4),
+        fetchJsonRetry(`/tiles/biome_tints.json?v=${AV}`, 4),
+        fetchJsonRetry(`/tiles/blockmodels.json?v=${AV}`, 3).catch(() => ({})),
+      ]).then(([atlas, tints, bmodels]) => ({ atlas, tints, bmodels }))
+        .catch((e) => { voxAssetsPromise = null; throw e; });   // let a later call retry from scratch
+    }
+    return voxAssetsPromise;
+  }
+
   async function ensureVoxelAssets() {
     if (voxMat) return true;
     if (typeof THREE === 'undefined') return false;
     const AV = Date.now();
-    const [atlas, tints, bmodels] = await Promise.all([
-      fetch(`/tiles/atlas.json?v=${AV}`).then((r) => r.json()),
-      fetch(`/tiles/biome_tints.json?v=${AV}`).then((r) => r.json()).catch(() => ({})),
-      fetch(`/tiles/blockmodels.json?v=${AV}`).then((r) => r.json()).catch(() => ({})),
-    ]);
+    const { atlas, tints, bmodels } = await loadVoxAssets();
     const tex = await new THREE.TextureLoader().loadAsync(`/tiles/atlas.png?v=${AV}`);
     tex.flipY = false;
     tex.magFilter = THREE.NearestFilter;
@@ -1162,8 +1247,9 @@
    * each tile is meshed by the normal voxel mesher and the whole group is scaled by 2^lod. Nothing in
    * the mesher has to know about LOD.
    */
-  async function buildVoxelLevel(world, lod, vx0, vz0, vx1, vz1, bg) {
+  async function buildVoxelLevel(world, lod, vx0, vz0, vx1, vz1, bg, exclude, faceBudget) {
     const f = 1 << lod;
+    const budget = faceBudget || MAX_LEVEL_FACES;
     if (lod === 0) {
       // Prerendered tiles sit on a fixed N_CHUNKS grid; snap the window onto it so we can fetch them.
       vx0 = Math.floor(vx0 / N_CHUNKS) * N_CHUNKS;
@@ -1179,6 +1265,11 @@
         tileList.push([tx, tz]);
       }
     }
+    // Nearest tiles first, so if the face budget binds it drops the far edge rather than the ground
+    // under your feet.
+    const midTx = (vx0 + vx1) / 2, midTz = (vz0 + vz1) / 2;
+    tileList.sort((a, b) => (Math.abs(a[0] - midTx) + Math.abs(a[1] - midTz))
+                          - (Math.abs(b[0] - midTx) + Math.abs(b[1] - midTz)));
     const loaded = new Set();
     let lastProblem = '';
     const tileCells = N_CHUNKS * 16;              // 160 cells per tile side
@@ -1190,13 +1281,22 @@
       for (;;) {
         const i = next++;
         if (i >= tileList.length) return;
+        if (faces >= budget) { lastProblem = 'face budget reached'; return; }
         const tx = tileList[i][0], tz = tileList[i][1];
+        // Coarse levels are a RING around the finer level still on screen: never draw over it, or the
+        // near field is covered with low-detail (and currently untinted) geometry.
+        if (exclude) {
+          const rx0 = tx * 16 * f, rz0 = tz * 16 * f;
+          const rx1 = (tx + N_CHUNKS) * 16 * f, rz1 = (tz + N_CHUNKS) * 16 * f;
+          if (rx0 >= exclude.cx0 * 16 && rx1 <= (exclude.cx1 + 1) * 16
+              && rz0 >= exclude.cz0 * 16 && rz1 <= (exclude.cz1 + 1) * 16) continue;
+        }
         // lod 0 uses prerendered tiles when they exist (no client meshing); otherwise fall back to
         // the live mesher so brand-new chunks still show immediately.
         if (lod === 0) {
           const gtx = tx / N_CHUNKS, gtz = tz / N_CHUNKS;
           try {
-            const resp = await fetch(`/tiles/${encodeURIComponent(world)}/mesh/lod0/${gtx}_${gtz}.gtmesh`);
+            const resp = await fetch(`/tiles/${encodeURIComponent(world)}/mesh/lod0/${gtx}_${gtz}.gtmesh?v=${TILES_V}`);
             if (resp.ok) {
               const bytes = await inflateRaw(new Uint8Array(await resp.arrayBuffer()));
               const t = parseTile(bytes);
@@ -1209,7 +1309,7 @@
               g.userData.bbox = { x0: tx * 16 * f, z0: tz * 16 * f,
                                   x1: (tx + N_CHUNKS) * 16 * f, z1: (tz + N_CHUNKS) * 16 * f };
               group.add(g);
-              faces += geo.getAttribute('position').count / 6;
+              faces += (geo.index ? geo.index.count : geo.getAttribute('position').count) / 6;
               tiles++;
               loaded.add(tx + ',' + tz);
               if (bg) hideCoveredVoxTiles(bg, loaded, tileBlocks);
@@ -1247,7 +1347,7 @@
           g.userData.bbox = { x0: tx * 16 * f, z0: tz * 16 * f,
                               x1: (tx + N_CHUNKS) * 16 * f, z1: (tz + N_CHUNKS) * 16 * f };
           group.add(g);
-          const n = r.geo.getAttribute('position').count / 6;
+          const n = (r.geo.index ? r.geo.index.count : r.geo.getAttribute('position').count) / 6;
           faces += n;
           tiles++;
           loaded.add(tx + ',' + tz);
@@ -1278,10 +1378,11 @@
   }
 
   /**
-   * Build one LOD level over the visible window. Everything here is real blocks - the only thing that
-   * changes with zoom is how big a block is - so there is no separate "world map" to fall back to.
-   * The previous (coarser) level stays on screen as the backdrop for anything the new level does not
-   * cover, and tiles of it are hidden as the finer level covers them.
+   * Build the terrain for the current zoom: a fine lod-0 island in the middle plus one coarser
+   * backdrop level filling the distance. Everything is real blocks - the only
+   * thing that changes with zoom is how big a block is - so there is no separate "world map" to fall
+   * back to. The previous level stays on screen as the backdrop, and its tiles are hidden where the
+   * new level covers them.
    */
   async function buildWorldTier(world, cx0, cz0, cx1, cz1, frame) {
     const spanChunks = Math.max(cx1 - cx0, cz1 - cz0);
@@ -1294,18 +1395,53 @@
     // cover thousands of chunks on the fly would stall. 256 real chunks a side is 4096 blocks, which
     // is the far edge we agreed on.
     const winReal = Math.min(spanChunks, VOXEL_MAX_REAL_CHUNKS);
-    const winV = Math.max(2, Math.min(Math.ceil(winReal / f), VOXEL_MAX_VCHUNKS));
+    // lod 1 gets a wider window than lod 0: its tiles are 4x the area, so it can reach the same 256
+    // real chunks with ~1/4 the tiles - which is what lets the low-res ring fill the screen.
+    const winCap = lod === 0 ? VOXEL_MAX_VCHUNKS : VOXEL_MAX_VCHUNKS_LOD1;
+    const winV = Math.max(2, Math.min(Math.ceil(winReal / f), winCap));
     const midVx = Math.round(((cx0 + cx1) / 2) / f), midVz = Math.round(((cz0 + cz1) / 2) / f);
     const vx0 = midVx - Math.floor(winV / 2), vz0 = midVz - Math.floor(winV / 2);
     const vx1 = vx0 + winV - 1, vz1 = vz0 + winV - 1;
 
     const bbox = { cx0: vx0 * f, cz0: vz0 * f, cx1: (vx1 + 1) * f - 1, cz1: (vz1 + 1) * f - 1 };
 
+    // Fine island in the middle: at a coarse tier the tier's own level is only
+    // a backdrop for the distance, and real blocks stay where you are actually looking. Sized to a
+    // share of the view, face-capped, and dropped once the view is so wide that fine blocks would
+    // cover almost none of it - that is the only point at which lod 0 "fades out".
+    let coreWin = null;
+    if (lod > 0 && spanChunks <= CORE_DROP_SPAN) {
+      const n = Math.max(N_CHUNKS, Math.min(CORE_MAX_CHUNKS, Math.round(spanChunks * CORE_SPAN_FRACTION)));
+      const midCx = (cx0 + cx1) / 2, midCz = (cz0 + cz1) / 2;
+      const cc0 = Math.floor((midCx - n / 2) / N_CHUNKS) * N_CHUNKS;
+      const cd0 = Math.floor((midCz - n / 2) / N_CHUNKS) * N_CHUNKS;
+      coreWin = { cx0: cc0, cz0: cd0, cx1: cc0 + N_CHUNKS - 1, cz1: cd0 + N_CHUNKS - 1 };
+    }
+    const coreMoved = coreWin
+      ? (!coreLevel || coreLevel.cx0 !== coreWin.cx0 || coreLevel.cz0 !== coreWin.cz0)
+      : !!coreGroup;
+    if (coreMoved) {
+      if (coreWin) {
+        const cr = await buildVoxelLevel(world, 0, coreWin.cx0, coreWin.cz0, coreWin.cx1, coreWin.cz1,
+                                         null, null, CORE_FACE_BUDGET);
+        if (cr.tiles) {
+          disposeGroup(coreGroup);
+          coreGroup = cr.group;
+          coreLevel = { cx0: coreWin.cx0, cz0: coreWin.cz0, cx1: coreWin.cx1, cz1: coreWin.cz1 };
+        } else {
+          disposeGroup(cr.group);
+        }
+      } else {
+        disposeGroup(coreGroup); coreGroup = null; coreLevel = null;
+      }
+    }
+
     if (frame) {
       // frame the middle of the window; zooming out is how you leave, so start where the detail is
       const span = Math.max(cx1 - cx0, cz1 - cz0) * 16;
       const ctr = new THREE.Vector3(((cx0 + cx1) / 2) * 16, 80, ((cz0 + cz1) / 2) * 16);
-      scene.fog = new THREE.Fog(WORLD_TINT, span * 1.2, span * 3.5);
+      // No scene fog: it was set once from the opening span and never updated, so zooming out closed
+      // it over the whole world and dimmed everything. Colour stays true at every distance instead.
       const fitDist = (span * 0.5) / Math.tan((camera.fov / 2) * Math.PI / 180);
       camera.position.copy(ctr).addScaledVector(new THREE.Vector3(0.32, 0.55, 0.32).normalize(), fitDist * 0.8);
       controls.target.copy(ctr);
@@ -1323,7 +1459,12 @@
       backdropGroup.position.y = -1;   // one block lower so coincident surfaces cannot z-fight
     }
     const bg = backdropGroup;
-    const r = await buildVoxelLevel(world, lod, vx0, vz0, vx1, vz1, bg);
+    // The coarse level is a backdrop RING: skip whatever the fine middle already covers.
+    const exclude = coreLevel
+      ? { cx0: coreLevel.cx0, cz0: coreLevel.cz0, cx1: coreLevel.cx1, cz1: coreLevel.cz1 }
+      : null;
+    const r = await buildVoxelLevel(world, lod, vx0, vz0, vx1, vz1, bg, exclude,
+                                    coreLevel ? MAX_LEVEL_FACES - CORE_FACE_BUDGET : undefined);
     if (!r.tiles) {
       scene.remove(r.group);
       statusEl.textContent = 'no block data here yet \u00b7 lod ' + lod + ' \u00b7 '
@@ -1335,18 +1476,15 @@
         g.userData.bbox = { x0: 0, z0: 0, x1: 0, z1: 0 };
       }
     }
-    // drop the old level only once the new one is bigger than it (i.e. we zoomed out); when zooming
-    // in it stays as the backdrop, otherwise the world would end at the edge of the window
-    // when we zoomed out the new level covers the old, so the backdrop is no longer needed at all
-    if (backdropGroup && prevLevel) {
-      const covers = bbox.cx0 <= prevLevel.cx0 && bbox.cx1 >= prevLevel.cx1
-        && bbox.cz0 <= prevLevel.cz0 && bbox.cz1 >= prevLevel.cz1;
-      if (covers) { disposeGroup(backdropGroup); backdropGroup = null; }
-    }
+    // The new level plus the fine core cover the visible window, so the previous level is redundant:
+    // drop it now. Keeping it is what left a coarse lod 1 hanging around when zooming in.
+    if (backdropGroup) { disposeGroup(backdropGroup); backdropGroup = null; }
     worldGroup = r.group;
     worldLevel = { key: tier.key, lod, cx0: bbox.cx0, cz0: bbox.cz0, cx1: bbox.cx1, cz1: bbox.cz1 };
     statusEl.textContent = `lod ${lod} \u00b7 ${f}m blocks \u00b7 ${r.tiles} tiles \u00b7 `
-      + `${r.faces.toLocaleString()} faces`;
+      + `${r.faces.toLocaleString()} faces \u00b7 biomes `
+      + (lastBiomeStats ? `${lastBiomeStats.withBiome}/${lastBiomeStats.chunks}` : '?')
+      + ` \u00b7 tints ${lastBiomeStats ? lastBiomeStats.tintKeys : '?'}`;
   }
 
   /**
@@ -1377,7 +1515,9 @@
     const visBlocks = 2 * dist * Math.tan((camera.fov / 2) * Math.PI / 180) * 1.4;
     const tier = tierFor(Math.max(8, visBlocks / 16));
     // chunks the mesh should span at this resolution so the window covers the view
-    const half = Math.max(4, visBlocks / 32); // real chunks across the view, half going each way
+    // Load a margin beyond the view: with none, the window edge sits exactly at the screen edge, so new
+    // terrain only started loading once it was already a large part of the screen.
+    const half = Math.max(6, (visBlocks / 32) * 1.6); // real chunks across the view, half going each way
 
     const tx = controls.target.x / 16, tz = controls.target.z / 16;
     const b = worldBounds;
@@ -1511,24 +1651,32 @@
     raf = null;
     window.removeEventListener('resize', onResize);
     window.removeEventListener('keydown', onKey);
-    if (atlasTex) { atlasTex.dispose(); atlasTex = null; }
     if (refineTimer) { clearTimeout(refineTimer); refineTimer = null; }
-    disposeGroup(backdropGroup);
-    backdropGroup = null;
-    disposeWorldGroup();
-    disposeVoxelGroup();
-    if (worldMat) { worldMat.dispose(); worldMat = null; }
-    worldLevel = null; worldBounds = null; refineBusy = false; worldLoading = false;
-    if (renderer) renderer.dispose();
-    if (controls) controls.dispose();
-    if (canvas) canvas.remove();
-    if (closeBtn) closeBtn.remove();
+    // Take the 3D layer down FIRST so the 2D map always comes back, even if a three.js/WebGL
+    // dispose throws underneath us. (The canvas used to come off at the very end, so one throwing
+    // dispose left the 3D view stuck on screen and the "2D map" button looking dead.)
+    if (canvas) { canvas.remove(); canvas = null; }
+    if (closeBtn) { closeBtn.remove(); closeBtn = null; }
     if (depthBtn) { depthBtn.remove(); depthBtn = null; }
     if (worldBtn) { worldBtn.remove(); worldBtn = null; }
     if (islandsBtn) { islandsBtn.remove(); islandsBtn = null; }
-    if (statusEl) statusEl.remove();
-    if (popupEl) popupEl.remove();
-    renderer = scene = camera = controls = canvas = closeBtn = statusEl = markerPoints = popupEl = null;
+    if (statusEl) { statusEl.remove(); statusEl = null; }
+    if (popupEl) { popupEl.remove(); popupEl = null; }
+    try {
+      if (atlasTex) { atlasTex.dispose(); atlasTex = null; }
+      if (animTex) { animTex.dispose(); animTex = null; }
+      disposeGroup(backdropGroup);
+      backdropGroup = null;
+      disposeWorldGroup();
+      disposeVoxelGroup();
+      if (worldMat) { worldMat.dispose(); worldMat = null; }
+      if (renderer) renderer.dispose();
+      if (controls) controls.dispose();
+    } catch (e) {
+      console.warn('GT3D close: dispose failed (UI already removed)', e);
+    }
+    worldLevel = null; worldBounds = null; refineBusy = false; worldLoading = false;
+    renderer = scene = camera = controls = markerPoints = null;
     downXY = null;
     // tell the 2D map it can repaint now that the 3D view is gone
     try { if (window.GT && window.GT.on3DClose) window.GT.on3DClose(); } catch (e) { /* ignore */ }

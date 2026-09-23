@@ -86,8 +86,9 @@ public final class Renderer {
             System.out.printf("world %s extent cx %d..%d cz %d..%d%n", world, minCx, maxCx, minCz, maxCz);
 
             Map<Integer, BufferedImage> heightStats = new HashMap<>(); // reserved (unused, kept simple)
+            java.util.Set<Long> scope = ONLY_VISITED ? loadScope(conn, world, VISITED_RADIUS) : null;
             for (String layer : new String[] { "terrain", "biome" }) {
-                renderLevel0(conn, world, out, layer, tile, minY, minCx, maxCx, minCz, maxCz);
+                renderLevel0(conn, world, out, layer, tile, minY, minCx, maxCx, minCz, maxCz, scope);
             }
             // Build the pyramid by downscaling the previous level until it fits in one tile.
             int z = 1;
@@ -116,8 +117,34 @@ public final class Renderer {
         }
     }
 
+    /** Inhabited chunks (world data) plus a chunk buffer, or null when nothing is recorded. */
+    private static java.util.Set<Long> loadScope(Connection conn, String world, int radius) throws SQLException {
+        java.util.Set<Long> out = new java.util.HashSet<>();
+        int inhabited = 0;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT cx,cz FROM chunks WHERE world=? AND inhabited_time > 0")) {
+            ps.setString(1, world);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    int cx = rs.getInt(1), cz = rs.getInt(2);
+                    inhabited++;
+                    for (int dx = -radius; dx <= radius; dx++) {
+                        for (int dz = -radius; dz <= radius; dz++) {
+                            out.add(((long) (cx + dx) << 32) ^ ((cz + dz) & 0xffffffffL));
+                        }
+                    }
+                }
+            }
+        }
+        if (inhabited == 0) return null;
+        System.out.println("visited filter: " + inhabited + " inhabited chunk(s) -> " + out.size()
+                + " in scope (+" + radius + " chunk buffer)");
+        return out;
+    }
+
     private static void renderLevel0(Connection conn, String world, String outDir, String layer,
-                                     int tile, int minY, int minCx, int maxCx, int minCz, int maxCz) throws Exception {
+                                     int tile, int minY, int minCx, int maxCx, int minCz, int maxCz,
+                                     java.util.Set<Long> scope) throws Exception {
         File dir = new File(outDir, world + "/" + layer + "/0");
         dir.mkdirs();
         long t0 = System.currentTimeMillis();
@@ -140,11 +167,6 @@ public final class Renderer {
                 int[] yAt = new int[tile * tile];
                 String sql = "SELECT cx,cz,biome,surface_block,surface_y FROM chunks "
                         + "WHERE world=? AND cx>=? AND cx<? AND cz>=? AND cz<?";
-                if (ONLY_VISITED) {
-                    // Inhabited time comes from the world itself and covers its whole life, unlike our
-                    // own visit logging which only goes back to when it was added.
-                    sql += " AND inhabited_time > 0";
-                }
                 try (PreparedStatement ps = conn.prepareStatement(sql)) {
                     int pi = 1;
                     ps.setString(pi++, world);
@@ -152,7 +174,10 @@ public final class Renderer {
                     ps.setInt(pi++, cz0 - m); ps.setInt(pi++, cz0 + tile + m);
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
-                            int px = rs.getInt(1) - cx0, py = rs.getInt(2) - cz0;
+                            int rcx = rs.getInt(1), rcz = rs.getInt(2);
+                            if (scope != null
+                                    && !scope.contains(((long) rcx << 32) ^ (rcz & 0xffffffffL))) continue;
+                            int px = rcx - cx0, py = rcz - cz0;
                             if (biomeLayer) biomeAt[(py + m) * pw + (px + m)] = rs.getString(3);
                             if (px < 0 || py < 0 || px >= tile || py >= tile) continue;
                             blockAt[py * tile + px] = rs.getString(4);

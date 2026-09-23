@@ -47,9 +47,15 @@ public class Storage {
             st.execute("PRAGMA journal_mode=WAL");
             st.execute("PRAGMA synchronous=NORMAL");
             st.execute("PRAGMA busy_timeout=5000");
+            st.execute("PRAGMA mmap_size=0");
+            // Never memory-map the database. A long-lived process holding a stale mmap while another
+            // writer (the offline dumper) grows the file faults with SIGBUS inside the native SQLite
+            // driver - which kills the whole JVM, not just the query (crashed the server 2026-09-22).
+            st.execute("PRAGMA mmap_size=0");
         }
         try (Statement st = readConn.createStatement()) {
             st.execute("PRAGMA busy_timeout=5000");
+            st.execute("PRAGMA mmap_size=0");
         }
         migrate();
     }
@@ -71,9 +77,11 @@ public class Storage {
                 st.execute("PRAGMA journal_mode=WAL");
                 st.execute("PRAGMA synchronous=NORMAL");
                 st.execute("PRAGMA busy_timeout=5000");
+            st.execute("PRAGMA mmap_size=0");
             }
             try (Statement st = readConn.createStatement()) {
                 st.execute("PRAGMA busy_timeout=5000");
+            st.execute("PRAGMA mmap_size=0");
             }
         } catch (SQLException e) {
             log.severe("[GroundTruth] failed to reopen the database: " + e.getMessage());
