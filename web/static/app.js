@@ -66,6 +66,15 @@ let lastHoverChunk = null;         // last hovered chunk key, so the label refre
 let outlineCoords = new Map();     // biome -> Set("cx,cz"), the biome outline overlay
 let structures = [];
 let worldSeed = null;
+// The server reports each world's dimension; when an older build omits it, fall back to the same
+// name convention the server uses for height offsets, so the slime overlay is not silently lost.
+function envOfWorld(w) {
+  if (w && w.env) return w.env;
+  const n = String((w && w.world) || '').toLowerCase();
+  if (n.includes('nether')) return 'NETHER';
+  if (n.includes('the_end') || n.endsWith('_end')) return 'THE_END';
+  return 'NORMAL';
+}
 let currentWorld = null;
 let currentEnv = null;
 let worldList = [];
@@ -132,6 +141,16 @@ async function loadPlayers() {
     const code = localStorage.getItem('gt_code');
     if (!code) { players = []; draw(); return; }  // markers need a login (see applyIdentity)
     const res = await fetch('/api/players?code=' + encodeURIComponent(code));
+    if (res.status === 401) {
+      // The stored code has expired or been revoked. Drop it and show the logged-out state rather
+      // than asking with it forever: this poll runs every few seconds, so a dead code meant an
+      // error on every tick and live markers that could never come back.
+      try { localStorage.removeItem('gt_code'); } catch (e) { /* ignore */ }
+      players = [];
+      applyIdentity(null);
+      draw();
+      return;
+    }
     players = (await res.json()).players || [];
     draw();
   } catch (e) { /* keep last known */ }
@@ -960,10 +979,10 @@ async function loadWorlds() {
     let saved = null;
     try { saved = localStorage.getItem('groundtruth-world'); } catch (e) { /* ignore */ }
     worldSelectEl.innerHTML = worldList.map((w) =>
-      `<option value="${w.world}">${w.world} (${w.env}, ${w.chunks} chunks)</option>`).join('');
+      `<option value="${w.world}">${w.world} (${envOfWorld(w)}, ${w.chunks} chunks)</option>`).join('');
     currentWorld = worldList.some((w) => w.world === saved) ? saved : worldList[0].world;
     worldSelectEl.value = currentWorld;
-    currentEnv = (worldList.find((w) => w.world === currentWorld) || {}).env || null;
+    currentEnv = envOfWorld(worldList.find((w) => w.world === currentWorld) || { world: currentWorld });
     await load();
   } catch (e) {
     countsEl.textContent = 'failed to load the world list from the server';
@@ -1046,7 +1065,7 @@ document.querySelectorAll('.panel-collapse-btn').forEach((btn) => {
 
 worldSelectEl.addEventListener('change', () => {
   currentWorld = worldSelectEl.value;
-  currentEnv = (worldList.find((w) => w.world === currentWorld) || {}).env || null;
+  currentEnv = envOfWorld(worldList.find((w) => w.world === currentWorld) || { world: currentWorld });
   try { localStorage.setItem('groundtruth-world', currentWorld); } catch (e) { /* ignore */ }
   load();
 });
@@ -1070,6 +1089,11 @@ window.GT = {
   setShowBboxes: (v) => { toggleBboxesEl.checked = !!v; draw(); },
   bboxColor: () => settings.bboxColor,
   setBboxColor: (v) => { settings.bboxColor = v; saveSettings(); draw(); },
+  showSlime: () => toggleSlimeEl.checked,
+  setShowSlime: (v) => { toggleSlimeEl.checked = !!v; draw(); },
+  isSlime: (cx, cz) => isSlimeChunk(worldSeed, cx, cz),
+  // slime chunks only exist in overworld-type dimensions, and the seed is needed to compute them
+  canShowSlime: () => currentEnv === 'NORMAL' && worldSeed != null,
   on3DClose: () => draw(),
 };
 document.getElementById('view3dBtn').addEventListener('click', () => {

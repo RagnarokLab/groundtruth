@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 
 import org.bukkit.Bukkit;
+import org.bukkit.World;
 import org.bukkit.entity.Player;
 
 /**
@@ -399,11 +400,26 @@ public final class WebServer {
             if (!first) sb.append(',');
             first = false;
             sb.append("{\"world\":").append(LogListener.Json.str(w.world))
+              .append(",\"env\":").append(LogListener.Json.str(envOf(w.world)))
               .append(",\"chunks\":").append(w.chunks)
               .append(",\"structures\":").append(w.structures)
               .append('}');
         }
         return sb.append("]}").toString();
+    }
+
+    /**
+     * A world's dimension: the loaded world is authoritative; a world that is not currently loaded
+     * (the index outlives a world being open in memory) falls back to the same name convention the
+     * height offsets use, so nothing here disagrees about which dimensions are overworld-type.
+     */
+    private static String envOf(String world) {
+        World w = Bukkit.getWorld(world);
+        if (w != null) return w.getEnvironment().name();
+        String n = world == null ? "" : world.toLowerCase(java.util.Locale.ROOT);
+        if (n.contains("nether")) return "NETHER";
+        if (n.contains("the_end") || n.endsWith("_end")) return "THE_END";
+        return "NORMAL";
     }
 
     /**

@@ -31,7 +31,9 @@
   let raf = null, canvas = null, closeBtn = null, statusEl = null;
   let markerPoints = null, popupEl = null, downXY = null;
   let overlayGroup = null;        // structure outlines etc: rebuilt per level, disposed with it
+  let overlaySeq = 0;             // guards async overlay builds: a newer refresh wins
   let panelEl = null, bboxToggle = null, bboxColor = null, lastVoxWindow = null;
+  let slimeToggle = null;
   let atlasTex = null, animTex = null, depthBtn = null, worldBtn = null, islandsBtn = null;
   const waterTime = { value: 0 }; // seconds; drives the animated water frames
   let includeUnderground = true;  // toggle: surface-only (false) vs all the way down to bedrock (true)
@@ -40,6 +42,9 @@
   let worldStep = 4;              // chunk decimation in world mode (4 -> 64-block cells)
   const WORLD_YSCALE = 1;         // TRUE proportions - GroundTruth shows the world as it actually is
   let worldIslands = true;        // draw sky islands as real floating geometry
+  const SLIME_MAX_CHUNKS = 104;  // /api/pixels refuses a request over 12000 chunks, so the slime
+                                 // overlay covers a centred square inside that; slime chunks are 1 in
+                                 // 10 and scattered, so nothing about the edge reads as a boundary
   const VOXEL_MAX_VCHUNKS = 70;   // cap on the window, in virtual chunks (7x7 tiles of 10) - also the
                                   // span at which the tier switches from 1m to 2m blocks
   const VOXEL_MAX_VCHUNKS_LOD1 = 128; // lod 1's own cap: its tiles cover 4x the area, so reaching the
@@ -1002,6 +1007,23 @@
     colRow.appendChild(bboxColor);
     colRow.appendChild(document.createTextNode('box colour'));
     panelEl.appendChild(colRow);
+    const slimeRow = document.createElement('label');
+    slimeRow.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;color:#7ee98a;';
+    slimeToggle = document.createElement('input');
+    slimeToggle.type = 'checkbox';
+    slimeToggle.checked = !!(window.GT && window.GT.showSlime && window.GT.showSlime());
+    if (window.GT && window.GT.canShowSlime && !window.GT.canShowSlime()) {
+      slimeToggle.disabled = true;
+      slimeRow.style.opacity = '0.5';
+      slimeRow.title = 'slime chunks exist in overworld-type dimensions only';
+    }
+    slimeToggle.onchange = () => {
+      if (window.GT && window.GT.setShowSlime) window.GT.setShowSlime(slimeToggle.checked);
+      refreshOverlays();
+    };
+    slimeRow.appendChild(slimeToggle);
+    slimeRow.appendChild(document.createTextNode('slime chunks'));
+    panelEl.appendChild(slimeRow);
     for (const b of [depthBtn, worldBtn, islandsBtn]) {
       const hidden = b.style.display === 'none';
       b.style.cssText = 'padding:5px 8px;font-size:13px;cursor:pointer;background:#222;color:#eee;'
@@ -1577,6 +1599,7 @@
                                     coreLevel ? MAX_LEVEL_FACES - CORE_FACE_BUDGET : undefined);
     if (!r.tiles) {
       scene.remove(r.group);
+      clearOverlays();   // nothing new to outline, so drop last level's
       const why = 'no block data here yet \u00b7 lod ' + lod + ' \u00b7 ' + (r.problem || 'unknown');
       // the way out depends on whether a coarser level is left to try
       if (lod === 0) setStatus('empty', why, 'zoom out', zoomOutStep);
@@ -1597,6 +1620,9 @@
       + `${r.faces.toLocaleString()} faces \u00b7 biomes `
       + (lastBiomeStats ? `${lastBiomeStats.withBiome}/${lastBiomeStats.chunks}` : '?')
       + ` \u00b7 tints ${lastBiomeStats ? lastBiomeStats.tintKeys : '?'}`);
+    // Overlays track the level that is actually on screen, so they are rebuilt here: this runs for
+    // both the first load and every zoom-driven rebuild.
+    refreshOverlays();
   }
 
   /**
@@ -1689,14 +1715,76 @@
       underground: false, kind: p.kind,
     }));
     scene.add(markerPoints);
-    refreshOverlays();
   }
 
-  /** Rebuild the runtime overlays for whatever window is currently on screen. */
-  function refreshOverlays() {
+  /**
+   * Slime chunks as translucent green plates laid on the surface, outlined so they still read over
+   * grass. A slime chunk is a pure function of the world seed, so no data is stored for it; only the
+   * surface height comes from the server, as one sample per chunk from /api/pixels.
+   */
+  async function addSlimePlates(cx0, cz0, cx1, cz1, seq) {
+    if (!window.GT || !window.GT.isSlime) return;
+    // Never past the level's own window: that is where terrain exists, and a plate with no ground
+    // under it would hang in the background. Inside that, cap the request to the server's cell limit,
+    // centred, so the plates cover what is being looked at.
+    const half = SLIME_MAX_CHUNKS >> 1;
+    const mx = (cx0 + cx1) >> 1, mz = (cz0 + cz1) >> 1;
+    const ax0 = Math.max(cx0, mx - half), ax1 = Math.min(cx1, mx + half - 1);
+    const az0 = Math.max(cz0, mz - half), az1 = Math.min(cz1, mz + half - 1);
+    let buf;
+    try {
+      const j = await (await fetch(`/api/pixels?world=${encodeURIComponent(lastCenter.world)}`
+        + `&cx0=${ax0}&cz0=${az0}&cx1=${ax1}&cz1=${az1}&px=16&deflate=1`)).json();
+      if (!j || !j.data) return;
+      buf = await inflated(j.data);
+    } catch (e) { return; }
+    if (seq !== overlaySeq) return;                 // a newer refresh has already taken over
+    const d = new DataView(buf);
+    const ox = d.getInt16(0), oz = d.getInt16(2), cols = d.getInt32(6), rows = d.getInt32(10);
+    const verts = [], edges = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const cell = 14 + (r * cols + c) * 7;
+        const y = d.getInt16(cell);
+        if (y === -32768) continue;                 // server has no surface for that chunk
+        const cx = ox + c, cz = oz + r;             // at one sample per chunk a cell IS a chunk
+        if (!window.GT.isSlime(cx, cz)) continue;
+        const x0 = cx * 16, z0 = cz * 16, x1 = x0 + 16, z1 = z0 + 16, yy = y + 1;
+        verts.push(x0, yy, z0, x1, yy, z0, x1, yy, z1, x0, yy, z0, x1, yy, z1, x0, yy, z1);
+        edges.push(x0, yy, z0, x1, yy, z0, x1, yy, z0, x1, yy, z1,
+                   x1, yy, z1, x0, yy, z1, x0, yy, z1, x0, yy, z0);
+      }
+    }
+    if (!verts.length) return;
+    if (!overlayGroup) { overlayGroup = new THREE.Group(); scene.add(overlayGroup); }
+    const fill = new THREE.BufferGeometry();
+    fill.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    overlayGroup.add(new THREE.Mesh(fill, new THREE.MeshBasicMaterial({
+      color: 0x3ce65a, transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide,
+    })));
+    const outline = new THREE.BufferGeometry();
+    outline.setAttribute('position', new THREE.Float32BufferAttribute(edges, 3));
+    overlayGroup.add(new THREE.LineSegments(outline, new THREE.LineBasicMaterial({
+      color: 0x3ce65a, transparent: true, opacity: 0.85,
+    })));
+  }
+
+  /**
+   * Rebuild the runtime overlays for whatever window is currently on screen.
+   *
+   * Async because the slime plates need surface heights from the server: overlaySeq makes the newest
+   * refresh the only one allowed to add geometry, so a slow response cannot land on a later view.
+   */
+  async function refreshOverlays() {
+    const seq = ++overlaySeq;
     clearOverlays();
     if (worldLevel) {
       addStructureBoxes(worldLevel.cx0, worldLevel.cz0, worldLevel.cx1, worldLevel.cz1);
+      if (window.GT && window.GT.showSlime && window.GT.showSlime()
+          && window.GT.canShowSlime && window.GT.canShowSlime()) {
+        await addSlimePlates(worldLevel.cx0, worldLevel.cz0, worldLevel.cx1, worldLevel.cz1, seq)
+          .catch(() => {});   // a bad payload just means no plates, never a broken view
+      }
     } else if (lastVoxWindow) {
       addStructureBoxes(lastVoxWindow.cx0, lastVoxWindow.cz0,
                         lastVoxWindow.cx0 + VOXEL_CHUNKS - 1, lastVoxWindow.cz0 + VOXEL_CHUNKS - 1);
@@ -1836,7 +1924,7 @@
     if (statusEl) { statusEl.remove(); statusEl = null; }
     if (popupEl) { popupEl.remove(); popupEl = null; }
     if (panelEl) { panelEl.remove(); panelEl = null; }
-    bboxToggle = null; bboxColor = null; lastVoxWindow = null;
+    bboxToggle = null; bboxColor = null; lastVoxWindow = null; slimeToggle = null;
     try {
       if (atlasTex) { atlasTex.dispose(); atlasTex = null; }
       if (animTex) { animTex.dispose(); animTex = null; }
