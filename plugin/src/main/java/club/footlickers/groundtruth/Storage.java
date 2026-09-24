@@ -45,10 +45,12 @@ public class Storage {
         }
         File dbFile = new File(dataFolder, "groundtruth.db");
         this.url = "jdbc:sqlite:" + dbFile.getAbsolutePath();
-        // journal_mode is persistent in the file, but setting it here keeps a freshly created
-        // database in WAL. mmap_size=0 keeps the main database file out of memory entirely.
+        // TRUNCATE, not WAL: WAL's shared wal-index is what kept faulting SIGBUS across the three
+        // processes that open this database. journal_mode is persistent in the file, but setting it
+        // here keeps a freshly created database out of WAL too. mmap_size=0 keeps the main file out
+        // of memory as well.
         this.wdb = new DbConn(url, IDLE_MS,
-                "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL",
+                "PRAGMA journal_mode=TRUNCATE", "PRAGMA synchronous=NORMAL",
                 "PRAGMA busy_timeout=5000", "PRAGMA mmap_size=0");
         this.rdb = new DbConn(url, IDLE_MS,
                 "PRAGMA busy_timeout=5000", "PRAGMA mmap_size=0");

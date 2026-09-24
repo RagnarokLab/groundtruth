@@ -8,18 +8,20 @@ import java.sql.Statement;
 /**
  * A SQLite connection that is opened on first use and closed again once it has been idle for a while.
  *
- * <p>SQLite in WAL mode always memory-maps the wal-index ({@code groundtruth.db-shm}); {@code
- * PRAGMA mmap_size=0} does not cover it. A process that keeps a connection open for days therefore
- * keeps that mapping alive across every checkpoint and WAL reset, and when another process (the
- * offline dumper) resets the wal-index while the mapping is still live, the next access faults with
- * SIGBUS inside the native driver - which kills the whole JVM, not just the query. Two server crashes
- * (2026-09-22 on a read from the server thread, 2026-09-23 on a web thread) faulted inside that
- * mapping. Closing when idle means any reset happens while this process holds no mapping.
+ * <p>The databases run in {@code journal_mode=TRUNCATE}, not WAL. WAL memory-maps a wal-index
+ * ({@code groundtruth.db-shm}) which several processes share - the plugin, the Python web service and
+ * the offline dumper all open this database - and that shared mapping is what kept faulting with
+ * SIGBUS inside the native driver, killing the whole JVM. Four crashes (2026-09-22, twice on
+ * 2026-09-23, once on 2026-09-24) faulted at the same offset in that mapping. {@code
+ * PRAGMA mmap_size=0} does not cover the wal-index. Without WAL there is no wal-index to fault on.
  *
- * <p>It also stops the WAL growing without bound: a connection that never closes never lets SQLite
- * checkpoint, and the file had reached 2.3 GB.
+ * <p>Closing when idle is kept anyway: it bounds how long a stale connection can linger, and it is
+ * what lets a long-running process pick up a schema or journal-mode change made underneath it.
  */
 final class DbConn {
+
+    private static final java.util.logging.Logger LOG =
+            java.util.logging.Logger.getLogger("GroundTruth");
 
     private final String url;
     private final String[] pragmas;
@@ -45,7 +47,13 @@ final class DbConn {
                 c = DriverManager.getConnection(url);
                 try (Statement st = c.createStatement()) {
                     for (String p : pragmas) {
-                        st.execute(p);
+                        try {
+                            st.execute(p);
+                        } catch (SQLException e) {
+                            // a pragma that cannot be applied (a mode change while another process
+                            // holds the database) must not take the connection down with it
+                            LOG.warning("[GroundTruth] pragma failed (" + p + "): " + e.getMessage());
+                        }
                     }
                 }
             }

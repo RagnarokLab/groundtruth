@@ -48,7 +48,7 @@ public class LogDb implements AutoCloseable {
         File dbFile = new File(dataFolder, "groundtruth-log.db");
         String url = "jdbc:sqlite:" + dbFile.getAbsolutePath();
         this.wdb = new DbConn(url, 45_000,
-                "PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL",
+                "PRAGMA journal_mode=TRUNCATE", "PRAGMA synchronous=NORMAL",
                 "PRAGMA busy_timeout=10000", "PRAGMA mmap_size=0");
         this.rdb = new DbConn(url, 45_000,
                 "PRAGMA busy_timeout=5000", "PRAGMA mmap_size=0");

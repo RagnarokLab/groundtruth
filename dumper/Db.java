@@ -48,10 +48,10 @@ public class Db implements AutoCloseable {
     public Db(String path) throws SQLException {
         conn = DriverManager.getConnection("jdbc:sqlite:" + path);
         try (Statement st = conn.createStatement()) {
-            st.execute("PRAGMA journal_mode=WAL");
+            st.execute("PRAGMA journal_mode=TRUNCATE");
             st.execute("PRAGMA synchronous=NORMAL");
             st.execute("PRAGMA busy_timeout=10000");
-            // no mmap: a stale mapping faults SIGBUS in native SQLite and kills the JVM
+            // no mmap, and no WAL: the shared wal-index is a mapping several processes can fault on
             st.execute("PRAGMA mmap_size=0");
         }
         migrate();
