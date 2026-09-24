@@ -78,6 +78,22 @@ public final class GtApi {
     }
 
     /**
+     * The toggleable biome overlay as a map PNG: one colour per chunk, transparent where no biome is
+     * recorded, so it draws over the terrain image. Same geometry as {@link #mapImage}.
+     */
+    public CompletableFuture<byte[]> biomeImage(String world, int blockX, int blockZ, int zoom, int w, int h) {
+        return bytes("/api/map/image",
+                "world", world, "layer", "biome", "x", Integer.toString(blockX), "z", Integer.toString(blockZ),
+                "zoom", Integer.toString(zoom), "w", Integer.toString(w), "h", Integer.toString(h));
+    }
+
+    /** The recorded biome (and surface block) for one chunk, for the cursor readout. */
+    public CompletableFuture<String> chunkInfo(String world, int cx, int cz) {
+        return text("/api/chunkinfo",
+                "world", world, "cx", Integer.toString(cx), "cz", Integer.toString(cz));
+    }
+
+    /**
      * Per-block detail for a chunk range: the true block colour and height of every block, 16x16 per
      * chunk, deflated and base64'd. This is what gives the close-in view real block detail - the tile
      * pyramid bottoms out at one pixel per chunk.

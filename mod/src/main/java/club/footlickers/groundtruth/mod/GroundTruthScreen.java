@@ -19,7 +19,9 @@ import net.minecraft.resources.Identifier;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The in-game GroundTruth map.
@@ -34,6 +36,8 @@ public class GroundTruthScreen extends Screen {
 
     private static final Identifier MAP_TEX =
             Identifier.fromNamespaceAndPath("groundtruth", "live_map");
+    private static final Identifier BIOME_TEX =
+            Identifier.fromNamespaceAndPath("groundtruth", "live_biome");
     private static final int MARGIN = 96;
     private static final double MIN_BPP = 1.0, MAX_BPP = 512.0, ZOOM_STEP = 1.5;
     private static final double DETAIL_BPP = 2.0;
@@ -81,6 +85,15 @@ public class GroundTruthScreen extends Screen {
     private boolean showTrail = false;
     private final List<int[]> trail = new ArrayList<>();   // x, z
     private boolean loginRefreshed = false;
+
+    // biome overlay + cursor readout
+    private boolean showBiome = false;
+    private volatile NativeImage pendingBiome = null;
+    private NativeImage shownBiome = null;
+    private boolean biomeRegistered = false;
+    private int biomeMapW = -1, biomeMapH = -1;
+    private final Map<Long, String> biomeCache = new ConcurrentHashMap<>();
+    private final Set<Long> biomePending = ConcurrentHashMap.newKeySet();
 
     // waypoint list panel
     private boolean wpPanelOpen = false;
@@ -210,6 +223,26 @@ public class GroundTruthScreen extends Screen {
                 status = world + " @ " + (int) cx + "," + (int) cz + "  " + fmtBpp(at);
             });
         });
+        if (showBiome) {
+            GroundTruthMod.api.biomeImage(world, (int) cx, (int) cz, zz, w + 2 * MARGIN, h + 2 * MARGIN)
+                    .thenAccept(bytes -> {
+                if (bytes == null) return;
+                final NativeImage img;
+                try {
+                    img = NativeImage.read(bytes);
+                } catch (Exception e) {
+                    return;
+                }
+                Minecraft.getInstance().execute(() -> {
+                    if (gen != mapGen) {
+                        img.close();
+                        return;
+                    }
+                    if (pendingBiome != null) pendingBiome.close();
+                    pendingBiome = img;
+                });
+            });
+        }
     }
 
     private static String fmtBpp(double v) {
@@ -262,6 +295,18 @@ public class GroundTruthScreen extends Screen {
             panPy = 0;
         }
 
+        if (pendingBiome != null) {
+            NativeImage img = pendingBiome;
+            pendingBiome = null;
+            if (biomeRegistered) mc.getTextureManager().release(BIOME_TEX);
+            mc.getTextureManager().register(BIOME_TEX, new DynamicTexture(() -> "groundtruth biome", img));
+            biomeRegistered = true;
+            if (shownBiome != null) shownBiome.close();
+            shownBiome = img;
+            biomeMapW = img.getWidth();
+            biomeMapH = img.getHeight();
+        }
+
         if (registered && mapW > 0 && mapH > 0) {
             double scale = shownBpp / bpp;
             double dw = mapW * scale, dh = mapH * scale;
@@ -277,6 +322,16 @@ public class GroundTruthScreen extends Screen {
             }
             g.blit(RenderPipelines.GUI_TEXTURED, MAP_TEX, dx, dy, 0f, 0f,
                     (int) Math.round(dw), (int) Math.round(dh), mapW, mapH, mapW, mapH);
+            // The biome layer is the same geometry as the terrain image, drawn at ~55% so the relief
+            // still reads through - the same overlay the web map uses.
+            if (showBiome && shownBiome != null && !shownIsDetail && biomeMapW > 0) {
+                double bw = biomeMapW * scale, bh = biomeMapH * scale;
+                int bdx = (int) Math.round((this.width - bw) / 2 + panPx);
+                int bdy = (int) Math.round((this.height - bh) / 2 + panPy);
+                g.blit(RenderPipelines.GUI_TEXTURED, BIOME_TEX, bdx, bdy, 0f, 0f,
+                        (int) Math.round(bw), (int) Math.round(bh), biomeMapW, biomeMapH,
+                        biomeMapW, biomeMapH, 0x8CFFFFFF);
+            }
         }
 
         drawLayers(g);
@@ -291,8 +346,10 @@ public class GroundTruthScreen extends Screen {
         double[] hover = blockOf(mouseX, mouseY);
         g.text(this.font, "GroundTruth \u00b7 " + status, 12, 12, 0xFFFFFFFF);
         g.text(this.font, GroundTruthMod.api.baseUrl(), 12, 26, 0xFFA0D8FF);
+        String hoverBiome = biomeAt(hover[0], hover[1]);
         g.text(this.font, "cursor: " + (int) Math.floor(hover[0]) + ", " + (int) Math.floor(hover[1])
-                + "   nether: " + Math.round(hover[0] / 8) + ", " + Math.round(hover[1] / 8),
+                + "   nether: " + Math.round(hover[0] / 8) + ", " + Math.round(hover[1] / 8)
+                + "   biome: " + (hoverBiome == null ? "\u2026" : shortBiome(hoverBiome)),
                 12, 40, 0xFFC0FFC0);
         if (mc.player != null) {
             g.text(this.font, "you: " + String.format("%.0f, %.0f, %.0f",
@@ -304,6 +361,7 @@ public class GroundTruthScreen extends Screen {
                 + "  [T]structures " + (showStructures ? "on" : "off")
                 + "  [W]aypoints " + (showWaypoints ? "on" : "off")
                 + "  [R]trail " + (showTrail ? "on" : "off")
+                + "  [B]iome " + (showBiome ? "on" : "off")
                 + "  (" + (structTypes.size() - structHidden.size()) + "/" + structTypes.size() + " types shown)",
                 12, this.height - 28, 0xFF9AA4B2);
 
@@ -524,6 +582,35 @@ public class GroundTruthScreen extends Screen {
         return steps + 1;
     }
 
+    /** Recorded biome for the chunk under a block position, fetched once per chunk and cached. */
+    private String biomeAt(double bx, double bz) {
+        if (world == null) return null;
+        int cx = (int) Math.floor(bx / 16.0), cz = (int) Math.floor(bz / 16.0);
+        long key = ((long) cx << 32) ^ (cz & 0xffffffffL);
+        String v = biomeCache.get(key);
+        if (v != null) return v;
+        if (biomePending.add(key)) {
+            final String w = world;
+            GroundTruthMod.api.chunkInfo(w, cx, cz).thenAccept(body -> {
+                String biome = null;
+                try {
+                    JsonObject o = JsonParser.parseString(body).getAsJsonObject();
+                    JsonElement b = o.get("biome");
+                    if (b != null && !b.isJsonNull()) biome = b.getAsString();
+                } catch (Exception ignored) {
+                }
+                biomeCache.put(key, biome == null ? "unindexed" : biome);
+            });
+        }
+        return null;
+    }
+
+    private static String shortBiome(String biome) {
+        int i = biome.indexOf(':');
+        String s = i >= 0 ? biome.substring(i + 1) : biome;
+        return s.replace('_', ' ');
+    }
+
     // --- structure popup / filter ---------------------------------------------------------------
 
     /** Nearest structure to a screen point, within a small radius, or null. */
@@ -573,7 +660,7 @@ public class GroundTruthScreen extends Screen {
         int x = this.width - FILTER_W - 8, y = 60;
         g.fill(x, y, x + FILTER_W, y + h, 0xE0101418);
         g.fill(x, y, x + FILTER_W, y + 1, 0xFF6A7480);
-        g.text(this.font, "structures (search, click to toggle)", x + 6, y + 5, 0xFFFFFFFF);
+        g.text(this.font, "structures (click toggle \u00b7 shift-click all/none)", x + 6, y + 5, 0xFFFFFFFF);
         g.fill(x + 6, y + 17, x + FILTER_W - 6, y + 29, 0xFF000000);
         g.text(this.font, filterText + "_", x + 9, y + 20, 0xFFE8EEF5);
         int row = 0;
@@ -589,7 +676,7 @@ public class GroundTruthScreen extends Screen {
         g.text(this.font, "F closes", x + 6, y + h - 11, 0xFF9AA4B2);
     }
 
-    private void clickFilter(double mx, double my) {
+    private void clickFilter(double mx, double my, boolean shift) {
         int h = FILTER_ROWS * FILTER_ROW + 34;
         int x = this.width - FILTER_W - 8, y = 60;
         if (mx < x || mx > x + FILTER_W || my < y || my > y + h) return;
@@ -597,8 +684,18 @@ public class GroundTruthScreen extends Screen {
             int row = (int) ((my - y - 32) / FILTER_ROW);
             List<Integer> matches = filterMatches();
             if (row >= 0 && row < matches.size()) {
-                int ti = matches.get(row);
-                if (!structHidden.remove(ti)) structHidden.add(ti);
+                if (shift) {
+                    // shift-click is select-all / select-none: if everything is shown, clear the lot;
+                    // otherwise show everything, whatever the clicked type was.
+                    if (structHidden.isEmpty()) {
+                        for (int i = 0; i < structTypes.size(); i++) structHidden.add(i);
+                    } else {
+                        structHidden.clear();
+                    }
+                } else {
+                    int ti = matches.get(row);
+                    if (!structHidden.remove(ti)) structHidden.add(ti);
+                }
                 cachedWx0 = Double.NaN;   // force the visible list to rebuild
             }
         }
@@ -855,7 +952,7 @@ public class GroundTruthScreen extends Screen {
         }
         if (wpPanelOpen && clickWaypointPanel(mx, my)) return true;
         if (filterOpen) {
-            clickFilter(mx, my);
+            clickFilter(mx, my, e.hasShiftDown());
             return true;
         }
         if (settingsOpen) {
@@ -1011,6 +1108,11 @@ public class GroundTruthScreen extends Screen {
             showTrail = !showTrail;
             if (showTrail) loadTrail();
             else trail.clear();
+            return true;
+        }
+        if (e.key() == 66) {                        // B: biome overlay
+            showBiome = !showBiome;
+            if (showBiome) refetchSoon();
             return true;
         }
         if (e.key() == 76) {                        // L: waypoint list
