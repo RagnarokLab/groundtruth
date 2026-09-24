@@ -1,6 +1,9 @@
 package club.footlickers.groundtruth.mod;
 
 import com.mojang.blaze3d.platform.NativeImage;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.Screen;
@@ -64,6 +67,17 @@ public class GroundTruthScreen extends Screen {
 
     private String lastDiag = null;
 
+    /** Overlay layers, mirroring what the web map can show. */
+    private static final class Wp {
+        String name;
+        int x, z, colour;
+    }
+
+    private final List<Wp> waypoints = new ArrayList<>();
+    private final List<int[]> structures = new ArrayList<>();   // x, z in block coords
+    private volatile Long seed = null;
+    private boolean showWaypoints = true, showStructures = true, showSlime = false;
+
     public GroundTruthScreen() {
         super(Component.literal("GroundTruth"));
     }
@@ -85,6 +99,7 @@ public class GroundTruthScreen extends Screen {
                 return;
             }
             refetch();
+            loadLayers();
         });
     }
 
@@ -210,6 +225,7 @@ public class GroundTruthScreen extends Screen {
                     (int) Math.round(dw), (int) Math.round(dh), mapW, mapH, mapW, mapH);
         }
 
+        drawLayers(g);
         drawOwnMarker(g);
         drawMenu(g);
         drawWaypointPrompt(g);
@@ -222,6 +238,10 @@ public class GroundTruthScreen extends Screen {
         }
         g.text(this.font, "drag pan \u00b7 scroll zoom \u00b7 right-click options \u00b7 M closes",
                 12, this.height - 16, 0xFF808080);
+        g.text(this.font, "[S]lime " + (showSlime ? "on" : "off")
+                + "  [T]structures " + (showStructures ? "on" : "off")
+                + "  [W]aypoints " + (showWaypoints ? "on" : "off"),
+                12, this.height - 28, 0xFF9AA4B2);
 
         String diag = "tex=" + mapW + "x" + mapH + " shownBpp=" + shownBpp + " bpp=" + bpp;
         if (!diag.equals(lastDiag)) {
@@ -230,14 +250,114 @@ public class GroundTruthScreen extends Screen {
         }
     }
 
+    /** Waypoints, structures and slime chunks for the visible window. */
+    private void loadLayers() {
+        GroundTruthMod.api.waypoints().thenAccept(body -> {
+            List<Wp> list = new ArrayList<>();
+            try {
+                JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+                for (JsonElement e : root.getAsJsonArray("waypoints")) {
+                    JsonObject o = e.getAsJsonObject();
+                    Wp w = new Wp();
+                    w.name = o.get("name").getAsString();
+                    w.x = o.get("x").getAsInt();
+                    w.z = o.get("z").getAsInt();
+                    JsonElement c = o.get("colour");
+                    w.colour = (c == null || c.isJsonNull()) ? 0xFFD25C : parseColour(c.getAsString());
+                    list.add(w);
+                }
+            } catch (Exception ignored) {
+                // a malformed list just means no waypoint markers
+            }
+            waypoints.clear();
+            waypoints.addAll(list);
+        });
+        GroundTruthMod.api.text("/api/structures", "world", world).thenAccept(body -> {
+            List<int[]> list = new ArrayList<>();
+            try {
+                JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+                JsonElement s = root.get("seed");
+                if (s != null && !s.isJsonNull()) seed = s.getAsLong();
+                for (JsonElement e : root.getAsJsonArray("structures")) {
+                    JsonObject o = e.getAsJsonObject();
+                    list.add(new int[]{o.get("x").getAsInt(), o.get("z").getAsInt()});
+                }
+            } catch (Exception ignored) {
+            }
+            structures.clear();
+            structures.addAll(list);
+        });
+    }
+
+    private static int parseColour(String s) {
+        try {
+            return 0xFF000000 | (Integer.parseInt(s.replace("#", ""), 16) & 0xFFFFFF);
+        } catch (Exception e) {
+            return 0xFFFFD25C;
+        }
+    }
+
+    private void drawLayers(GuiGraphicsExtractor g) {
+        double halfW = this.width / 2.0 * bpp, halfH = this.height / 2.0 * bpp;
+        double wx0 = mapX - halfW, wx1 = mapX + halfW, wz0 = mapZ - halfH, wz1 = mapZ + halfH;
+
+        // slime chunks: a pure function of the seed, so nothing needs fetching - but only worth
+        // drawing once a chunk is a few pixels across
+        if (showSlime && seed != null && bpp <= 16) {
+            int cx0 = (int) Math.floor(wx0 / 16), cx1 = (int) Math.ceil(wx1 / 16);
+            int cz0 = (int) Math.floor(wz0 / 16), cz1 = (int) Math.ceil(wz1 / 16);
+            int sz = (int) Math.max(1, Math.round(16 / bpp));
+            for (int cx = cx0; cx <= cx1; cx++) {
+                for (int cz = cz0; cz <= cz1; cz++) {
+                    if (!isSlimeChunk(seed, cx, cz)) continue;
+                    double[] s = screenOf(cx * 16.0, cz * 16.0);
+                    int px = (int) Math.round(s[0]), py = (int) Math.round(s[1]);
+                    g.fill(px, py, px + sz, py + sz, 0x553CE65A);
+                }
+            }
+        }
+        if (showStructures && bpp <= 32) {
+            for (int[] st : structures) {
+                if (st[0] < wx0 - 64 || st[0] > wx1 + 64 || st[1] < wz0 - 64 || st[1] > wz1 + 64) continue;
+                double[] s = screenOf(st[0], st[1]);
+                int px = (int) Math.round(s[0]), py = (int) Math.round(s[1]);
+                g.fill(px - 1, py - 1, px + 2, py + 2, 0xCCFFD25C);
+            }
+        }
+        if (showWaypoints) {
+            for (Wp w : waypoints) {
+                double[] s = screenOf(w.x, w.z);
+                if (s[0] < -40 || s[1] < -20 || s[0] > this.width + 40 || s[1] > this.height + 20) continue;
+                int px = (int) Math.round(s[0]), py = (int) Math.round(s[1]);
+                g.fill(px - 3, py - 3, px + 4, py + 4, 0xFF101010);
+                g.fill(px - 2, py - 2, px + 3, py + 3, w.colour);
+                g.text(this.font, w.name, px + 6, py - 4, w.colour);
+            }
+        }
+    }
+
+    /**
+     * The vanilla slime-chunk formula: exact, and a pure function of the seed and chunk coordinates,
+     * so it needs no stored data. Long arithmetic wraps the same way the reference implementation's
+     * 64-bit unsigned maths does.
+     */
+    private static boolean isSlimeChunk(long seed, int cx, int cz) {
+        long x = cx, z = cz;
+        long s = seed + x * x * 4987142L + x * 5947611L + z * z * 4392871L + z * 2918603L;
+        s = (s ^ 0x5DEECE66DL) & ((1L << 48) - 1);
+        s = (s * 0x5DEECE66DL + 0xBL) & ((1L << 48) - 1);
+        return ((s >> 17) % 10) == 0;
+    }
+
     /** Your own position, so the map is anchored to something. */
     private void drawOwnMarker(GuiGraphicsExtractor g) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null) return;
         double[] s = screenOf(mc.player.getX(), mc.player.getZ());
         int x = (int) Math.round(s[0]), y = (int) Math.round(s[1]);
-        g.fill(x - 3, y - 3, 7, 7, 0xFF101010);
-        g.fill(x - 2, y - 2, 5, 5, 0xFFFFD25C);
+        // fill takes CORNERS (x1, y1, x2, y2), not width/height
+        g.fill(x - 3, y - 3, x + 4, y + 4, 0xFF101010);
+        g.fill(x - 2, y - 2, x + 3, y + 3, 0xFFFFD25C);
         g.text(this.font, "you", x + 6, y - 4, 0xFFFFD25C);
     }
 
@@ -250,11 +370,11 @@ public class GroundTruthScreen extends Screen {
         if (menuAt == null) return;
         int h = MENU_ITEMS.length * MENU_ROW + 6;
         int x = (int) menuX, y = (int) menuY;
-        g.fill(x, y, MENU_W, h, 0xE0101418);
-        g.fill(x, y, MENU_W, 1, 0xFF6A7480);
-        g.fill(x, y + h - 1, MENU_W, 1, 0xFF6A7480);
-        g.fill(x, y, 1, h, 0xFF6A7480);
-        g.fill(x + MENU_W - 1, y, 1, h, 0xFF6A7480);
+        g.fill(x, y, x + MENU_W, y + h, 0xE0101418);
+        g.fill(x, y, x + MENU_W, y + 1, 0xFF6A7480);
+        g.fill(x, y + h - 1, x + MENU_W, y + h, 0xFF6A7480);
+        g.fill(x, y, x + 1, y + h, 0xFF6A7480);
+        g.fill(x + MENU_W - 1, y, x + MENU_W, y + h, 0xFF6A7480);
         for (int i = 0; i < MENU_ITEMS.length; i++) {
             g.text(this.font, MENU_ITEMS[i], x + 6, y + 4 + i * MENU_ROW, 0xFFE8EEF5);
         }
@@ -266,12 +386,12 @@ public class GroundTruthScreen extends Screen {
         if (wpName == null) return;
         int w = 260, h = 66;
         int x = (this.width - w) / 2, y = (this.height - h) / 2;
-        g.fill(x, y, w, h, 0xF0101418);
-        g.fill(x, y, w, 1, 0xFF6A7480);
-        g.fill(x, y + h - 1, w, 1, 0xFF6A7480);
+        g.fill(x, y, x + w, y + h, 0xF0101418);
+        g.fill(x, y, x + w, y + 1, 0xFF6A7480);
+        g.fill(x, y + h - 1, x + w, y + h, 0xFF6A7480);
         g.text(this.font, "new waypoint", x + 8, y + 6, 0xFFFFFFFF);
         g.text(this.font, "name: " + wpName + "_", x + 8, y + 22, 0xFFE8EEF5);
-        g.fill(x + 8, y + 36, 14, 10, 0xFF000000 | WAYPOINT_COLOURS[wpColour]);
+        g.fill(x + 8, y + 36, x + 22, y + 46, 0xFF000000 | WAYPOINT_COLOURS[wpColour]);
         g.text(this.font, "colour (click)", x + 28, y + 37, 0xFF9AA4B2);
         g.text(this.font, wpPublic ? "public" : "private", x + 150, y + 37,
                 wpPublic ? 0xFF8ADF6B : 0xFF9AA4B2);
@@ -440,6 +560,18 @@ public class GroundTruthScreen extends Screen {
         }
         if (e.key() == 77) {                        // GLFW_KEY_M toggles the map closed
             this.onClose();
+            return true;
+        }
+        if (e.key() == 83) {                        // S: slime chunks
+            showSlime = !showSlime;
+            return true;
+        }
+        if (e.key() == 84) {                        // T: structures
+            showStructures = !showStructures;
+            return true;
+        }
+        if (e.key() == 87) {                        // W: waypoints
+            showWaypoints = !showWaypoints;
             return true;
         }
         return super.keyPressed(e);

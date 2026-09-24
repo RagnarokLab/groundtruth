@@ -1142,12 +1142,12 @@ def waypoints_list(uuid):
     try:
         try:
             rows = conn.execute(
-                "SELECT uuid,name,world,x,y,z,public FROM waypoints WHERE public=1 OR uuid=?",
+                "SELECT uuid,name,world,x,y,z,colour,public FROM waypoints WHERE public=1 OR uuid=?",
                 (uuid or "",)).fetchall()
         except sqlite3.OperationalError:
             return []
         return [{"uuid": r[0], "name": r[1], "world": r[2], "x": r[3], "y": r[4], "z": r[5],
-                 "public": r[6] == 1} for r in rows]
+                 "colour": r[6], "public": r[7] == 1} for r in rows]
     finally:
         conn.close()
 
