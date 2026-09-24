@@ -103,9 +103,14 @@ public final class GtApi {
         return text("/api/worlds");
     }
 
-    /** Waypoints (public to all, private to their owner). */
-    public CompletableFuture<String> waypoints() {
-        return text("/api/waypoints");
+    /**
+     * Waypoints: public ones for everyone, plus the caller's own private ones when their login code
+     * is supplied. Without the code the server cannot tell who is asking, so only public ones come
+     * back.
+     */
+    public CompletableFuture<String> waypoints(String code) {
+        if (code == null || code.isEmpty()) return text("/api/waypoints");
+        return text("/api/waypoints", "code", code);
     }
 
     /**
@@ -118,6 +123,24 @@ public final class GtApi {
                 "x", Integer.toString(x), "y", "64", "z", Integer.toString(z),
                 "public", Integer.toString(isPublic), "colour", colour);
         HttpRequest req = HttpRequest.newBuilder(URI.create(baseUrl + "/api/waypoints?" + query))
+                .timeout(Duration.ofSeconds(15))
+                .header("User-Agent", USER_AGENT)
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build();
+        return HTTP.sendAsync(req, HttpResponse.BodyHandlers.ofString())
+                .thenApply(r -> r.statusCode() == 200 ? r.body() : null)
+                .exceptionally(e -> null);
+    }
+
+    /** The caller's own recent position samples, oldest first: {"points":[[x,y,z,ts],...]}. */
+    public CompletableFuture<String> track(String code, String world, int hours) {
+        return text("/api/track", "code", code, "world", world, "hours", Integer.toString(hours));
+    }
+
+    /** Delete one of the caller's own waypoints by name. */
+    public CompletableFuture<String> deleteWaypoint(String code, String name) {
+        String query = form("code", code, "name", name);
+        HttpRequest req = HttpRequest.newBuilder(URI.create(baseUrl + "/api/waypoints/delete?" + query))
                 .timeout(Duration.ofSeconds(15))
                 .header("User-Agent", USER_AGENT)
                 .POST(HttpRequest.BodyPublishers.noBody())

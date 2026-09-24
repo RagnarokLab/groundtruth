@@ -1,5 +1,8 @@
 package club.footlickers.groundtruth.mod;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
@@ -14,6 +17,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.List;
 
 public class GroundTruthMod implements ClientModInitializer {
@@ -35,6 +39,39 @@ public class GroundTruthMod implements ClientModInitializer {
 
     public static String code() {
         return loginCode;
+    }
+
+    /** The logged-in player's name, decoded from the login token; null when not logged in. */
+    public static String playerName() {
+        return claim("n");
+    }
+
+    /** The logged-in player's uuid, decoded from the login token; null when not logged in. */
+    public static String playerUuid() {
+        return claim("u");
+    }
+
+    /**
+     * One field out of the login token's payload. The token is a base64url payload and signature the
+     * server mints, so the player's own identity is already in hand without another round trip - the
+     * map uses it to label a waypoint with its owner and to tell which waypoints are theirs.
+     */
+    private static String claim(String key) {
+        String code = loginCode;
+        if (code == null) return null;
+        int dot = code.lastIndexOf('.');
+        if (dot <= 0) return null;
+        try {
+            String b = code.substring(0, dot);
+            int pad = (4 - b.length() % 4) % 4;
+            String json = new String(Base64.getUrlDecoder().decode(b + "=".repeat(pad)),
+                    StandardCharsets.UTF_8);
+            JsonObject o = JsonParser.parseString(json).getAsJsonObject();
+            JsonElement v = o.get(key);
+            return v == null || v.isJsonNull() ? null : v.getAsString();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**

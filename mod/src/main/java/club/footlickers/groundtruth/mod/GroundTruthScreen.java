@@ -1,5 +1,6 @@
 package club.footlickers.groundtruth.mod;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -69,9 +70,20 @@ public class GroundTruthScreen extends Screen {
     private double menuX, menuY;
 
     // waypoint prompt
+    private static final int WP_W = 280, WP_H = 78;
     private String wpName = null;
     private boolean wpPublic = false;
     private int wpColour = 1;
+    private int wpX, wpZ;                        // the block the open prompt is for
+    private boolean wpEditing = false;           // re-saving a waypoint that already exists
+
+    // own recent trail
+    private boolean showTrail = false;
+    private final List<int[]> trail = new ArrayList<>();   // x, z
+    private boolean loginRefreshed = false;
+
+    // waypoint list panel
+    private boolean wpPanelOpen = false;
 
     // overlays
     private final List<int[]> structures = new ArrayList<>();     // x, z, type index
@@ -212,6 +224,19 @@ public class GroundTruthScreen extends Screen {
     public void tick() {
         super.tick();
         if (refetchIn > 0 && --refetchIn == 0) refetch();
+        maybeRefreshForLogin();
+    }
+
+    /**
+     * Once the login code has been captured, reload anything that is personal to the player: the
+     * waypoint list (so their private ones appear) and the trail. Without a code the first load can
+     * only return public data.
+     */
+    private void maybeRefreshForLogin() {
+        if (loginRefreshed || !GroundTruthMod.hasCode()) return;
+        loginRefreshed = true;
+        if (world != null) loadLayers();
+        if (showTrail) loadTrail();
     }
 
     @Override
@@ -260,6 +285,7 @@ public class GroundTruthScreen extends Screen {
         drawMenu(g);
         drawFilterPanel(g);
         drawSettingsPanel(g);
+        drawWaypointPanel(g);
         drawWaypointPrompt(g);
 
         double[] hover = blockOf(mouseX, mouseY);
@@ -272,11 +298,12 @@ public class GroundTruthScreen extends Screen {
             g.text(this.font, "you: " + String.format("%.0f, %.0f, %.0f",
                     mc.player.getX(), mc.player.getY(), mc.player.getZ()), 12, 54, 0xFF9AA4B2);
         }
-        g.text(this.font, "drag pan \u00b7 scroll zoom \u00b7 right-click options \u00b7 F structures \u00b7 O colours \u00b7 M closes",
+        g.text(this.font, "drag pan \u00b7 scroll zoom \u00b7 right-click options \u00b7 F structures \u00b7 O colours \u00b7 L waypoints \u00b7 M closes",
                 12, this.height - 16, 0xFF808080);
         g.text(this.font, "[S]lime " + (showSlime ? "on" : "off")
                 + "  [T]structures " + (showStructures ? "on" : "off")
                 + "  [W]aypoints " + (showWaypoints ? "on" : "off")
+                + "  [R]trail " + (showTrail ? "on" : "off")
                 + "  (" + (structTypes.size() - structHidden.size()) + "/" + structTypes.size() + " types shown)",
                 12, this.height - 28, 0xFF9AA4B2);
 
@@ -290,7 +317,8 @@ public class GroundTruthScreen extends Screen {
     // --- overlays ------------------------------------------------------------------------------
 
     private void loadLayers() {
-        GroundTruthMod.api.waypoints().thenAccept(body -> {
+        final String code = GroundTruthMod.code();
+        GroundTruthMod.api.waypoints(code).thenAccept(body -> {
             List<Wp> list = new ArrayList<>();
             try {
                 JsonObject root = JsonParser.parseString(body).getAsJsonObject();
@@ -300,6 +328,8 @@ public class GroundTruthScreen extends Screen {
                     w.name = o.get("name").getAsString();
                     w.x = o.get("x").getAsInt();
                     w.z = o.get("z").getAsInt();
+                    w.uuid = o.has("uuid") && !o.get("uuid").isJsonNull() ? o.get("uuid").getAsString() : null;
+                    w.isPublic = o.has("public") && o.get("public").getAsBoolean();
                     JsonElement c = o.get("colour");
                     w.colour = (c == null || c.isJsonNull()) ? 0xFFD25C : parseColour(c.getAsString());
                     list.add(w);
@@ -332,6 +362,35 @@ public class GroundTruthScreen extends Screen {
             structures.addAll(list);
             structTypes.clear();
             structTypes.addAll(types);
+        });
+    }
+
+    /**
+     * The player's own recent trail, from the server's position log. Only ever their own - the
+     * endpoint refuses without the login code, which is the point: it shows where YOU have been.
+     */
+    private void loadTrail() {
+        if (!GroundTruthMod.hasCode() || world == null) {
+            trail.clear();
+            status = "trail needs a login - opening the waypoint menu asks for one";
+            return;
+        }
+        status = "loading trail\u2026";
+        GroundTruthMod.api.track(GroundTruthMod.code(), world, 12).thenAccept(body -> {
+            List<int[]> pts = new ArrayList<>();
+            try {
+                JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+                for (JsonElement e : root.getAsJsonArray("points")) {
+                    JsonArray a = e.getAsJsonArray();
+                    pts.add(new int[]{a.get(0).getAsInt(), a.get(2).getAsInt()});
+                }
+            } catch (Exception ignored) {
+            }
+            Minecraft.getInstance().execute(() -> {
+                trail.clear();
+                trail.addAll(pts);
+                status = "trail: " + trail.size() + " point" + (trail.size() == 1 ? "" : "s");
+            });
         });
     }
 
@@ -389,6 +448,7 @@ public class GroundTruthScreen extends Screen {
                 g.fill(px - 1, py - 1, px + 2, py + 2, col);
             }
         }
+        if (showTrail) drawTrail(g);
         if (showWaypoints) {
             for (Wp w : waypoints) {
                 double[] s = screenOf(w.x, w.z);
@@ -417,6 +477,51 @@ public class GroundTruthScreen extends Screen {
         g.fill(x - 3, y - 3, x + 4, y + 4, 0xFF101010);
         g.fill(x - 2, y - 2, x + 3, y + 3, 0xFFFFD25C);
         g.text(this.font, "you", x + 6, y - 4, 0xFFFFD25C);
+    }
+
+    /**
+     * The player's own recent trail as a line. Drawn as short screen-space segments rather than one
+     * long path so a teleport (or a gap in the samples) does not draw a line across the map, and
+     * bounded by a fill budget so a long trail at a tight zoom cannot stall a frame.
+     */
+    private void drawTrail(GuiGraphicsExtractor g) {
+        if (trail.isEmpty()) return;
+        int col = 0xCCFF6BAE;
+        int budget = 20000;
+        double[] prev = null;
+        for (int[] p : trail) {
+            double[] s = screenOf(p[0], p[1]);
+            boolean on = s[0] >= -32 && s[1] >= -32 && s[0] <= this.width + 32 && s[1] <= this.height + 32;
+            if (!on) {
+                prev = null;
+                continue;
+            }
+            if (prev == null) {
+                g.fill((int) s[0], (int) s[1], (int) s[0] + 2, (int) s[1] + 2, col);
+                budget--;
+            } else {
+                budget -= segment(g, prev[0], prev[1], s[0], s[1], col, budget);
+            }
+            if (budget <= 0) return;
+            prev = s;
+        }
+    }
+
+    /** Rasterise one screen-space segment with a DDA, returning how many fills it used. */
+    private static int segment(GuiGraphicsExtractor g, double x1, double y1, double x2, double y2,
+                               int col, int budget) {
+        double dx = x2 - x1, dy = y2 - y1;
+        int steps = (int) Math.min(budget, Math.max(Math.abs(dx), Math.abs(dy)));
+        if (steps <= 0) {
+            g.fill((int) x1, (int) y1, (int) x1 + 2, (int) y1 + 2, col);
+            return 1;
+        }
+        for (int i = 0; i <= steps; i++) {
+            int px = (int) Math.round(x1 + dx * i / steps);
+            int py = (int) Math.round(y1 + dy * i / steps);
+            g.fill(px, py, px + 1, py + 1, col);
+        }
+        return steps + 1;
     }
 
     // --- structure popup / filter ---------------------------------------------------------------
@@ -525,6 +630,81 @@ public class GroundTruthScreen extends Screen {
         else if (my >= y + 36 && my < y + 50) slimeColour = (slimeColour + 1) % PALETTE.length;
     }
 
+    // --- waypoint list --------------------------------------------------------------------------
+
+    private static final int WPL_W = 300, WPL_ROW = 12, WPL_ROWS = 13;
+
+    private int wpPanelRows() {
+        return Math.min(WPL_ROWS, waypoints.size());
+    }
+
+    private void drawWaypointPanel(GuiGraphicsExtractor g) {
+        if (!wpPanelOpen) return;
+        int shown = wpPanelRows();
+        int h = 20 + Math.max(1, shown) * WPL_ROW + 14;
+        int x = this.width - WPL_W - 8, y = 60;
+        g.fill(x, y, x + WPL_W, y + h, 0xE0101418);
+        g.fill(x, y, x + WPL_W, y + 1, 0xFF6A7480);
+        g.text(this.font, "waypoints", x + 6, y + 5, 0xFFFFFFFF);
+        g.text(this.font, GroundTruthMod.hasCode() ? "(click jump \u00b7 e edit \u00b7 x delete)"
+                        : "(log in to see your own)",
+                x + 62, y + 5, 0xFF9AA4B2);
+        if (waypoints.isEmpty()) {
+            g.text(this.font, "none yet - right-click the map to add one", x + 6, y + 22, 0xFF9AA4B2);
+        }
+        for (int i = 0; i < shown; i++) {
+            Wp w = waypoints.get(i);
+            int ry = y + 20 + i * WPL_ROW;
+            g.fill(x + 6, ry + 2, x + 14, ry + 9, w.colour);
+            String label = w.name + "  " + w.x + ", " + w.z + (w.isPublic ? "  public" : "");
+            g.text(this.font, label, x + 18, ry + 1, 0xFFE8EEF5);
+            if (w.mine()) {
+                g.text(this.font, "e", x + WPL_W - 30, ry + 1, 0xFF8ADF6B);
+                g.text(this.font, "x", x + WPL_W - 16, ry + 1, 0xFFFF6B6B);
+            }
+        }
+        g.text(this.font, "L closes", x + 6, y + h - 11, 0xFF9AA4B2);
+    }
+
+    /** @return true when the click was inside the panel and has been handled. */
+    private boolean clickWaypointPanel(double mx, double my) {
+        int shown = wpPanelRows();
+        int h = 20 + Math.max(1, shown) * WPL_ROW + 14;
+        int x = this.width - WPL_W - 8, y = 60;
+        if (mx < x || mx > x + WPL_W || my < y || my > y + h) return false;
+        int row = (int) ((my - y - 20) / WPL_ROW);
+        if (row < 0 || row >= shown) return true;
+        Wp w = waypoints.get(row);
+        if (w.mine() && mx >= x + WPL_W - 34 && mx <= x + WPL_W - 22) {
+            editWaypoint(w);
+        } else if (w.mine() && mx >= x + WPL_W - 20 && mx <= x + WPL_W - 8) {
+            deleteWaypoint(w);
+        } else {
+            mapX = w.x;
+            mapZ = w.z;
+            cachedWx0 = Double.NaN;
+            refetchSoon();
+            wpPanelOpen = false;
+            status = "jumped to " + w.name;
+        }
+        return true;
+    }
+
+    private void deleteWaypoint(Wp w) {
+        if (!GroundTruthMod.hasCode()) {
+            status = "log in first";
+            return;
+        }
+        status = "deleting " + w.name + "\u2026";
+        GroundTruthMod.api.deleteWaypoint(GroundTruthMod.code(), w.name).thenAccept(body -> {
+            boolean ok = body != null && body.contains("\"ok\":true");
+            Minecraft.getInstance().execute(() -> {
+                status = ok ? ("deleted waypoint " + w.name) : "could not delete waypoint";
+                if (ok) loadLayers();
+            });
+        });
+    }
+
     // --- right-click menu -----------------------------------------------------------------------
 
     private static final String[] MENU_ITEMS = {
@@ -549,19 +729,22 @@ public class GroundTruthScreen extends Screen {
 
     private void drawWaypointPrompt(GuiGraphicsExtractor g) {
         if (wpName == null) return;
-        int w = 260, h = 66;
-        int x = (this.width - w) / 2, y = (this.height - h) / 2;
-        g.fill(x, y, x + w, y + h, 0xF0101418);
-        g.fill(x, y, x + w, y + 1, 0xFF6A7480);
-        g.fill(x, y + h - 1, x + w, y + h, 0xFF6A7480);
-        g.text(this.font, "new waypoint", x + 8, y + 6, 0xFFFFFFFF);
+        int x = (this.width - WP_W) / 2, y = (this.height - WP_H) / 2;
+        g.fill(x, y, x + WP_W, y + WP_H, 0xF0101418);
+        g.fill(x, y, x + WP_W, y + 1, 0xFF6A7480);
+        g.fill(x, y + WP_H - 1, x + WP_W, y + WP_H, 0xFF6A7480);
+        g.text(this.font, wpEditing ? "edit waypoint" : "new waypoint", x + 8, y + 6, 0xFFFFFFFF);
         g.text(this.font, "name: " + wpName + "_", x + 8, y + 22, 0xFFE8EEF5);
-        g.fill(x + 8, y + 36, x + 22, y + 46, 0xFF000000 | PALETTE[wpColour]);
-        g.text(this.font, "colour (click)", x + 28, y + 37, 0xFF9AA4B2);
-        g.text(this.font, wpPublic ? "public" : "private", x + 150, y + 37,
+        g.fill(x + 8, y + 38, x + 22, y + 48, 0xFF000000 | PALETTE[wpColour]);
+        g.text(this.font, "colour (click)", x + 28, y + 39, 0xFF9AA4B2);
+        g.text(this.font, wpPublic ? "public" : "private", x + 150, y + 39,
                 wpPublic ? 0xFF8ADF6B : 0xFF9AA4B2);
-        g.text(this.font, GroundTruthMod.hasCode() ? "login ready \u00b7 enter saves"
-                : "asking the server for a login code\u2026", x + 8, y + 52, 0xFF9AA4B2);
+        String who = GroundTruthMod.playerName();
+        String login = GroundTruthMod.hasCode()
+                ? "saved as " + (who == null || who.isBlank() ? "you" : who) + " \u00b7 enter saves"
+                : "asking the server for a login code\u2026";
+        g.text(this.font, login, x + 8, y + 56, 0xFF9AA4B2);
+        g.text(this.font, "block " + wpX + ", " + wpZ, x + 8, y + 68, 0xFF808080);
     }
 
     private void menuAction(int index) {
@@ -587,6 +770,9 @@ public class GroundTruthScreen extends Screen {
 
     private void openWaypointPrompt(boolean isPublic) {
         if (menuAt == null) return;
+        wpX = menuAt[0];
+        wpZ = menuAt[1];
+        wpEditing = false;
         wpName = "";
         wpPublic = isPublic;
         wpColour = 1;
@@ -596,8 +782,25 @@ public class GroundTruthScreen extends Screen {
         }
     }
 
+    /** Reopen the prompt on an existing waypoint, keeping its position and settings. */
+    private void editWaypoint(Wp w) {
+        wpX = w.x;
+        wpZ = w.z;
+        wpName = w.name;
+        wpPublic = w.isPublic;
+        wpColour = nearestPalette(w.colour);
+        wpEditing = true;
+        wpPanelOpen = false;
+        if (!GroundTruthMod.hasCode()) {
+            status = "requesting a login code\u2026";
+            GroundTruthMod.requestLink();
+        }
+    }
+
     private void saveWaypoint() {
-        if (menuAt == null || wpName == null || wpName.isEmpty()) {
+        // The prompt carries its own block; it must not depend on the right-click menu still being
+        // open, because that menu is dismissed the moment it is used.
+        if (wpName == null || wpName.isBlank()) {
             status = "give the waypoint a name first";
             return;
         }
@@ -606,19 +809,36 @@ public class GroundTruthScreen extends Screen {
             GroundTruthMod.requestLink();
             return;
         }
-        int bx = menuAt[0], bz = menuAt[1];
+        final String name = wpName.trim();
+        final int bx = wpX, bz = wpZ;
         String colour = String.format("#%06X", PALETTE[wpColour] & 0xFFFFFF);
         status = "saving waypoint\u2026";
-        GroundTruthMod.api.saveWaypoint(GroundTruthMod.code(), wpName, world, bx, bz,
+        GroundTruthMod.api.saveWaypoint(GroundTruthMod.code(), name, world, bx, bz,
                         wpPublic ? 1 : 0, colour)
                 .thenAccept(body -> {
                     boolean ok = body != null && body.contains("\"ok\":true");
-                    Minecraft.getInstance().execute(() -> status = ok
-                            ? ("saved " + (wpPublic ? "public " : "") + "waypoint " + wpName)
-                            : "could not save waypoint");
+                    Minecraft.getInstance().execute(() -> {
+                        status = ok ? ("saved " + (wpPublic ? "public " : "") + "waypoint " + name)
+                                    : "could not save waypoint";
+                        if (ok) loadLayers();
+                    });
                 });
         wpName = null;
-        menuAt = null;
+        wpEditing = false;
+    }
+
+    private static int nearestPalette(int argb) {
+        int best = 0, bestD = Integer.MAX_VALUE;
+        int r = (argb >> 16) & 0xFF, gr = (argb >> 8) & 0xFF, b = argb & 0xFF;
+        for (int i = 0; i < PALETTE.length; i++) {
+            int pr = (PALETTE[i] >> 16) & 0xFF, pg = (PALETTE[i] >> 8) & 0xFF, pb = PALETTE[i] & 0xFF;
+            int d = (r - pr) * (r - pr) + (gr - pg) * (gr - pg) + (b - pb) * (b - pb);
+            if (d < bestD) {
+                bestD = d;
+                best = i;
+            }
+        }
+        return best;
     }
 
     // --- input ----------------------------------------------------------------------------------
@@ -627,12 +847,13 @@ public class GroundTruthScreen extends Screen {
     public boolean mouseClicked(MouseButtonEvent e, boolean doubleClick) {
         double mx = e.x(), my = e.y();
         if (wpName != null) {
-            int x = (this.width - 260) / 2, y = (this.height - 66) / 2;
-            if (my >= y + 34 && my <= y + 48 && mx >= x + 6 && mx <= x + 26) {
+            int x = (this.width - WP_W) / 2, y = (this.height - WP_H) / 2;
+            if (my >= y + 36 && my <= y + 50 && mx >= x + 6 && mx <= x + 26) {
                 wpColour = (wpColour + 1) % PALETTE.length;
             }
             return true;
         }
+        if (wpPanelOpen && clickWaypointPanel(mx, my)) return true;
         if (filterOpen) {
             clickFilter(mx, my);
             return true;
@@ -786,14 +1007,36 @@ public class GroundTruthScreen extends Screen {
             showWaypoints = !showWaypoints;
             return true;
         }
+        if (e.key() == 82) {                        // R: own recent trail
+            showTrail = !showTrail;
+            if (showTrail) loadTrail();
+            else trail.clear();
+            return true;
+        }
+        if (e.key() == 76) {                        // L: waypoint list
+            wpPanelOpen = !wpPanelOpen;
+            filterOpen = false;
+            settingsOpen = false;
+            if (wpPanelOpen) {
+                if (GroundTruthMod.hasCode()) {
+                    loadLayers();
+                } else {
+                    status = "requesting a login code\u2026";
+                    GroundTruthMod.requestLink();
+                }
+            }
+            return true;
+        }
         if (e.key() == 70) {                        // F: structure filter
             filterOpen = !filterOpen;
             settingsOpen = false;
+            wpPanelOpen = false;
             return true;
         }
         if (e.key() == 79) {                        // O: colours
             settingsOpen = !settingsOpen;
             filterOpen = false;
+            wpPanelOpen = false;
             return true;
         }
         return super.keyPressed(e);
@@ -835,7 +1078,15 @@ public class GroundTruthScreen extends Screen {
 
     private static final class Wp {
         String name;
+        String uuid;
         int x, z, colour;
+        boolean isPublic;
+
+        /** True when this waypoint belongs to the logged-in player. */
+        boolean mine() {
+            String me = GroundTruthMod.playerUuid();
+            return me != null && me.equals(uuid);
+        }
     }
 
     private final List<Wp> waypoints = new ArrayList<>();
