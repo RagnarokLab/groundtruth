@@ -1,9 +1,9 @@
 package club.footlickers.groundtruth.mod;
 
-import com.mojang.blaze3d.platform.NativeImage;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.mojang.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.Screen;
@@ -16,15 +16,18 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * The in-game GroundTruth map.
  *
- * <p>Drag to pan, scroll to zoom, right-click for options. Two sources, because they cover different
- * ranges: the prebuilt tile pyramid (<b>one pixel per chunk</b> at its finest) for everything zoomed
- * out, and /api/detail (real per-block colours and heights) once you are close enough that a chunk is
- * more than a pixel - the same split the web viewer uses.
+ * <p>Drag to pan, scroll to zoom, right-click for options, F for the structure filter, O for colours.
+ * Two sources, because they cover different ranges: the prebuilt tile pyramid (<b>one pixel per
+ * chunk</b> at its finest) for everything zoomed out, and /api/detail (real per-block colours and
+ * heights) once you are close enough that a chunk is more than a pixel - the same split the web
+ * viewer uses.
  */
 public class GroundTruthScreen extends Screen {
 
@@ -34,7 +37,7 @@ public class GroundTruthScreen extends Screen {
     private static final double MIN_BPP = 1.0, MAX_BPP = 512.0, ZOOM_STEP = 1.5;
     private static final double DETAIL_BPP = 2.0;
     private static final int DETAIL_MAX_CHUNKS = 4096;
-    private static final int[] WAYPOINT_COLOURS = {
+    private static final int[] PALETTE = {
         0xFFFFFF, 0xFFD25C, 0x8ADF6B, 0x5CC8FF, 0xFF8A5C, 0xD08CFF, 0xFF6BAE, 0x9AA4B2,
     };
 
@@ -45,38 +48,48 @@ public class GroundTruthScreen extends Screen {
     private double bpp = 32;
     private boolean panning = false;
     private double panPx = 0, panPy = 0;
+    private boolean dragged = false;
 
     private volatile NativeImage pending = null;
     private double pendingBpp = 1;
+    private boolean pendingIsDetail = false;
+    private double pendingOriginX = 0, pendingOriginZ = 0;
     private NativeImage shown = null;
     private int mapW = -1, mapH = -1;
     private double shownBpp = 1;
+    private boolean shownIsDetail = false;
+    private double shownOriginX = 0, shownOriginZ = 0;
     private boolean registered = false;
 
     private int refetchIn = -1;
     private int mapGen = 0;
 
-    /** Right-click menu: null when closed, otherwise the block coords it was opened over. */
+    // right-click menu
     private int[] menuAt = null;
     private double menuX, menuY;
 
-    /** Waypoint prompt: non-null while asking for a name. */
+    // waypoint prompt
     private String wpName = null;
     private boolean wpPublic = false;
     private int wpColour = 1;
 
-    private String lastDiag = null;
-
-    /** Overlay layers, mirroring what the web map can show. */
-    private static final class Wp {
-        String name;
-        int x, z, colour;
-    }
-
-    private final List<Wp> waypoints = new ArrayList<>();
-    private final List<int[]> structures = new ArrayList<>();   // x, z in block coords
+    // overlays
+    private final List<int[]> structures = new ArrayList<>();     // x, z, type index
+    private final List<String> structTypes = new ArrayList<>();
+    private final Set<Integer> structHidden = new HashSet<>();
+    private final List<int[]> structVisible = new ArrayList<>();  // cached per window
+    private double cachedWx0 = Double.NaN, cachedWz0, cachedWx1, cachedWz1;
     private volatile Long seed = null;
     private boolean showWaypoints = true, showStructures = true, showSlime = false;
+    private int iconColour = 1, slimeColour = 2;
+
+    // panels
+    private boolean filterOpen = false;
+    private String filterText = "";
+    private boolean settingsOpen = false;
+    private int[] structPopup = null;                             // x, z, type index
+
+    private String lastDiag = null;
 
     public GroundTruthScreen() {
         super(Component.literal("GroundTruth"));
@@ -103,16 +116,18 @@ public class GroundTruthScreen extends Screen {
         });
     }
 
-    /** Blocks covered by one GUI pixel. */
-    private double bpp() {
-        return bpp;
-    }
-
     /** Screen position of a block coordinate. */
     private double[] screenOf(double bx, double bz) {
         return new double[]{
             (bx - mapX) / bpp + this.width / 2.0,
             (bz - mapZ) / bpp + this.height / 2.0,
+        };
+    }
+
+    private double[] blockOf(double sx, double sy) {
+        return new double[]{
+            mapX + (sx - this.width / 2.0) * bpp,
+            mapZ + (sy - this.height / 2.0) * bpp,
         };
     }
 
@@ -145,6 +160,10 @@ public class GroundTruthScreen extends Screen {
                     }
                     pending = img;
                     pendingBpp = 1;
+                    pendingIsDetail = true;
+                    // the detail image starts at the first chunk it covers, NOT at the map centre
+                    pendingOriginX = cx0 * 16.0;
+                    pendingOriginZ = cz0 * 16.0;
                     status = world + " @ " + (int) cx + "," + (int) cz + "  " + fmtBpp(at);
                 });
             });
@@ -175,6 +194,7 @@ public class GroundTruthScreen extends Screen {
                 }
                 pending = img;
                 pendingBpp = 16.0 * (1 << zz);
+                pendingIsDetail = false;
                 status = world + " @ " + (int) cx + "," + (int) cz + "  " + fmtBpp(at);
             });
         });
@@ -210,47 +230,65 @@ public class GroundTruthScreen extends Screen {
             mapW = img.getWidth();
             mapH = img.getHeight();
             shownBpp = pendingBpp;
+            shownIsDetail = pendingIsDetail;
+            shownOriginX = pendingOriginX;
+            shownOriginZ = pendingOriginZ;
             panPx = 0;
             panPy = 0;
         }
 
         if (registered && mapW > 0 && mapH > 0) {
-            // the texture is one pixel per shownBpp blocks; dest size is independent of source size,
-            // which is what makes zooming work. The pixel-rect overload is the one that draws reliably.
             double scale = shownBpp / bpp;
             double dw = mapW * scale, dh = mapH * scale;
-            int dx = (int) Math.round((this.width - dw) / 2 + panPx);
-            int dy = (int) Math.round((this.height - dh) / 2 + panPy);
+            int dx, dy;
+            if (shownIsDetail) {
+                // position by the image's own origin so overlays land on the right blocks
+                double[] s = screenOf(shownOriginX, shownOriginZ);
+                dx = (int) Math.round(s[0] + panPx);
+                dy = (int) Math.round(s[1] + panPy);
+            } else {
+                dx = (int) Math.round((this.width - dw) / 2 + panPx);
+                dy = (int) Math.round((this.height - dh) / 2 + panPy);
+            }
             g.blit(RenderPipelines.GUI_TEXTURED, MAP_TEX, dx, dy, 0f, 0f,
                     (int) Math.round(dw), (int) Math.round(dh), mapW, mapH, mapW, mapH);
         }
 
         drawLayers(g);
         drawOwnMarker(g);
+        drawStructurePopup(g);
         drawMenu(g);
+        drawFilterPanel(g);
+        drawSettingsPanel(g);
         drawWaypointPrompt(g);
 
+        double[] hover = blockOf(mouseX, mouseY);
         g.text(this.font, "GroundTruth \u00b7 " + status, 12, 12, 0xFFFFFFFF);
         g.text(this.font, GroundTruthMod.api.baseUrl(), 12, 26, 0xFFA0D8FF);
+        g.text(this.font, "cursor: " + (int) Math.floor(hover[0]) + ", " + (int) Math.floor(hover[1])
+                + "   nether: " + Math.round(hover[0] / 8) + ", " + Math.round(hover[1] / 8),
+                12, 40, 0xFFC0FFC0);
         if (mc.player != null) {
-            g.text(this.font, String.format("%.0f, %.0f, %.0f",
-                    mc.player.getX(), mc.player.getY(), mc.player.getZ()), 12, 40, 0xFFC0FFC0);
+            g.text(this.font, "you: " + String.format("%.0f, %.0f, %.0f",
+                    mc.player.getX(), mc.player.getY(), mc.player.getZ()), 12, 54, 0xFF9AA4B2);
         }
-        g.text(this.font, "drag pan \u00b7 scroll zoom \u00b7 right-click options \u00b7 M closes",
+        g.text(this.font, "drag pan \u00b7 scroll zoom \u00b7 right-click options \u00b7 F structures \u00b7 O colours \u00b7 M closes",
                 12, this.height - 16, 0xFF808080);
         g.text(this.font, "[S]lime " + (showSlime ? "on" : "off")
                 + "  [T]structures " + (showStructures ? "on" : "off")
-                + "  [W]aypoints " + (showWaypoints ? "on" : "off"),
+                + "  [W]aypoints " + (showWaypoints ? "on" : "off")
+                + "  (" + (structTypes.size() - structHidden.size()) + "/" + structTypes.size() + " types shown)",
                 12, this.height - 28, 0xFF9AA4B2);
 
-        String diag = "tex=" + mapW + "x" + mapH + " shownBpp=" + shownBpp + " bpp=" + bpp;
+        String diag = "tex=" + mapW + "x" + mapH + " bpp=" + bpp;
         if (!diag.equals(lastDiag)) {
             lastDiag = diag;
             GroundTruthMod.LOGGER.info("[GroundTruth] render: {}", diag);
         }
     }
 
-    /** Waypoints, structures and slime chunks for the visible window. */
+    // --- overlays ------------------------------------------------------------------------------
+
     private void loadLayers() {
         GroundTruthMod.api.waypoints().thenAccept(body -> {
             List<Wp> list = new ArrayList<>();
@@ -267,25 +305,33 @@ public class GroundTruthScreen extends Screen {
                     list.add(w);
                 }
             } catch (Exception ignored) {
-                // a malformed list just means no waypoint markers
             }
             waypoints.clear();
             waypoints.addAll(list);
         });
         GroundTruthMod.api.text("/api/structures", "world", world).thenAccept(body -> {
             List<int[]> list = new ArrayList<>();
+            List<String> types = new ArrayList<>();
             try {
                 JsonObject root = JsonParser.parseString(body).getAsJsonObject();
                 JsonElement s = root.get("seed");
                 if (s != null && !s.isJsonNull()) seed = s.getAsLong();
                 for (JsonElement e : root.getAsJsonArray("structures")) {
                     JsonObject o = e.getAsJsonObject();
-                    list.add(new int[]{o.get("x").getAsInt(), o.get("z").getAsInt()});
+                    String type = o.get("type").getAsString();
+                    int ti = types.indexOf(type);
+                    if (ti < 0) {
+                        types.add(type);
+                        ti = types.size() - 1;
+                    }
+                    list.add(new int[]{o.get("x").getAsInt(), o.get("z").getAsInt(), ti});
                 }
             } catch (Exception ignored) {
             }
             structures.clear();
             structures.addAll(list);
+            structTypes.clear();
+            structTypes.addAll(types);
         });
     }
 
@@ -297,31 +343,50 @@ public class GroundTruthScreen extends Screen {
         }
     }
 
+    /** Structures inside the visible window, recomputed only when the window actually moves. */
+    private List<int[]> visibleStructures() {
+        double halfW = this.width / 2.0 * bpp, halfH = this.height / 2.0 * bpp;
+        double wx0 = mapX - halfW, wx1 = mapX + halfW, wz0 = mapZ - halfH, wz1 = mapZ + halfH;
+        if (!structVisible.isEmpty() && wx0 == cachedWx0 && wz0 == cachedWz0 && wx1 == cachedWx1 && wz1 == cachedWz1) {
+            return structVisible;
+        }
+        structVisible.clear();
+        for (int[] st : structures) {
+            if (st[0] < wx0 - 64 || st[0] > wx1 + 64 || st[1] < wz0 - 64 || st[1] > wz1 + 64) continue;
+            if (structHidden.contains(st[2])) continue;
+            structVisible.add(st);
+        }
+        cachedWx0 = wx0;
+        cachedWz0 = wz0;
+        cachedWx1 = wx1;
+        cachedWz1 = wz1;
+        return structVisible;
+    }
+
     private void drawLayers(GuiGraphicsExtractor g) {
         double halfW = this.width / 2.0 * bpp, halfH = this.height / 2.0 * bpp;
         double wx0 = mapX - halfW, wx1 = mapX + halfW, wz0 = mapZ - halfH, wz1 = mapZ + halfH;
 
-        // slime chunks: a pure function of the seed, so nothing needs fetching - but only worth
-        // drawing once a chunk is a few pixels across
         if (showSlime && seed != null && bpp <= 16) {
             int cx0 = (int) Math.floor(wx0 / 16), cx1 = (int) Math.ceil(wx1 / 16);
             int cz0 = (int) Math.floor(wz0 / 16), cz1 = (int) Math.ceil(wz1 / 16);
             int sz = (int) Math.max(1, Math.round(16 / bpp));
+            int col = 0x55000000 | (PALETTE[slimeColour] & 0xFFFFFF);
             for (int cx = cx0; cx <= cx1; cx++) {
                 for (int cz = cz0; cz <= cz1; cz++) {
                     if (!isSlimeChunk(seed, cx, cz)) continue;
                     double[] s = screenOf(cx * 16.0, cz * 16.0);
                     int px = (int) Math.round(s[0]), py = (int) Math.round(s[1]);
-                    g.fill(px, py, px + sz, py + sz, 0x553CE65A);
+                    g.fill(px, py, px + sz, py + sz, col);
                 }
             }
         }
         if (showStructures && bpp <= 32) {
-            for (int[] st : structures) {
-                if (st[0] < wx0 - 64 || st[0] > wx1 + 64 || st[1] < wz0 - 64 || st[1] > wz1 + 64) continue;
+            int col = 0xFF000000 | PALETTE[iconColour];
+            for (int[] st : visibleStructures()) {
                 double[] s = screenOf(st[0], st[1]);
                 int px = (int) Math.round(s[0]), py = (int) Math.round(s[1]);
-                g.fill(px - 1, py - 1, px + 2, py + 2, 0xCCFFD25C);
+                g.fill(px - 1, py - 1, px + 2, py + 2, col);
             }
         }
         if (showWaypoints) {
@@ -336,11 +401,6 @@ public class GroundTruthScreen extends Screen {
         }
     }
 
-    /**
-     * The vanilla slime-chunk formula: exact, and a pure function of the seed and chunk coordinates,
-     * so it needs no stored data. Long arithmetic wraps the same way the reference implementation's
-     * 64-bit unsigned maths does.
-     */
     private static boolean isSlimeChunk(long seed, int cx, int cz) {
         long x = cx, z = cz;
         long s = seed + x * x * 4987142L + x * 5947611L + z * z * 4392871L + z * 2918603L;
@@ -349,17 +409,123 @@ public class GroundTruthScreen extends Screen {
         return ((s >> 17) % 10) == 0;
     }
 
-    /** Your own position, so the map is anchored to something. */
     private void drawOwnMarker(GuiGraphicsExtractor g) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null) return;
         double[] s = screenOf(mc.player.getX(), mc.player.getZ());
         int x = (int) Math.round(s[0]), y = (int) Math.round(s[1]);
-        // fill takes CORNERS (x1, y1, x2, y2), not width/height
         g.fill(x - 3, y - 3, x + 4, y + 4, 0xFF101010);
         g.fill(x - 2, y - 2, x + 3, y + 3, 0xFFFFD25C);
         g.text(this.font, "you", x + 6, y - 4, 0xFFFFD25C);
     }
+
+    // --- structure popup / filter ---------------------------------------------------------------
+
+    /** Nearest structure to a screen point, within a small radius, or null. */
+    private int[] structureAt(double sx, double sy) {
+        int[] best = null;
+        double bestD = 8 * 8;
+        for (int[] st : visibleStructures()) {
+            double[] s = screenOf(st[0], st[1]);
+            double d = (s[0] - sx) * (s[0] - sx) + (s[1] - sy) * (s[1] - sy);
+            if (d < bestD) {
+                bestD = d;
+                best = st;
+            }
+        }
+        return best;
+    }
+
+    private void drawStructurePopup(GuiGraphicsExtractor g) {
+        if (structPopup == null) return;
+        String type = structPopup[2] < structTypes.size() ? structTypes.get(structPopup[2]) : "?";
+        String line = type + "  @ " + structPopup[0] + ", " + structPopup[1];
+        int w = this.font.width(line) + 12;
+        int x = Math.min((int) menuX, this.width - w - 4);
+        int y = Math.max(4, (int) menuY - 22);
+        g.fill(x, y, x + w, y + 16, 0xE0101418);
+        g.fill(x, y, x + w, y + 1, 0xFF6A7480);
+        g.text(this.font, line, x + 6, y + 4, 0xFFFFFFFF);
+    }
+
+    private static final int FILTER_W = 240, FILTER_ROW = 12, FILTER_ROWS = 14;
+
+    private List<Integer> filterMatches() {
+        List<Integer> out = new ArrayList<>();
+        String q = filterText.toLowerCase();
+        for (int i = 0; i < structTypes.size(); i++) {
+            String t = structTypes.get(i).split(":").length > 1
+                    ? structTypes.get(i).substring(structTypes.get(i).indexOf(':') + 1) : structTypes.get(i);
+            if (q.isEmpty() || t.toLowerCase().contains(q)) out.add(i);
+            if (out.size() >= FILTER_ROWS) break;
+        }
+        return out;
+    }
+
+    private void drawFilterPanel(GuiGraphicsExtractor g) {
+        if (!filterOpen) return;
+        int h = FILTER_ROWS * FILTER_ROW + 34;
+        int x = this.width - FILTER_W - 8, y = 60;
+        g.fill(x, y, x + FILTER_W, y + h, 0xE0101418);
+        g.fill(x, y, x + FILTER_W, y + 1, 0xFF6A7480);
+        g.text(this.font, "structures (search, click to toggle)", x + 6, y + 5, 0xFFFFFFFF);
+        g.fill(x + 6, y + 17, x + FILTER_W - 6, y + 29, 0xFF000000);
+        g.text(this.font, filterText + "_", x + 9, y + 20, 0xFFE8EEF5);
+        int row = 0;
+        for (int ti : filterMatches()) {
+            int ry = y + 32 + row * FILTER_ROW;
+            boolean hidden = structHidden.contains(ti);
+            String t = structTypes.get(ti);
+            t = t.contains(":") ? t.substring(t.indexOf(':') + 1) : t;
+            g.fill(x + 6, ry + 2, x + 13, ry + 9, hidden ? 0xFF30363C : 0xFF8ADF6B);
+            g.text(this.font, t, x + 17, ry + 1, hidden ? 0xFF9AA4B2 : 0xFFE8EEF5);
+            row++;
+        }
+        g.text(this.font, "F closes", x + 6, y + h - 11, 0xFF9AA4B2);
+    }
+
+    private void clickFilter(double mx, double my) {
+        int h = FILTER_ROWS * FILTER_ROW + 34;
+        int x = this.width - FILTER_W - 8, y = 60;
+        if (mx < x || mx > x + FILTER_W || my < y || my > y + h) return;
+        if (my >= y + 32) {
+            int row = (int) ((my - y - 32) / FILTER_ROW);
+            List<Integer> matches = filterMatches();
+            if (row >= 0 && row < matches.size()) {
+                int ti = matches.get(row);
+                if (!structHidden.remove(ti)) structHidden.add(ti);
+                cachedWx0 = Double.NaN;   // force the visible list to rebuild
+            }
+        }
+    }
+
+    // --- settings panel -------------------------------------------------------------------------
+
+    private static final int SET_W = 190;
+
+    private void drawSettingsPanel(GuiGraphicsExtractor g) {
+        if (!settingsOpen) return;
+        int h = 62;
+        int x = this.width - SET_W - 8, y = 60;
+        g.fill(x, y, x + SET_W, y + h, 0xE0101418);
+        g.fill(x, y, x + SET_W, y + 1, 0xFF6A7480);
+        g.text(this.font, "colours (click to change)", x + 6, y + 5, 0xFFFFFFFF);
+        g.fill(x + 6, y + 20, x + 20, y + 30, 0xFF000000 | PALETTE[iconColour]);
+        g.text(this.font, "structure icons", x + 26, y + 21, 0xFFE8EEF5);
+        g.fill(x + 6, y + 38, x + 20, y + 48, 0xFF000000 | PALETTE[slimeColour]);
+        g.text(this.font, "slime chunks", x + 26, y + 39, 0xFFE8EEF5);
+        g.text(this.font, "O closes", x + 6, y + h - 11, 0xFF9AA4B2);
+    }
+
+    private void clickSettings(double mx, double my) {
+        int h = 62;
+        int x = this.width - SET_W - 8, y = 60;
+        if (mx < x || mx > x + SET_W || my < y || my > y + h) return;
+        if (my >= y + 18 && my < y + 32) iconColour = (iconColour + 1) % PALETTE.length;
+        else if (my >= y + 36 && my < y + 50) slimeColour = (slimeColour + 1) % PALETTE.length;
+    }
+
+    // --- right-click menu -----------------------------------------------------------------------
 
     private static final String[] MENU_ITEMS = {
         "copy overworld coords", "copy nether coords", "set waypoint", "set public waypoint",
@@ -378,8 +544,7 @@ public class GroundTruthScreen extends Screen {
         for (int i = 0; i < MENU_ITEMS.length; i++) {
             g.text(this.font, MENU_ITEMS[i], x + 6, y + 4 + i * MENU_ROW, 0xFFE8EEF5);
         }
-        g.text(this.font, "block " + menuAt[0] + ", " + menuAt[1],
-                x + 6, y + h + 3, 0xFF9AA4B2);
+        g.text(this.font, "block " + menuAt[0] + ", " + menuAt[1], x + 6, y + h + 3, 0xFF9AA4B2);
     }
 
     private void drawWaypointPrompt(GuiGraphicsExtractor g) {
@@ -391,11 +556,12 @@ public class GroundTruthScreen extends Screen {
         g.fill(x, y + h - 1, x + w, y + h, 0xFF6A7480);
         g.text(this.font, "new waypoint", x + 8, y + 6, 0xFFFFFFFF);
         g.text(this.font, "name: " + wpName + "_", x + 8, y + 22, 0xFFE8EEF5);
-        g.fill(x + 8, y + 36, x + 22, y + 46, 0xFF000000 | WAYPOINT_COLOURS[wpColour]);
+        g.fill(x + 8, y + 36, x + 22, y + 46, 0xFF000000 | PALETTE[wpColour]);
         g.text(this.font, "colour (click)", x + 28, y + 37, 0xFF9AA4B2);
         g.text(this.font, wpPublic ? "public" : "private", x + 150, y + 37,
                 wpPublic ? 0xFF8ADF6B : 0xFF9AA4B2);
-        g.text(this.font, "enter save \u00b7 tab public/private \u00b7 esc cancel", x + 8, y + 52, 0xFF9AA4B2);
+        g.text(this.font, GroundTruthMod.hasCode() ? "login ready \u00b7 enter saves"
+                : "asking the server for a login code\u2026", x + 8, y + 52, 0xFF9AA4B2);
     }
 
     private void menuAction(int index) {
@@ -425,21 +591,23 @@ public class GroundTruthScreen extends Screen {
         wpPublic = isPublic;
         wpColour = 1;
         if (!GroundTruthMod.hasCode()) {
-            // no stored login: ask the server for one. It answers in chat and the mod reads it there,
-            // so nothing has to be copied out of the game.
             status = "requesting a login code\u2026";
             GroundTruthMod.requestLink();
         }
     }
 
     private void saveWaypoint() {
-        if (menuAt == null || wpName == null || wpName.isEmpty()) return;
+        if (menuAt == null || wpName == null || wpName.isEmpty()) {
+            status = "give the waypoint a name first";
+            return;
+        }
         if (!GroundTruthMod.hasCode()) {
-            status = "still waiting for a login code";
+            status = "still waiting for a login code from the server";
+            GroundTruthMod.requestLink();
             return;
         }
         int bx = menuAt[0], bz = menuAt[1];
-        String colour = String.format("#%06X", WAYPOINT_COLOURS[wpColour] & 0xFFFFFF);
+        String colour = String.format("#%06X", PALETTE[wpColour] & 0xFFFFFF);
         status = "saving waypoint\u2026";
         GroundTruthMod.api.saveWaypoint(GroundTruthMod.code(), wpName, world, bx, bz,
                         wpPublic ? 1 : 0, colour)
@@ -453,13 +621,24 @@ public class GroundTruthScreen extends Screen {
         menuAt = null;
     }
 
+    // --- input ----------------------------------------------------------------------------------
+
     @Override
     public boolean mouseClicked(MouseButtonEvent e, boolean doubleClick) {
         double mx = e.x(), my = e.y();
-        if (wpName != null) {                       // the prompt swallows clicks
-            if (my >= (this.height - 66) / 2.0 + 36 && my <= (this.height - 66) / 2.0 + 48) {
-                wpColour = (wpColour + 1) % WAYPOINT_COLOURS.length;
+        if (wpName != null) {
+            int x = (this.width - 260) / 2, y = (this.height - 66) / 2;
+            if (my >= y + 34 && my <= y + 48 && mx >= x + 6 && mx <= x + 26) {
+                wpColour = (wpColour + 1) % PALETTE.length;
             }
+            return true;
+        }
+        if (filterOpen) {
+            clickFilter(mx, my);
+            return true;
+        }
+        if (settingsOpen) {
+            clickSettings(mx, my);
             return true;
         }
         if (menuAt != null) {
@@ -473,16 +652,14 @@ public class GroundTruthScreen extends Screen {
         }
         if (e.button() == 0) {
             panning = true;
+            dragged = false;
             panPx = 0;
             panPy = 0;
             return true;
         }
         if (e.button() == 1) {
-            double[] world2 = new double[]{
-                mapX + (mx - this.width / 2.0) * bpp,
-                mapZ + (my - this.height / 2.0) * bpp,
-            };
-            menuAt = new int[]{(int) Math.round(world2[0]), (int) Math.round(world2[1])};
+            double[] b = blockOf(mx, my);
+            menuAt = new int[]{(int) Math.round(b[0]), (int) Math.round(b[1])};
             menuX = Math.min(mx, this.width - MENU_W - 4);
             menuY = Math.min(my, this.height - MENU_ITEMS.length * MENU_ROW - 20);
             return true;
@@ -495,6 +672,7 @@ public class GroundTruthScreen extends Screen {
         if (panning) {
             panPx += dx;
             panPy += dy;
+            if (Math.abs(panPx) > 2 || Math.abs(panPy) > 2) dragged = true;
             return true;
         }
         return super.mouseDragged(e, dx, dy);
@@ -504,11 +682,21 @@ public class GroundTruthScreen extends Screen {
     public boolean mouseReleased(MouseButtonEvent e) {
         if (panning && e.button() == 0) {
             panning = false;
-            // Move the centre by what was dragged, but KEEP the offset until the new image lands -
-            // clearing it here made the map jump back, then jump again.
-            mapX -= panPx * bpp;
-            mapZ -= panPy * bpp;
-            refetchSoon();
+            if (dragged) {
+                mapX -= panPx * bpp;
+                mapZ -= panPy * bpp;
+                refetchSoon();
+            } else {
+                // a click, not a drag: select a structure under the cursor
+                int[] st = structureAt(e.x(), e.y());
+                structPopup = st;
+                if (st != null) {
+                    menuX = e.x();
+                    menuY = e.y();
+                }
+            }
+            panPx = 0;
+            panPy = 0;
             return true;
         }
         return super.mouseReleased(e);
@@ -521,6 +709,7 @@ public class GroundTruthScreen extends Screen {
         next = Math.max(MIN_BPP, Math.min(MAX_BPP, next));
         if (next != bpp) {
             bpp = next;
+            cachedWx0 = Double.NaN;
             refetchSoon();
         }
         return true;
@@ -528,9 +717,20 @@ public class GroundTruthScreen extends Screen {
 
     @Override
     public boolean charTyped(CharacterEvent e) {
+        char c = (char) e.codepoint();
         if (wpName != null) {
-            char c = (char) e.codepoint();
+            if (c == '\r' || c == '\n') {           // some keyboards deliver Enter as a character
+                saveWaypoint();
+                return true;
+            }
             if (c >= 32 && c < 127 && wpName.length() < 24) wpName += c;
+            return true;
+        }
+        if (filterOpen) {
+            if (c >= 32 && c < 127 && filterText.length() < 20) {
+                filterText += c;
+                cachedWx0 = Double.NaN;
+            }
             return true;
         }
         return super.charTyped(e);
@@ -539,7 +739,7 @@ public class GroundTruthScreen extends Screen {
     @Override
     public boolean keyPressed(KeyEvent e) {
         if (wpName != null) {
-            if (e.key() == 259) {                   // backspace
+            if (e.key() == 259) {
                 if (!wpName.isEmpty()) wpName = wpName.substring(0, wpName.length() - 1);
                 return true;
             }
@@ -547,18 +747,30 @@ public class GroundTruthScreen extends Screen {
                 saveWaypoint();
                 return true;
             }
-            if (e.key() == 258) {                   // tab: public <-> private
+            if (e.key() == 258) {
                 wpPublic = !wpPublic;
                 return true;
             }
-            if (e.key() == 256) {                   // esc cancels the prompt, not the map
+            if (e.key() == 256) {
                 wpName = null;
                 menuAt = null;
                 return true;
             }
             return true;
         }
-        if (e.key() == 77) {                        // GLFW_KEY_M toggles the map closed
+        if (filterOpen) {
+            if (e.key() == 259) {
+                if (!filterText.isEmpty()) filterText = filterText.substring(0, filterText.length() - 1);
+            } else if (e.key() == 70 || e.key() == 256) {
+                filterOpen = false;
+            }
+            return true;
+        }
+        if (settingsOpen) {
+            if (e.key() == 79 || e.key() == 256) settingsOpen = false;
+            return true;
+        }
+        if (e.key() == 77) {                        // M toggles the map closed
             this.onClose();
             return true;
         }
@@ -572,6 +784,16 @@ public class GroundTruthScreen extends Screen {
         }
         if (e.key() == 87) {                        // W: waypoints
             showWaypoints = !showWaypoints;
+            return true;
+        }
+        if (e.key() == 70) {                        // F: structure filter
+            filterOpen = !filterOpen;
+            settingsOpen = false;
+            return true;
+        }
+        if (e.key() == 79) {                        // O: colours
+            settingsOpen = !settingsOpen;
+            filterOpen = false;
             return true;
         }
         return super.keyPressed(e);
@@ -589,10 +811,6 @@ public class GroundTruthScreen extends Screen {
         return "NORMAL";
     }
 
-    /**
-     * Find the server world whose environment matches, from /api/worlds. Deliberately a scan rather
-     * than a JSON library: the shape is one flat object per world.
-     */
     private static String pickWorld(String json, String env) {
         if (json == null) return null;
         String first = null;
@@ -614,4 +832,11 @@ public class GroundTruthScreen extends Screen {
         }
         return first;
     }
+
+    private static final class Wp {
+        String name;
+        int x, z, colour;
+    }
+
+    private final List<Wp> waypoints = new ArrayList<>();
 }
