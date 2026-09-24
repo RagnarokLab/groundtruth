@@ -1152,15 +1152,21 @@ def waypoints_list(uuid):
         conn.close()
 
 
-def waypoint_put(uuid, name, world, x, y, z, is_public):
+def waypoint_put(uuid, name, world, x, y, z, is_public, colour=None):
     now = int(time.time())
+    # keep the colour to a plain #rrggbb so nothing arbitrary ends up rendered on the map
+    if colour:
+        colour = "#" + "".join(c for c in colour.lstrip("#") if c in "0123456789abcdefABCDEF")[:6]
+        if len(colour) != 7:
+            colour = None
     conn = db_rw()
     try:
         conn.execute(
-            "INSERT INTO waypoints (uuid,name,world,x,y,z,public,created_ts,updated_ts) VALUES (?,?,?,?,?,?,?,?,?) "
+            "INSERT INTO waypoints (uuid,name,world,x,y,z,colour,public,created_ts,updated_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(uuid,name) DO UPDATE SET world=excluded.world, x=excluded.x, y=excluded.y, z=excluded.z, "
-            "public=excluded.public, updated_ts=excluded.updated_ts",
-            (uuid, name, world, x, y, z, 1 if is_public else 0, now, now))
+            "colour=excluded.colour, public=excluded.public, updated_ts=excluded.updated_ts",
+            (uuid, name, world, x, y, z, colour, 1 if is_public else 0, now, now))
         conn.commit()
         return True
     except Exception:
@@ -1864,7 +1870,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": waypoint_put(
                         uuid, name, qs.get("world", ["world"])[0],
                         int(qs["x"][0]), int(qs.get("y", ["64"])[0]), int(qs["z"][0]),
-                        qs.get("public", ["0"])[0] in ("1", "true", "yes"))})
+                        qs.get("public", ["0"])[0] in ("1", "true", "yes"),
+                        qs.get("colour", [None])[0])})
             except (ValueError, KeyError):
                 self.send_response(400); self.end_headers()
             return

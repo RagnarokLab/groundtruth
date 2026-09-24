@@ -1,9 +1,11 @@
 package club.footlickers.groundtruth.mod;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
@@ -75,6 +77,17 @@ public final class GtApi {
                 "zoom", Integer.toString(zoom), "w", Integer.toString(w), "h", Integer.toString(h));
     }
 
+    /**
+     * Per-block detail for a chunk range: the true block colour and height of every block, 16x16 per
+     * chunk, deflated and base64'd. This is what gives the close-in view real block detail - the tile
+     * pyramid bottoms out at one pixel per chunk.
+     */
+    public CompletableFuture<String> detail(String world, int cx0, int cz0, int cx1, int cz1) {
+        return text("/api/detail",
+                "world", world, "cx0", Integer.toString(cx0), "cz0", Integer.toString(cz0),
+                "cx1", Integer.toString(cx1), "cz1", Integer.toString(cz1));
+    }
+
     /** A prerendered 3D mesh tile (10x10-chunk grid): <tiles>/<world>/mesh/lod0/<tx>_<tz>.gtmesh */
     public CompletableFuture<byte[]> meshTile(String world, int tx, int tz) {
         return bytes("/tiles/" + world + "/mesh/lod0/" + tx + "_" + tz + ".gtmesh");
@@ -93,5 +106,34 @@ public final class GtApi {
     /** Waypoints (public to all, private to their owner). */
     public CompletableFuture<String> waypoints() {
         return text("/api/waypoints");
+    }
+
+    /**
+     * Create or update one of the caller's waypoints. Needs their login code, which the mod captures
+     * from chat rather than asking for.
+     */
+    public CompletableFuture<String> saveWaypoint(String code, String name, String world,
+                                                 int x, int z, int isPublic, String colour) {
+        String query = form("code", code, "name", name, "world", world,
+                "x", Integer.toString(x), "y", "64", "z", Integer.toString(z),
+                "public", Integer.toString(isPublic), "colour", colour);
+        HttpRequest req = HttpRequest.newBuilder(URI.create(baseUrl + "/api/waypoints?" + query))
+                .timeout(Duration.ofSeconds(15))
+                .header("User-Agent", USER_AGENT)
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build();
+        return HTTP.sendAsync(req, HttpResponse.BodyHandlers.ofString())
+                .thenApply(r -> r.statusCode() == 200 ? r.body() : null)
+                .exceptionally(e -> null);
+    }
+
+    private static String form(String... kv) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i + 1 < kv.length; i += 2) {
+            if (i > 0) sb.append('&');
+            sb.append(URLEncoder.encode(kv[i], StandardCharsets.UTF_8)).append('=')
+              .append(URLEncoder.encode(kv[i + 1] == null ? "" : kv[i + 1], StandardCharsets.UTF_8));
+        }
+        return sb.toString();
     }
 }

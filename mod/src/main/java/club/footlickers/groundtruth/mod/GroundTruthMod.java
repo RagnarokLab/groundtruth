@@ -3,6 +3,7 @@ package club.footlickers.groundtruth.mod;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ServerData;
@@ -23,8 +24,18 @@ public class GroundTruthMod implements ClientModInitializer {
     private static final Identifier API_RESOURCE =
             Identifier.fromNamespaceAndPath("groundtruth", "api.txt");
 
-    /** The plugin web API for the server currently connected to; set when the map is opened. */
     public static volatile GtApi api = new GtApi("http://127.0.0.1:8095", "");
+
+    /** The player's login code, captured from chat. Never typed or pasted by hand. */
+    private static volatile String loginCode = null;
+
+    public static boolean hasCode() {
+        return loginCode != null;
+    }
+
+    public static String code() {
+        return loginCode;
+    }
 
     /**
      * Where the map API lives.
@@ -50,7 +61,6 @@ public class GroundTruthMod implements ClientModInitializer {
         return "http://127.0.0.1:8095";
     }
 
-    /** The map URL the server published in its resource pack, or null when it published none. */
     private static String packApi(Minecraft mc) {
         try {
             List<Resource> stack = mc.getResourceManager().getResourceStack(API_RESOURCE);
@@ -66,10 +76,39 @@ public class GroundTruthMod implements ClientModInitializer {
         return null;
     }
 
+    /**
+     * Ask the server for a login code. It answers in chat and {@link #captureCode} picks it up, so
+     * nothing has to be copied out of the game - you cannot copy Minecraft chat.
+     */
+    public static void requestLink() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player != null && mc.getConnection() != null) {
+            mc.getConnection().sendCommand("groundtruth link");
+        }
+    }
+
+    /**
+     * A login code is a base64url payload and signature joined by a dot, and nothing else in chat
+     * looks like that, so it can be recognised without matching any of the surrounding wording.
+     */
+    private static void captureCode(String text) {
+        if (text == null) return;
+        for (String tok : text.split("[\\s,;]+")) {
+            int dot = tok.indexOf('.');
+            if (tok.startsWith("eyJ") && dot > 20 && dot < tok.length() - 10) {
+                loginCode = tok;
+                LOGGER.info("[GroundTruth] captured a login code from chat");
+                return;
+            }
+        }
+    }
+
     private KeyMapping openKey;
 
     @Override
     public void onInitializeClient() {
+        // The server states the map URL in its resource pack; the login code arrives in chat.
+        ClientReceiveMessageEvents.GAME.register((message, overlay) -> captureCode(message.getString()));
         KeyMapping.Category category = new KeyMapping.Category(
                 Identifier.fromNamespaceAndPath("groundtruth", "map"));
         openKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
