@@ -48,6 +48,8 @@ public class GroundTruthScreen extends Screen {
 
     private volatile String status = "connecting\u2026";
     private volatile String world = null;
+    /** The dimension the player is in (NORMAL/NETHER/THE_END) - decides how coords translate. */
+    private String dim = "NORMAL";
 
     private double mapX, mapZ;
     private double bpp = 32;
@@ -130,6 +132,7 @@ public class GroundTruthScreen extends Screen {
         mapX = mc.player.getX();
         mapZ = mc.player.getZ();
         final String env = envOf(mc);
+        dim = env;
         GroundTruthMod.api.worlds().thenAccept(body -> {
             world = pickWorld(body, env);
             if (world == null) {
@@ -348,7 +351,7 @@ public class GroundTruthScreen extends Screen {
         g.text(this.font, GroundTruthMod.api.baseUrl(), 12, 26, 0xFFA0D8FF);
         String hoverBiome = biomeAt(hover[0], hover[1]);
         g.text(this.font, "cursor: " + (int) Math.floor(hover[0]) + ", " + (int) Math.floor(hover[1])
-                + "   nether: " + Math.round(hover[0] / 8) + ", " + Math.round(hover[1] / 8)
+                + "   " + otherLabel() + ": " + otherX(hover[0]) + ", " + otherZ(hover[1])
                 + "   biome: " + (hoverBiome == null ? "\u2026" : shortBiome(hoverBiome)),
                 12, 40, 0xFFC0FFC0);
         if (mc.player != null) {
@@ -611,6 +614,25 @@ public class GroundTruthScreen extends Screen {
         return s.replace('_', ' ');
     }
 
+    // --- coordinate scaling (overworld <-> nether) ----------------------------------------------
+
+    private boolean isNether() {
+        return "NETHER".equals(dim);
+    }
+
+    /** The paired dimension's coordinate: the nether is overworld/8, and the overworld is nether*8. */
+    private int otherX(double x) {
+        return (int) Math.round(isNether() ? x * 8.0 : x / 8.0);
+    }
+
+    private int otherZ(double z) {
+        return (int) Math.round(isNether() ? z * 8.0 : z / 8.0);
+    }
+
+    private String otherLabel() {
+        return isNether() ? "overworld" : "nether";
+    }
+
     // --- structure popup / filter ---------------------------------------------------------------
 
     /** Nearest structure to a screen point, within a small radius, or null. */
@@ -819,9 +841,15 @@ public class GroundTruthScreen extends Screen {
         g.fill(x, y, x + 1, y + h, 0xFF6A7480);
         g.fill(x + MENU_W - 1, y, x + MENU_W, y + h, 0xFF6A7480);
         for (int i = 0; i < MENU_ITEMS.length; i++) {
-            g.text(this.font, MENU_ITEMS[i], x + 6, y + 4 + i * MENU_ROW, 0xFFE8EEF5);
+            g.text(this.font, menuLabel(i), x + 6, y + 4 + i * MENU_ROW, 0xFFE8EEF5);
         }
         g.text(this.font, "block " + menuAt[0] + ", " + menuAt[1], x + 6, y + h + 3, 0xFF9AA4B2);
+    }
+
+    /** The menu rows, with the coordinate row named for the dimension you are actually in. */
+    private String menuLabel(int i) {
+        if (i == 1) return "copy " + otherLabel() + " coords";
+        return MENU_ITEMS[i];
     }
 
     private void drawWaypointPrompt(GuiGraphicsExtractor g) {
@@ -854,9 +882,9 @@ public class GroundTruthScreen extends Screen {
                 status = "copied " + bx + " " + bz;
             }
             case 1 -> {
-                int nx = Math.round(bx / 8.0f), nz = Math.round(bz / 8.0f);
+                int nx = otherX(bx), nz = otherZ(bz);
                 mc.keyboardHandler.setClipboard(nx + " " + nz);
-                status = "copied nether " + nx + " " + nz;
+                status = "copied " + otherLabel() + " " + nx + " " + nz;
             }
             case 2 -> openWaypointPrompt(false);
             case 3 -> openWaypointPrompt(true);
