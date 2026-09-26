@@ -107,14 +107,25 @@ public class GroundTruthScreen extends Screen {
     private final List<int[]> structVisible = new ArrayList<>();  // cached per window
     private double cachedWx0 = Double.NaN, cachedWz0, cachedWx1, cachedWz1;
     private volatile Long seed = null;
-    private boolean showWaypoints = true, showStructures = true, showSlime = false;
+    private boolean showWaypoints = true, showStructures = false, showSlime = false;
     private int iconColour = 1, slimeColour = 2;
+    /** True once the noisy types have been hidden for the first load. */
+    private boolean structDefaultsApplied = false;
 
     // panels
     private boolean filterOpen = false;
     private String filterText = "";
     private boolean settingsOpen = false;
     private int[] structPopup = null;                             // x, z, type index
+
+    // search & jump
+    private boolean searchOpen = false;
+    private String searchText = "";
+    private final List<Hit> searchHits = new ArrayList<>();
+
+    // players panel (admin only)
+    private boolean playersOpen = false;
+    private final List<Hit> playerHits = new ArrayList<>();
 
     private String lastDiag = null;
 
@@ -344,6 +355,8 @@ public class GroundTruthScreen extends Screen {
         drawFilterPanel(g);
         drawSettingsPanel(g);
         drawWaypointPanel(g);
+        drawSearchPanel(g);
+        drawPlayersPanel(g);
         drawWaypointPrompt(g);
 
         double[] hover = blockOf(mouseX, mouseY);
@@ -358,7 +371,7 @@ public class GroundTruthScreen extends Screen {
             g.text(this.font, "you: " + String.format("%.0f, %.0f, %.0f",
                     mc.player.getX(), mc.player.getY(), mc.player.getZ()), 12, 54, 0xFF9AA4B2);
         }
-        g.text(this.font, "drag pan \u00b7 scroll zoom \u00b7 right-click options \u00b7 F structures \u00b7 O colours \u00b7 L waypoints \u00b7 M closes",
+        g.text(this.font, "drag pan \u00b7 scroll zoom \u00b7 right-click options \u00b7 F structures \u00b7 O colours \u00b7 L waypoints \u00b7 J search \u00b7 P players \u00b7 M closes",
                 12, this.height - 16, 0xFF808080);
         g.text(this.font, "[S]lime " + (showSlime ? "on" : "off")
                 + "  [T]structures " + (showStructures ? "on" : "off")
@@ -423,7 +436,33 @@ public class GroundTruthScreen extends Screen {
             structures.addAll(list);
             structTypes.clear();
             structTypes.addAll(types);
+            // The map ships ~250 structure types and most of the noisy ones are underground. Hide
+            // those by default so the overlay opens as a readable surface map, not a field of dots;
+            // shift-click in the filter still shows everything, and a type can be re-enabled by
+            // clicking it. Applied once so it never undoes the player's own toggles.
+            if (!structDefaultsApplied) {
+                structDefaultsApplied = true;
+                for (int i = 0; i < structTypes.size(); i++) {
+                    if (looksUnderground(structTypes.get(i))) structHidden.add(i);
+                }
+                cachedWx0 = Double.NaN;
+            }
         });
+    }
+
+    /** Structure types that sit underground (or are far too common to draw by default). */
+    private static final String[] NOISY_TYPE_HINTS = {
+        "underground", "cave", "mineshaft", "deepslate", "catacomb", "crypt", "trial",
+        "dungeon", "monster_room", "bunker", "ancient_city", "stronghold",
+        "mining_outpost", "old_refinery", "sunken_tower", "giant_bee_hive",
+    };
+
+    private static boolean looksUnderground(String type) {
+        String t = type.toLowerCase();
+        for (String hint : NOISY_TYPE_HINTS) {
+            if (t.contains(hint)) return true;
+        }
+        return false;
     }
 
     /**
@@ -824,6 +863,178 @@ public class GroundTruthScreen extends Screen {
         });
     }
 
+    // --- search & jump --------------------------------------------------------------------------
+
+    private static final int SEARCH_ROWS = 12, SEARCH_ROW = 12, SEARCH_W = 300;
+
+    /** One jump target: a label plus where it is. */
+    private static final class Hit {
+        final String label;
+        final int x, z, colour;
+
+        Hit(String label, int x, int z, int colour) {
+            this.label = label;
+            this.x = x;
+            this.z = z;
+            this.colour = colour;
+        }
+    }
+
+    private static String shortType(String t) {
+        return t.contains(":") ? t.substring(t.indexOf(':') + 1) : t;
+    }
+
+    /** Build the hit list for the current text: coordinates, then waypoints, then structures. */
+    private void updateSearch() {
+        searchHits.clear();
+        String q = searchText.trim().toLowerCase();
+        if (q.isEmpty()) return;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("^(-?\\d{1,7})[ ,]+(-?\\d{1,7})$").matcher(q);
+        if (m.matches()) {
+            int x = Integer.parseInt(m.group(1)), z = Integer.parseInt(m.group(2));
+            searchHits.add(new Hit("jump to " + x + ", " + z, x, z, 0xFFFFD25C));
+        }
+        for (Wp w : waypoints) {
+            if (searchHits.size() >= SEARCH_ROWS) break;
+            if (w.name.toLowerCase().contains(q)) {
+                searchHits.add(new Hit("waypoint  " + w.name, w.x, w.z, w.colour));
+            }
+        }
+        // structures whose type matches, nearest to the middle of the view first
+        List<Hit> structs = new ArrayList<>();
+        for (int[] st : structures) {
+            if (structs.size() >= 4000) break;      // bounded work per keystroke
+            String t = shortType(structTypes.get(st[2]));
+            if (t.toLowerCase().contains(q)) {
+                structs.add(new Hit(t + "  " + st[0] + ", " + st[1], st[0], st[1], 0xFF8ADF6B));
+            }
+        }
+        final double cx = mapX, cz = mapZ;
+        structs.sort((a, b) -> Double.compare(dist2(a, cx, cz), dist2(b, cx, cz)));
+        for (int i = 0; i < structs.size() && searchHits.size() < SEARCH_ROWS; i++) {
+            searchHits.add(structs.get(i));
+        }
+    }
+
+    private static double dist2(Hit h, double cx, double cz) {
+        double dx = h.x - cx, dz = h.z - cz;
+        return dx * dx + dz * dz;
+    }
+
+    private void jumpTo(int x, int z, String what) {
+        mapX = x;
+        mapZ = z;
+        cachedWx0 = Double.NaN;
+        refetchSoon();
+        searchOpen = false;
+        playersOpen = false;
+        status = "jumped to " + what;
+    }
+
+    private void drawSearchPanel(GuiGraphicsExtractor g) {
+        if (!searchOpen) return;
+        int shown = Math.min(SEARCH_ROWS, searchHits.size());
+        int h = 34 + Math.max(1, shown) * SEARCH_ROW;
+        int x = (this.width - SEARCH_W) / 2, y = 60;
+        g.fill(x, y, x + SEARCH_W, y + h, 0xE0101418);
+        g.fill(x, y, x + SEARCH_W, y + 1, 0xFF6A7480);
+        g.text(this.font, "search & jump (enter = first hit)", x + 6, y + 5, 0xFFFFFFFF);
+        g.fill(x + 6, y + 17, x + SEARCH_W - 6, y + 29, 0xFF000000);
+        g.text(this.font, searchText + "_", x + 9, y + 20, 0xFFE8EEF5);
+        if (shown == 0) {
+            g.text(this.font, searchText.isEmpty() ? "type a name, a type, or \"x z\""
+                    : "no matches", x + 6, y + 36, 0xFF9AA4B2);
+        }
+        int row = 0;
+        for (Hit hit : searchHits) {
+            if (row >= SEARCH_ROWS) break;
+            int ry = y + 32 + row * SEARCH_ROW;
+            g.fill(x + 6, ry + 2, x + 12, ry + 8, hit.colour);
+            g.text(this.font, hit.label, x + 17, ry + 1, 0xFFE8EEF5);
+            row++;
+        }
+        g.text(this.font, "J closes", x + 6, y + h - 11, 0xFF9AA4B2);
+    }
+
+    /** @return true when the click was inside the search panel and has been handled. */
+    private boolean clickSearch(double mx, double my) {
+        int shown = Math.min(SEARCH_ROWS, searchHits.size());
+        int h = 34 + Math.max(1, shown) * SEARCH_ROW;
+        int x = (this.width - SEARCH_W) / 2, y = 60;
+        if (mx < x || mx > x + SEARCH_W || my < y || my > y + h) return false;
+        int row = (int) ((my - y - 32) / SEARCH_ROW);
+        if (my >= y + 32 && row >= 0 && row < searchHits.size()) {
+            Hit hit = searchHits.get(row);
+            jumpTo(hit.x, hit.z, hit.label);
+        }
+        return true;
+    }
+
+    // --- players (admin) ------------------------------------------------------------------------
+
+    private static final int PLAYERS_W = 240, PLAYERS_ROW = 12, PLAYERS_ROWS = 12;
+
+    private void loadPlayers() {
+        GroundTruthMod.api.players().thenAccept(body -> {
+            List<Hit> hits = new ArrayList<>();
+            try {
+                JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+                for (JsonElement e : root.getAsJsonArray("players")) {
+                    JsonObject o = e.getAsJsonObject();
+                    int hx = (int) Math.round(o.get("x").getAsDouble());
+                    int hz = (int) Math.round(o.get("z").getAsDouble());
+                    String world = o.has("world") && !o.get("world").isJsonNull()
+                            ? o.get("world").getAsString() : "?";
+                    String hearts = o.has("hearts") && !o.get("hearts").isJsonNull()
+                            ? o.get("hearts").getAsString() : "?";
+                    hits.add(new Hit(o.get("name").getAsString() + "  " + hearts + "\u2665  "
+                            + hx + ", " + hz + "  " + world, hx, hz, 0xFFFFD25C));
+                }
+            } catch (Exception ignored) {
+            }
+            playerHits.clear();
+            playerHits.addAll(hits);
+        });
+    }
+
+    private void drawPlayersPanel(GuiGraphicsExtractor g) {
+        if (!playersOpen) return;
+        int shown = Math.min(PLAYERS_ROWS, playerHits.size());
+        int h = 32 + Math.max(1, shown) * PLAYERS_ROW;
+        int x = 8, y = 60;
+        g.fill(x, y, x + PLAYERS_W, y + h, 0xE0101418);
+        g.fill(x, y, x + PLAYERS_W, y + 1, 0xFF6A7480);
+        g.text(this.font, "players \u00b7 click to jump", x + 6, y + 5, 0xFFFFFFFF);
+        if (!GroundTruthMod.isAdmin()) {
+            g.text(this.font, "admin only", x + 6, y + 18, 0xFFFF6B6B);
+        } else if (playerHits.isEmpty()) {
+            g.text(this.font, "nobody online", x + 6, y + 18, 0xFF9AA4B2);
+        }
+        int row = 0;
+        for (Hit hit : playerHits) {
+            if (row >= PLAYERS_ROWS) break;
+            int ry = y + 18 + row * PLAYERS_ROW;
+            g.text(this.font, hit.label, x + 6, ry + 1, 0xFFE8EEF5);
+            row++;
+        }
+        g.text(this.font, "P closes", x + 6, y + h - 11, 0xFF9AA4B2);
+    }
+
+    /** @return true when the click was inside the players panel and has been handled. */
+    private boolean clickPlayers(double mx, double my) {
+        int shown = Math.min(PLAYERS_ROWS, playerHits.size());
+        int h = 32 + Math.max(1, shown) * PLAYERS_ROW;
+        int x = 8, y = 60;
+        if (mx < x || mx > x + PLAYERS_W || my < y || my > y + h) return false;
+        int row = (int) ((my - y - 18) / PLAYERS_ROW);
+        if (my >= y + 18 && row >= 0 && row < playerHits.size()) {
+            Hit hit = playerHits.get(row);
+            jumpTo(hit.x, hit.z, hit.label.split("  ")[0]);
+        }
+        return true;
+    }
+
     // --- right-click menu -----------------------------------------------------------------------
 
     private static final String[] MENU_ITEMS = {
@@ -979,6 +1190,8 @@ public class GroundTruthScreen extends Screen {
             return true;
         }
         if (wpPanelOpen && clickWaypointPanel(mx, my)) return true;
+        if (searchOpen && clickSearch(mx, my)) return true;
+        if (playersOpen && clickPlayers(mx, my)) return true;
         if (filterOpen) {
             clickFilter(mx, my, e.hasShiftDown());
             return true;
@@ -1079,6 +1292,13 @@ public class GroundTruthScreen extends Screen {
             }
             return true;
         }
+        if (searchOpen) {
+            if (c >= 32 && c < 127 && searchText.length() < 40) {
+                searchText += c;
+                updateSearch();
+            }
+            return true;
+        }
         return super.charTyped(e);
     }
 
@@ -1116,6 +1336,26 @@ public class GroundTruthScreen extends Screen {
             if (e.key() == 79 || e.key() == 256) settingsOpen = false;
             return true;
         }
+        if (searchOpen) {
+            if (e.key() == 259) {
+                if (!searchText.isEmpty()) {
+                    searchText = searchText.substring(0, searchText.length() - 1);
+                    updateSearch();
+                }
+            } else if (e.key() == 257 || e.key() == 335) {
+                if (!searchHits.isEmpty()) {
+                    Hit hit = searchHits.get(0);
+                    jumpTo(hit.x, hit.z, hit.label);
+                }
+            } else if (e.key() == 74 || e.key() == 256) {
+                searchOpen = false;
+            }
+            return true;
+        }
+        if (playersOpen) {
+            if (e.key() == 80 || e.key() == 256) playersOpen = false;
+            return true;
+        }
         if (e.key() == 77) {                        // M toggles the map closed
             this.onClose();
             return true;
@@ -1143,10 +1383,30 @@ public class GroundTruthScreen extends Screen {
             if (showBiome) refetchSoon();
             return true;
         }
+        if (e.key() == 74) {                        // J: search & jump
+            searchOpen = !searchOpen;
+            filterOpen = false;
+            settingsOpen = false;
+            wpPanelOpen = false;
+            playersOpen = false;
+            if (searchOpen) updateSearch();
+            return true;
+        }
+        if (e.key() == 80) {                        // P: players (admin)
+            playersOpen = !playersOpen;
+            filterOpen = false;
+            settingsOpen = false;
+            wpPanelOpen = false;
+            searchOpen = false;
+            if (playersOpen) loadPlayers();
+            return true;
+        }
         if (e.key() == 76) {                        // L: waypoint list
             wpPanelOpen = !wpPanelOpen;
             filterOpen = false;
             settingsOpen = false;
+            searchOpen = false;
+            playersOpen = false;
             if (wpPanelOpen) {
                 if (GroundTruthMod.hasCode()) {
                     loadLayers();
@@ -1161,12 +1421,16 @@ public class GroundTruthScreen extends Screen {
             filterOpen = !filterOpen;
             settingsOpen = false;
             wpPanelOpen = false;
+            searchOpen = false;
+            playersOpen = false;
             return true;
         }
         if (e.key() == 79) {                        // O: colours
             settingsOpen = !settingsOpen;
             filterOpen = false;
             wpPanelOpen = false;
+            searchOpen = false;
+            playersOpen = false;
             return true;
         }
         return super.keyPressed(e);

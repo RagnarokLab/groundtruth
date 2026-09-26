@@ -51,6 +51,11 @@ public class GroundTruthMod implements ClientModInitializer {
         return claim("u");
     }
 
+    /** True when the login token carries the admin claim (groundtruth.admin at mint time). */
+    public static boolean isAdmin() {
+        return "1".equals(claim("a"));
+    }
+
     /**
      * One field out of the login token's payload. The token is a base64url payload and signature the
      * server mints, so the player's own identity is already in hand without another round trip - the
